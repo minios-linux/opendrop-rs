@@ -1758,6 +1758,44 @@ pub mod runtime {
         use super::*;
 
         #[test]
+        fn scheduler_fires_psf_before_mif() {
+            let mut scheduler = AnnounceScheduler::new(1_000_000);
+
+            assert_eq!(scheduler.poll_timeout_ms(1_000_000), 33);
+            assert_eq!(scheduler.due(1_032_768), vec![awdl::ActionSubtype::Mif]);
+            assert_eq!(scheduler.poll_timeout_ms(1_032_768), 80);
+            assert_eq!(scheduler.due(1_112_640), vec![awdl::ActionSubtype::Psf]);
+        }
+
+        #[test]
+        fn builds_broadcast_psf_announce_frame() {
+            let sync = crate::sync::SyncState::new(1_000_000);
+            let frame = build_announce_frame(
+                awdl::ActionSubtype::Psf,
+                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                0x0120,
+                1_000_000,
+                &sync,
+                44,
+            );
+            let mac = ieee80211::parse_mac_header(&frame).expect("valid action header");
+            let action = awdl::parse_action_frame(mac.body).expect("valid awdl action");
+            let tlvs = awdl::parse_tlvs(action.tlvs).expect("valid announce TLVs");
+
+            assert_eq!(mac.frame_control, 0x00d0);
+            assert_eq!(mac.destination, [0xff; 6]);
+            assert_eq!(mac.source, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            assert_eq!(mac.bssid, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            assert_eq!(mac.sequence_control, 0x0120);
+            assert_eq!(action.subtype, awdl::ActionSubtype::Psf);
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 4));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 5));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 18));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 24));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 6));
+        }
+
+        #[test]
         fn formats_hex_preview_with_limit() {
             assert_eq!(hex_preview(&[0xde, 0xad, 0xbe, 0xef], 3), "de ad be");
         }
