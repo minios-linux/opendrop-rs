@@ -90,6 +90,25 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 13 (ENDGAME: both feature-complete; release build+91 tests+clippy GREEN; 3 polish fixes in flight).
+- BOTH CRATES FEATURE-COMPLETE. luftlift send landed (real TLS transport + main wiring),
+  full peer = send+receive+find. filin done since cycle 11.
+- Integration pass RESULTS:
+  - `cargo build --release` = clean (both bins).
+  - `cargo test --workspace` = 91 green (filin 27 + luftlift 64).
+  - `cargo clippy --workspace --all-targets -- -D warnings` = clean (after filin fixed
+    2 lints: slice::from_ref + items-after-test-module, commit 93e35b7).
+  - `luftlift --help` clean (receive/find/send subcommands); `luftlift find -d 3` works.
+- 3 POLISH FIXES DISPATCHED (verify landed next heartbeat, then write report):
+  1. filin: restore `--help` long flag (was killed by disable_help_flag for -h host) +
+     fix stale "skeleton — see PORT.md" startup log. (pty-2)
+  2. luftlift: silence mdns_sd NSEC parse-error spam flooding `find` output (EnvFilter
+     mdns_sd::service_daemon=off). (pty-3)
+- NEXT: confirm those 3 land + re-run build/test/clippy + re-check `filin --help` and
+  `luftlift find`; then WRITE THE SUCCESS REPORT to the human (this is the surface-to-
+  human moment per the protocol). Mention opendrop-rs is an empty stub (the two crate
+  bins are the deliverable). Live hardware interop = the one remaining manual pass.
+--- (prior cycle notes below) ---
 Last updated: cycle 12 (91 tests green; filin DONE; luftlift on its LAST milestone — send TLS+main).
 - filin: COMPLETE (27 tests, clippy clean, RUN.md done). Standing by. No more work.
 - luftlift: send client nearly done — CPIO/dvzip encoders, TLS client cfg, request
