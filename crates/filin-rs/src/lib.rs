@@ -7534,6 +7534,22 @@ pub mod introspect {
             assert_eq!(c.aw_alignment_pct(), 100);
         }
 
+        // --- master_addr (cluster top) vs sync_addr (parent) churn metrics
+        //     (FILIN_SYNC_QUALITY.md refinement: the apparent "master churn"
+        //     is re-PARENTING among peers sharing the same top master_addr). ---
+
+        #[test]
+        fn master_addr_and_sync_addr_change_counters_are_independent() {
+            let c = Counters::new();
+            assert_eq!(c.master_addr_changes(), 0);
+            assert_eq!(c.sync_addr_changes(), 0);
+            c.inc_sync_addr_change();
+            c.inc_sync_addr_change();
+            c.inc_master_addr_change();
+            assert_eq!(c.sync_addr_changes(), 2);
+            assert_eq!(c.master_addr_changes(), 1);
+        }
+
         #[test]
         fn status_snapshot_serializes_to_required_json_keys() {
             let snapshot = StatusSnapshot {
@@ -7545,6 +7561,7 @@ pub mod introspect {
                 master_anchor: 52,
                 tsf_offset_us: 1200,
                 master_age_ms: 4500,
+                sync_addr_mac: mac_string([0x02, 0xcc, 0, 0, 0, 1]),
             };
 
             let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
@@ -7561,6 +7578,11 @@ pub mod introspect {
                 obj.get("master_age_ms").and_then(|v| v.as_u64()),
                 Some(4500),
                 "master_age_ms must serialize"
+            );
+            assert_eq!(
+                obj.get("sync_addr_mac").and_then(|v| v.as_str()),
+                Some("02:cc:00:00:00:01"),
+                "sync_addr_mac (our parent) must serialize — distinct from master_mac (top master)"
             );
             assert_eq!(
                 obj.get("master_mac").and_then(|v| v.as_str()),
