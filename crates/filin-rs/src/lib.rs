@@ -272,8 +272,19 @@ pub mod awdl {
         Ok(tlvs)
     }
 
-    pub fn parse_sync_parameters(_value: &[u8]) -> Result<SyncParameters, ParseError> {
-        Err(ParseError::TooShort)
+    pub fn parse_sync_parameters(value: &[u8]) -> Result<SyncParameters, ParseError> {
+        let time_to_next_aw_tu = read_le16(value, 1)?;
+        let aw_counter = read_le16(value, 29)?;
+
+        Ok(SyncParameters {
+            time_to_next_aw_tu,
+            aw_counter,
+        })
+    }
+
+    fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
+        let field = bytes.get(offset..offset + 2).ok_or(ParseError::TooShort)?;
+        Ok(u16::from_le_bytes([field[0], field[1]]))
     }
 
     #[cfg(test)]
