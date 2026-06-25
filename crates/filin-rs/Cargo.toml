@@ -18,4 +18,9 @@ anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 libc = { workspace = true }
+# JSON serialization for the localhost introspection HTTP API (see
+# FILIN_HTTP_INTROSPECT.md). Lightweight, non-async. Hand-rolled HTTP on
+# std::net::TcpListener avoids pulling in an HTTP framework or async runtime.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Add as needed: nix, pcap, neli/nl80211, tokio, etc. (coordinate big additions)
