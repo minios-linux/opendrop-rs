@@ -90,6 +90,30 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 22 (AUTONOMOUS — BOTH AUDITS COMPLETE; improved stack running & ready for live test).
+- *** BOTH GLM AUDITS DONE. ***
+- filin (pty-5, FILIN_AUDIT complete): channel hopping (adopt master chanseq + nl80211
+  switch at AW boundaries, revert to anchor when no master), AW-gated data TX, A-MSDU
+  decap, unicast same-channel gating + 3-TU guard. 68 tests, clippy clean. Idle.
+  Mechanically verified on hardware: NEW build runs STABLE (no crash on live nl80211
+  switching); stays on ch44 with no Apple master present (correct — needs an active
+  Apple master to adopt a sequence and actually hop). Live hopping test needs an awake
+  Apple device. Context ~230K (done; don't re-task — near limit).
+- luftlift (pty-3, LUFTLIFT_AUDIT complete): 7 faithfulness fixes — Expect:100-continue
+  deadlock, mDNS flags 1->0x06 (iOS-18 default, +--flags CLI), SenderID in /Ask,
+  media-caps JSON, 406 x-cpio Content-Type, Connection:close, client skip-1xx. dvzip/
+  CPIO/TLS already faithful. 77 tests, clippy clean. Idle. (plist_impl.rs also has
+  ReceiverMediaCapabilities/RecordData refinements.)
+- WORKSPACE: cargo build --release + clippy --workspace --all-targets clean; filin 68
+  + luftlift 77 tests green.
+- *** IMPROVED STACK IS RUNNING ON pty-7, READY FOR HUMAN'S LIVE TEST: ***
+  filin pid 1706796 (channel-hopping) + luftlift receive pid 1706886 announced as
+  luftlift-1706886. When human wakes + opens an Apple AirDrop sheet, it should engage
+  with channel hopping + corrected mDNS flags. If stale, restart:
+    pkill -f target/release/filin; pkill -f target/release/luftlift; (then re-run both)
+  Compare baseline = owl force-master (owl/src/election.h patched; `make -C owl/build owl`).
+- See WAKEUP_REPORT.md for the full overnight summary for the human.
+--- PRIOR cycle-21 below ---
 Last updated: cycle 21 (AUTONOMOUS — both GLM audits progressing well; tree green).
 - filin (pty-5): CHANNEL HOPPING DONE — a4f99a7 adopt master chanseq + switching,
   eb7f579 channel hopping + AW-gated data TX, 3fa3c69 A-MSDU. Now on per-peer
