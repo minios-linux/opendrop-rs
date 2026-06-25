@@ -766,92 +766,247 @@ pub mod awdl {
 }
 
 pub mod election {
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    //! Faithful port of owl `election.c` / `election.h`.
+    //!
+    //! AWDL master election: each node advertises an election state and adopts
+    //! the peer with the best `(master_counter, master_metric)`, breaking ties
+    //! by shorter sync tree (height) then larger address. A node never syncs to
+    //! a peer that already syncs to it (cycle prevention) and rejects trees
+    //! taller than `TREE_MAX_HEIGHT`.
+
+    /// owl `AWDL_ELECTION_METRIC_INIT` (owl/src/election.h:26).
+    pub const METRIC_INIT: u32 = 60;
+    /// owl `AWDL_ELECTION_COUNTER_INIT` (owl/src/election.h:27).
+    pub const COUNTER_INIT: u32 = 0;
+    /// owl `AWDL_ELECTION_TREE_MAX_HEIGHT` (owl/src/election.h:25).
+    pub const TREE_MAX_HEIGHT: u32 = 10;
+
+    /// owl `struct awdl_election_state` (owl/src/election.h:31-40).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ElectionState {
+        pub master_addr: [u8; 6],
+        pub sync_addr: [u8; 6],
+        pub self_addr: [u8; 6],
+        pub height: u32,
+        pub master_metric: u32,
+        pub self_metric: u32,
+        pub master_counter: u32,
+        pub self_counter: u32,
+    }
+
+    impl ElectionState {
+        /// owl `awdl_election_state_init` (owl/src/election.c:52-58).
+        pub fn new(self_addr: [u8; 6]) -> Self {
+            Self {
+                master_addr: self_addr,
+                sync_addr: self_addr,
+                self_addr,
+                height: 0,
+                master_metric: METRIC_INIT,
+                self_metric: METRIC_INIT,
+                master_counter: COUNTER_INIT,
+                self_counter: COUNTER_INIT,
+            }
+        }
+
+        /// owl `awdl_election_is_sync_master` (owl/src/election.c:35-37).
+        pub fn is_sync_master(&self, addr: &[u8; 6]) -> bool {
+            self.sync_addr == *addr
+        }
+
+        /// owl `awdl_election_run` (owl/src/election.c:67-120). Picks the best
+        /// master from the supplied peer election views and updates self in
+        /// place. `peers` need not be sorted; iteration order matches owl's.
+        pub fn run(&mut self, peers: &[PeerElection]) {
+            self.reset_self();
+
+            // `master_state` starts as self (owl/src/election.c:71).
+            let mut best_counter = self.self_counter;
+            let mut best_metric = self.self_metric;
+            let mut best_height = 0u32;
+            let mut best_addr = self.self_addr;
+            let mut adopted: Option<&PeerElection> = None;
+
+            for peer in peers {
+                if !peer.is_valid {
+                    continue;
+                }
+                if peer.height + 1 > TREE_MAX_HEIGHT {
+                    continue;
+                }
+                if peer.sync_addr == self.self_addr {
+                    continue; // reject: would form a cycle in the sync tree
+                }
+                let cmp = (peer.master_counter, peer.master_metric)
+                    .cmp(&(best_counter, best_metric));
+                match cmp {
+                    std::cmp::Ordering::Less => continue, // reject: lower master
+                    std::cmp::Ordering::Equal => {
+                        if peer.height > best_height {
+                            continue; // reject: longer sync tree
+                        } else if peer.height == best_height && peer.self_addr <= best_addr {
+                            continue; // reject: smaller/equal address tie-break
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+                // accept
+                adopted = Some(peer);
+                best_counter = peer.master_counter;
+                best_metric = peer.master_metric;
+                best_height = peer.height;
+                best_addr = peer.self_addr;
+            }
+
+            if let Some(peer) = adopted {
+                self.master_addr = peer.master_addr;
+                self.sync_addr = peer.self_addr;
+                self.master_metric = peer.master_metric;
+                self.master_counter = peer.master_counter;
+                self.height = peer.height + 1;
+            }
+        }
+
+        /// owl `awdl_election_reset_self` (owl/src/election.c:44-50).
+        fn reset_self(&mut self) {
+            self.height = 0;
+            self.master_addr = self.self_addr;
+            self.sync_addr = self.self_addr;
+            self.master_metric = self.self_metric;
+            self.master_counter = self.self_counter;
+        }
+    }
+
+    /// Read-only view of a peer's election state consumed by `ElectionState::run`.
+    /// Mirrors the fields owl reads from `struct awdl_peer` during election.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PeerElection {
         pub self_addr: [u8; 6],
         pub sync_addr: [u8; 6],
         pub master_addr: [u8; 6],
-        pub master_counter: u32,
-        pub master_metric: u32,
-        pub self_metric: u32,
         pub height: u32,
-    }
-
-    pub fn choose_sync_master(local: &ElectionState, peers: &[ElectionState]) -> ElectionState {
-        let mut selected = local.clone();
-
-        for peer in peers {
-            if should_adopt(peer, &selected) {
-                selected = ElectionState {
-                    self_addr: local.self_addr,
-                    sync_addr: peer.self_addr,
-                    master_addr: peer.master_addr,
-                    master_counter: peer.master_counter,
-                    master_metric: peer.master_metric,
-                    self_metric: local.self_metric,
-                    height: peer.height + 1,
-                };
-            }
-        }
-
-        selected
-    }
-
-    fn should_adopt(peer: &ElectionState, current: &ElectionState) -> bool {
-        match compare_master(peer, current) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => {
-                peer.height < current.height
-                    || (peer.height == current.height && peer.self_addr > current.self_addr)
-            }
-        }
-    }
-
-    fn compare_master(a: &ElectionState, b: &ElectionState) -> std::cmp::Ordering {
-        a.master_counter
-            .cmp(&b.master_counter)
-            .then_with(|| a.master_metric.cmp(&b.master_metric))
+        pub master_metric: u32,
+        pub master_counter: u32,
+        pub is_valid: bool,
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
-        fn state(addr: [u8; 6], master_metric: u32, height: u32) -> ElectionState {
-            ElectionState {
-                self_addr: addr,
-                sync_addr: addr,
-                master_addr: addr,
-                master_counter: 1,
-                master_metric,
-                self_metric: master_metric,
+        fn local(addr: [u8; 6]) -> ElectionState {
+            ElectionState::new(addr)
+        }
+
+        /// A peer view that syncs to itself (is its own master) with the given
+        /// advertised master counter/metric.
+        fn peer_master(
+            self_addr: [u8; 6],
+            master_counter: u32,
+            master_metric: u32,
+            height: u32,
+        ) -> PeerElection {
+            PeerElection {
+                self_addr,
+                sync_addr: self_addr,
+                master_addr: self_addr,
                 height,
+                master_metric,
+                master_counter,
+                is_valid: true,
             }
         }
 
         #[test]
-        fn adopts_peer_with_higher_master_metric() {
-            let local = state([0x02, 0, 0, 0, 0, 1], 100, 0);
-            let peer = state([0x02, 0, 0, 0, 0, 2], 200, 0);
-
-            let selected = choose_sync_master(&local, std::slice::from_ref(&peer));
-
-            assert_eq!(selected.master_addr, peer.master_addr);
-            assert_eq!(selected.sync_addr, peer.self_addr);
-            assert_eq!(selected.master_metric, 200);
-            assert_eq!(selected.height, 1);
+        fn lone_node_is_self_master_with_init_values() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            state.run(&[]);
+            assert_eq!(state.master_addr, [0x02, 0, 0, 0, 0, 1]);
+            assert_eq!(state.sync_addr, [0x02, 0, 0, 0, 0, 1]);
+            assert_eq!(state.master_metric, METRIC_INIT);
+            assert_eq!(state.master_counter, COUNTER_INIT);
+            assert_eq!(state.height, 0);
         }
 
         #[test]
-        fn breaks_equal_metric_tie_by_peer_address() {
-            let local = state([0x02, 0, 0, 0, 0, 1], 100, 0);
-            let lower = state([0x02, 0, 0, 0, 0, 2], 100, 0);
-            let higher = state([0x02, 0, 0, 0, 0, 3], 100, 0);
+        fn adopts_peer_with_higher_master_counter() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            let peer = peer_master([0x02, 0, 0, 0, 0, 2], 10, 200, 0);
 
-            let selected = choose_sync_master(&local, &[lower, higher.clone()]);
+            state.run(std::slice::from_ref(&peer));
 
-            assert_eq!(selected.sync_addr, higher.self_addr);
+            assert_eq!(state.master_addr, [0x02, 0, 0, 0, 0, 2]);
+            assert_eq!(state.sync_addr, [0x02, 0, 0, 0, 0, 2]);
+            assert_eq!(state.master_metric, 200);
+            assert_eq!(state.master_counter, 10);
+            assert_eq!(state.height, 1);
+        }
+
+        #[test]
+        fn rejects_peer_with_lower_master_than_self() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            // self advertises (counter=0, metric=60); peer advertises metric 10 < 60
+            let peer = peer_master([0x02, 0, 0, 0, 0, 2], 0, 10, 0);
+
+            state.run(std::slice::from_ref(&peer));
+
+            assert_eq!(state.sync_addr, state.self_addr); // still self-master
+        }
+
+        #[test]
+        fn breaks_equal_master_tie_by_shorter_height_then_address() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            let tall = peer_master([0x02, 0, 0, 0, 0, 9], 5, 100, 3);
+            let short_same = peer_master([0x02, 0, 0, 0, 0, 2], 5, 100, 0);
+            let short_larger = peer_master([0x02, 0, 0, 0, 0, 3], 5, 100, 0);
+
+            state.run(&[tall, short_same, short_larger]);
+
+            // equal (counter,metric); short_larger wins on address tie-break
+            assert_eq!(state.sync_addr, [0x02, 0, 0, 0, 0, 3]);
+        }
+
+        #[test]
+        fn rejects_peer_that_syncs_to_self_no_cycles() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            // peer claims to sync to us -> would create a cycle
+            let mut peer = peer_master([0x02, 0, 0, 0, 0, 2], 99, 9999, 0);
+            peer.sync_addr = [0x02, 0, 0, 0, 0, 1];
+
+            state.run(std::slice::from_ref(&peer));
+
+            assert_eq!(state.sync_addr, state.self_addr); // rejected
+        }
+
+        #[test]
+        fn rejects_peer_whose_tree_would_exceed_max_height() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            let peer = peer_master([0x02, 0, 0, 0, 0, 2], 99, 9999, TREE_MAX_HEIGHT);
+
+            state.run(std::slice::from_ref(&peer));
+
+            assert_eq!(state.sync_addr, state.self_addr); // rejected
+        }
+
+        #[test]
+        fn ignores_invalid_peers() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            let mut peer = peer_master([0x02, 0, 0, 0, 0, 2], 99, 9999, 0);
+            peer.is_valid = false;
+
+            state.run(std::slice::from_ref(&peer));
+
+            assert_eq!(state.sync_addr, state.self_addr); // ignored
+        }
+
+        #[test]
+        fn is_sync_master_detects_elected_master() {
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            let peer_addr = [0x02, 0, 0, 0, 0, 2];
+            state.run(std::slice::from_ref(&peer_master(peer_addr, 1, 200, 0)));
+
+            assert!(state.is_sync_master(&peer_addr));
+            assert!(!state.is_sync_master(&[0x02, 0, 0, 0, 0, 9]));
         }
     }
 }
