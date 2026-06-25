@@ -6535,5 +6535,181 @@ pub mod introspect {
             let msgs: Vec<&str> = captured.iter().map(|e| e.msg.as_str()).collect();
             assert_eq!(msgs, vec!["info captured", "debug captured"]);
         }
+
+        fn req(method: &str, path: &str) -> Request<'_> {
+            Request {
+                method,
+                path,
+                query: "",
+                body: &[],
+            }
+        }
+
+        fn req_with_body<'a>(method: &'a str, path: &'a str, body: &'a [u8]) -> Request<'a> {
+            Request {
+                method,
+                path,
+                query: "",
+                body,
+            }
+        }
+
+        fn req_with_query<'a>(method: &'a str, path_and_query: &'a str) -> Request<'a> {
+            // split "path?query" into path + query for the router
+            let (path, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
+            Request {
+                method,
+                path,
+                query,
+                body: &[],
+            }
+        }
+
+        fn json_body(resp: &Response) -> serde_json::Value {
+            serde_json::from_slice(&resp.body).expect("response body is valid JSON")
+        }
+
+        #[test]
+        fn status_route_merges_snapshot_and_counters() {
+            let intro = Introspection::new();
+            intro.set_status(StatusSnapshot {
+                current_channel: 44,
+                master_mac: mac_string([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                master_seq: 9,
+                synced: true,
+                peer_count: 2,
+            });
+            intro.counters.inc_mdns_rx_self();
+            intro.counters.inc_mdns_rx_self();
+            intro.counters.inc_mdns_rx_other();
+            intro.counters.inc_rebroadcast(44);
+            intro.counters.inc_rebroadcast(44);
+            intro.counters.inc_rebroadcast(149);
+
+            let resp = route(&intro, &req("GET", "/status"));
+            assert_eq!(resp.status, 200);
+            assert!(resp.content_type.contains("application/json"));
+            let obj = json_body(&resp).as_object().unwrap().clone();
+            assert_eq!(obj.get("current_channel").and_then(|v| v.as_u64()), Some(44));
+            assert_eq!(
+                obj.get("master_mac").and_then(|v| v.as_str()),
+                Some("02:aa:bb:cc:dd:ee")
+            );
+            assert_eq!(obj.get("master_seq").and_then(|v| v.as_u64()), Some(9));
+            assert_eq!(obj.get("synced").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(obj.get("peer_count").and_then(|v| v.as_u64()), Some(2));
+            assert_eq!(obj.get("mdns_rx_self").and_then(|v| v.as_u64()), Some(2));
+            assert_eq!(obj.get("mdns_rx_other").and_then(|v| v.as_u64()), Some(1));
+            let rbc = obj.get("rebroadcast_counts").unwrap().as_object().unwrap();
+            assert_eq!(rbc.get("6").and_then(|v| v.as_u64()), Some(0));
+            assert_eq!(rbc.get("44").and_then(|v| v.as_u64()), Some(2));
+            assert_eq!(rbc.get("149").and_then(|v| v.as_u64()), Some(1));
+        }
+
+        #[test]
+        fn peers_route_returns_array_of_peer_views() {
+            let intro = Introspection::new();
+            intro.set_peers(vec![
+                PeerView {
+                    mac: mac_string([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                    last_seen_ms_ago: 312,
+                    decoded_chanseq: vec![44, 44, 6, 6, 149, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44],
+                    current_channel: 44,
+                },
+            ]);
+
+            let resp = route(&intro, &req("GET", "/peers"));
+            assert_eq!(resp.status, 200);
+            let arr = json_body(&resp).as_array().unwrap().clone();
+            assert_eq!(arr.len(), 1);
+            let p = arr[0].as_object().unwrap();
+            assert_eq!(
+                p.get("mac").and_then(|v| v.as_str()),
+                Some("02:aa:bb:cc:dd:ee")
+            );
+            assert_eq!(p.get("last_seen_ms_ago").and_then(|v| v.as_u64()), Some(312));
+            let seq = p.get("decoded_chanseq").unwrap().as_array().unwrap();
+            assert_eq!(seq.len(), 16);
+            assert_eq!(seq[2].as_u64(), Some(6));
+            assert_eq!(seq[4].as_u64(), Some(149));
+            assert_eq!(p.get("current_channel").and_then(|v| v.as_u64()), Some(44));
+        }
+
+        #[test]
+        fn trace_route_returns_last_n_in_insertion_order() {
+            let ring = Arc::new(TraceRing::new(TRACE_RING_CAP));
+            let gate = Arc::new(TraceGate::new());
+            gate.set(GateLevel::Trace);
+            let layer = TraceLayer::new(ring.clone(), gate);
+            use tracing_subscriber::prelude::*;
+            let dispatch =
+                tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::info!("first");
+                tracing::info!("second");
+                tracing::info!("third");
+            });
+
+            let intro = Introspection::new_with_trace(ring, Arc::new(TraceGate::new()));
+            let resp = route(&intro, &req_with_query("GET", "/trace?n=2"));
+            assert_eq!(resp.status, 200);
+            let arr = json_body(&resp).as_array().unwrap();
+            assert_eq!(arr.len(), 2);
+            assert_eq!(
+                arr[0].as_object().unwrap().get("msg").and_then(|v| v.as_str()),
+                Some("second")
+            );
+            assert_eq!(
+                arr[1].as_object().unwrap().get("msg").and_then(|v| v.as_str()),
+                Some("third")
+            );
+        }
+
+        #[test]
+        fn trace_post_sets_gate_for_valid_level() {
+            let intro = Introspection::new();
+            // default off
+            assert!(!intro.trace_gate().allows(3));
+
+            let resp = route(
+                &intro,
+                &req_with_body("POST", "/trace", br#"{"level":"trace"}"#),
+            );
+            assert_eq!(resp.status, 200);
+            assert!(intro.trace_gate().allows(5));
+
+            let resp = route(
+                &intro,
+                &req_with_body("POST", "/trace", br#"{"level":"off"}"#),
+            );
+            assert_eq!(resp.status, 200);
+            assert!(!intro.trace_gate().allows(1));
+        }
+
+        #[test]
+        fn trace_post_rejects_unknown_level_or_bad_json_with_400() {
+            let intro = Introspection::new();
+
+            let resp = route(
+                &intro,
+                &req_with_body("POST", "/trace", br#"{"level":"verbose"}"#),
+            );
+            assert_eq!(resp.status, 400);
+
+            let resp = route(
+                &intro,
+                &req_with_body("POST", "/trace", b"not json at all"),
+            );
+            assert_eq!(resp.status, 400);
+        }
+
+        #[test]
+        fn unknown_route_and_wrong_method_both_return_404() {
+            let intro = Introspection::new();
+
+            assert_eq!(route(&intro, &req("GET", "/nope")).status, 404);
+            assert_eq!(route(&intro, &req("POST", "/status")).status, 404);
+            assert_eq!(route(&intro, &req("DELETE", "/trace")).status, 404);
+        }
     }
 }
