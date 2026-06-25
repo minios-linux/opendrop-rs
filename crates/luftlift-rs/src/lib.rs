@@ -9,4 +9,5 @@
 pub mod chunked;
 pub mod cpio;
 pub mod dvzip;
+pub mod http;
 pub mod plist_impl;
