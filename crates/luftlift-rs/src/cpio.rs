@@ -24,6 +24,8 @@
 //! (unlike the "newc" `070701` format). The archive is terminated by an
 //! entry named `TRAILER!!!` with a zero-length data body.
 
+use tracing::debug;
+
 /// A single file entry extracted from an ODC CPIO archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpioEntry<'a> {
@@ -51,9 +53,52 @@ const TRAILER_NAME: &str = "TRAILER!!!";
 /// malformed frame. A missing or wrong magic on the first header yields no
 /// entries — the downstream caller is expected to treat an empty result on
 /// a non-empty input as "not a CPIO".
-pub fn read_odc_cpio(_data: &[u8]) -> Vec<CpioEntry<'_>> {
-    // RED: unimplemented — the round-trip tests below must fail first.
-    Vec::new()
+pub fn read_odc_cpio(data: &[u8]) -> Vec<CpioEntry<'_>> {
+    let mut entries = Vec::new();
+    let mut pos = 0;
+    while pos + HDR_LEN <= data.len() {
+        if &data[pos..pos + MAGIC.len()] != MAGIC {
+            debug!(pos, "cpio: stopping, no ODC magic at header");
+            break;
+        }
+        let namesize = parse_octal(&data[pos + NAMESIZE_OFF..pos + NAMESIZE_OFF + NAMESIZE_LEN]);
+        let filesize = parse_octal(&data[pos + FILESIZE_OFF..pos + FILESIZE_OFF + FILESIZE_LEN]);
+        pos += HDR_LEN;
+
+        if namesize == 0 || pos + namesize > data.len() {
+            debug!(pos, namesize, "cpio: stopping, short name field");
+            break;
+        }
+        let name_bytes = &data[pos..pos + namesize];
+        let name = core::str::from_utf8(name_bytes)
+            .unwrap_or("")
+            .trim_end_matches('\0')
+            .to_string();
+        pos += namesize;
+
+        if pos + filesize > data.len() {
+            debug!(pos, filesize, "cpio: stopping, short data field");
+            break;
+        }
+        let file_data = &data[pos..pos + filesize];
+        pos += filesize;
+
+        if name == TRAILER_NAME {
+            break;
+        }
+        entries.push(CpioEntry { name, data: file_data });
+    }
+    entries
+}
+
+/// Parse a fixed-width ASCII-octal field, tolerating trailing NUL/space.
+fn parse_octal(field: &[u8]) -> usize {
+    let s = match core::str::from_utf8(field) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
+    usize::from_str_radix(trimmed, 8).unwrap_or(0)
 }
 
 #[cfg(test)]
