@@ -90,6 +90,19 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 3 (election algo + airdrop handlers underway).
+- filin (gpt-5.5): all AWDL TLV parsers (action hdr, TLVs, sync-params, election-v2,
+  channel-seq) green. Now into the ELECTION ALGORITHM ('elect higher metric master'
+  green); compare_master by (counter, metric). Continuing through election/sync.
+- luftlift (GLM-5.2): M3 chunked + M4 plist + M5 HTTP request parser all green. Now
+  on M5 handlers (/Discover /Ask /Upload), then TLS(rcgen)+server loop, mDNS, wire
+  receive flow in main.rs. Was iterating clippy -D warnings cleanup (lints, not real
+  compile errors) — self-resolving, no blocker.
+- NOTE on tree health: a workspace `cargo test` will often show a transient RED while
+  an agent has written its next red test but not yet the green — and luftlift may
+  briefly not compile under -D warnings mid-edit. Only intervene if a crate STAYS
+  broken across cycles; otherwise let the owning agent finish its red/green pair.
+--- (prior cycle notes below) ---
 Last updated: cycle 2 (notify-1 watcher woke me on a pty-2 approval; both agents flying).
 - filin (gpt-5.5): action header + AWDL TLVs + sync-params TLV all green; now on
   election-v2 TLV (RED just committed). Steady RED/green pairs, no blockers.
