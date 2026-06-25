@@ -346,12 +346,41 @@ pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:9931";
 ///   level gate. 400 on malformed JSON / missing `level` key.
 /// - Anything else → 404.
 pub fn route_introspect(
-    _state: &IntrospectState,
-    _method: &str,
-    _target: &str,
-    _body: &[u8],
+    state: &IntrospectState,
+    method: &str,
+    target: &str,
+    body: &[u8],
 ) -> IntrospectResponse {
-    todo!()
+    let path = target.split('?').next().unwrap_or(target);
+    match (method, path) {
+        ("GET", "/status") => IntrospectResponse::json(200, &state.snapshot()),
+        ("GET", "/trace") => {
+            let n = parse_trace_n(target).unwrap_or(DEFAULT_TRACE_N);
+            let events = state.trace_last_n(n);
+            IntrospectResponse::json(200, &events)
+        }
+        ("POST", "/trace") => {
+            let parsed: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(_) => return IntrospectResponse::json(400, &serde_json::json!({"error":"invalid json"})),
+            };
+            let level = parsed.get("level").and_then(|v| v.as_str());
+            match level {
+                Some(lv) => {
+                    state.set_trace_level(lv);
+                    IntrospectResponse::json(
+                        200,
+                        &serde_json::json!({"level": state.trace_level(), "enabled": state.trace_enabled()}),
+                    )
+                }
+                None => IntrospectResponse::json(
+                    400,
+                    &serde_json::json!({"error":"missing 'level' key (expected off|debug|trace)"}),
+                ),
+            }
+        }
+        _ => IntrospectResponse::json(404, &serde_json::json!({"error":"not found"})),
+    }
 }
 
 /// Default value used for `GET /trace` when no `n` query param is supplied.
