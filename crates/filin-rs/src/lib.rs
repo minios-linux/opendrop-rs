@@ -624,8 +624,22 @@ pub mod sync {
     }
 
     impl TsftBridge {
-        pub fn timestamp_rx(&mut self, _hw_tsft_us: u64, _host_now_us: u64) -> u64 {
-            unimplemented!("RED: TSFT bridge not implemented yet")
+        pub fn timestamp_rx(&mut self, hw_tsft_us: u64, host_now_us: u64) -> u64 {
+            let instant_offset = host_now_us as i64 - hw_tsft_us as i64;
+            let Some(offset) = self.offset_us else {
+                self.offset_us = Some(instant_offset);
+                return host_now_us;
+            };
+
+            let candidate = hw_tsft_us as i64 + offset;
+            if (candidate - host_now_us as i64).abs() > self.sanity_clamp_us {
+                self.offset_us = Some(instant_offset);
+                return host_now_us;
+            }
+
+            let next_offset = offset + ((instant_offset - offset) >> 4);
+            self.offset_us = Some(next_offset);
+            (hw_tsft_us as i64 + next_offset) as u64
         }
     }
 
