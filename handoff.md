@@ -90,6 +90,24 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 14 (DONE — pure-software port complete, verified, reported to human).
+*** MISSION COMPLETE (pending live hardware pass). ***
+- FINAL VERIFICATION (all green):
+  - cargo build --release: clean, both bins (target/release/filin, .../luftlift).
+  - cargo test --workspace: 92 passing (filin 28 + luftlift 64).
+  - cargo clippy --workspace --all-targets -- -D warnings: clean.
+  - filin --help works (accurate startup log, --help restored, -h=host iface).
+  - luftlift --help (receive/find/send) + `luftlift find -d N` clean output (NSEC
+    spam silenced).
+- Both agents reported feature-complete and are standing by. Polish fixes all landed
+  (filin 8070a38 help/log; luftlift 35543ad find-noise; filin 93e35b7 clippy).
+- Reported success to the human this cycle. The ONE remaining item = live hardware
+  interop pass (carl9170 monitor ch44 + awake iPhone); steps in crates/filin-rs/RUN.md.
+- opendrop-rs = 16-line stub (optional wrapper; the two crate bins are the deliverable).
+- IF the human returns and wants more: (a) live hardware bring-up w/ filin RUN.md;
+  (b) luftlift real-fixture test once /tmp/upload.bin exists; (c) opendrop-rs unified
+  CLI wrapper; (d) TLS integration test w/ threaded harness. None are blockers.
+--- (prior cycle notes below) ---
 Last updated: cycle 13 (ENDGAME: both feature-complete; release build+91 tests+clippy GREEN; 3 polish fixes in flight).
 - BOTH CRATES FEATURE-COMPLETE. luftlift send landed (real TLS transport + main wiring),
   full peer = send+receive+find. filin done since cycle 11.
