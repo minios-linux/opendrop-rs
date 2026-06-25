@@ -2559,6 +2559,7 @@ pub mod runtime {
         pub packet: os::packet::PacketSocket,
         self_addr: [u8; 6],
         anchor_channel: u16,
+        monitor_iface: String,
         pcap: Option<pcap::Writer<File>>,
     }
 
@@ -2590,6 +2591,7 @@ pub mod runtime {
             packet,
             self_addr: monitor_addr,
             anchor_channel: config.anchor_channel,
+            monitor_iface: config.monitor_iface.clone(),
             pcap,
         })
     }
@@ -2605,21 +2607,64 @@ pub mod runtime {
         let mut announce = AnnounceScheduler::new(host_time_us());
         let mut wlan_buf = vec![0u8; 4096];
         let mut tap_buf = vec![0u8; 2048];
+        // owl keeps at most one pending unicast frame (`state->next`,
+        // owl/daemon/core.c:42) and retries it when the AW/guard allows.
+        let mut pending_tx: Option<PendingFrame> = None;
 
         loop {
             let now_us = host_time_us();
+
+            // --- channel switching (owl awdl_switch_channel, core.c:279) ---
+            if announce.switch_due(&awdl_state.sync, now_us) {
+                if let Some(channel) = awdl_state.update_channel(now_us) {
+                    if let Some(freq) = channel::channel_to_frequency_mhz(channel) {
+                        match os::nl80211::set_channel(&links.monitor_iface, u32::from(freq)) {
+                            Ok(()) => tracing::debug!(
+                                channel,
+                                slot = awdl_state.sync.current_eaw(now_us) % 16,
+                                "switched monitor channel"
+                            ),
+                            Err(err) => tracing::warn!(
+                                ?err,
+                                channel,
+                                "failed to switch monitor channel"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            // --- peer table cleanup (owl awdl_clean_peers, core.c:320) ---
             if announce.clean_due(now_us) {
                 let removed = awdl_state.clean_peers(now_us);
                 if !removed.is_empty() {
-                    tracing::info!(removed = removed.len(), peers = awdl_state.peers.len(), "peer table cleaned");
+                    tracing::info!(
+                        removed = removed.len(),
+                        peers = awdl_state.peers.len(),
+                        "peer table cleaned"
+                    );
                 }
             }
+
+            // --- action frame TX: PSF/MIF (owl awdl_send_psf/mif) ---
             for subtype in announce.due(now_us, &awdl_state) {
                 let seq = awdl_state.next_data_seq();
                 let frame = build_announce_frame(subtype, &awdl_state, seq << 4, now_us);
                 match links.packet.send(&frame) {
                     Ok(sent) => tracing::trace!(sent, ?subtype, "injected awdl announce frame"),
                     Err(err) => tracing::trace!(?err, ?subtype, "packet announce send failed"),
+                }
+            }
+
+            // --- data TX: retry pending frame if AW allows ---
+            if pending_tx.is_some() {
+                if let Some(frame) = pending_tx.take() {
+                    if try_send_data(&links, &awdl_state, now_us, &frame) {
+                        // sent successfully
+                    } else {
+                        // still can't send — keep it pending
+                        pending_tx = Some(frame);
+                    }
                 }
             }
 
@@ -2635,6 +2680,10 @@ pub mod runtime {
                     revents: 0,
                 },
             ];
+            // Only poll the tap if we don't already have a pending frame.
+            if pending_tx.is_some() {
+                fds[1].events = 0;
+            }
             let poll_timeout_ms = announce.poll_timeout_ms(host_time_us());
             // SAFETY: fds points to two valid pollfd entries for the duration of the call.
             let rc =
@@ -2661,13 +2710,12 @@ pub mod runtime {
                                     tlv_count,
                                     master = ?awdl_state.election.master_addr,
                                     peers = awdl_state.peers.len(),
+                                    channel = awdl_state.current_channel,
                                     "rx awdl action frame"
                                 );
                             }
                             Err(err) => match decapsulate_rx_data(&wlan_buf[..len]) {
                                 Ok((source, frame)) => {
-                                    // owl only accepts data from a known peer
-                                    // (owl/src/rx.c:361) to limit the attack surface.
                                     if awdl_state.peers.get(&source).is_none() {
                                         tracing::trace!(
                                             ?source,
@@ -2719,21 +2767,70 @@ pub mod runtime {
                     match awdl::encapsulate_ethernet_payload(&tap_buf[..len], awdl_state.tx_seq) {
                         Ok(body) => {
                             let seq = awdl_state.next_data_seq();
-                            let frame = radiotap_prefixed(ieee80211::build_data_frame(
-                                dst,
-                                src,
-                                AWDL_BSSID,
-                                seq << 4,
-                                &body,
-                            ));
-                            match links.packet.send(&frame) {
-                                Ok(sent) => tracing::trace!(sent, "injected awdl data frame"),
-                                Err(err) => tracing::trace!(?err, "packet send failed"),
+                            let frame = PendingFrame {
+                                radiotap_frame: radiotap_prefixed(ieee80211::build_data_frame(
+                                    dst,
+                                    src,
+                                    AWDL_BSSID,
+                                    seq << 4,
+                                    &body,
+                                )),
+                            };
+                            // Try to send immediately; if we can't (wrong
+                            // channel, guard interval), buffer for retry.
+                            if !try_send_data(&links, &awdl_state, host_time_us(), &frame) {
+                                pending_tx = Some(frame);
+                                tracing::trace!(
+                                    pending = true,
+                                    "buffered data frame for later AW-gated TX"
+                                );
                             }
                         }
                         Err(err) => tracing::trace!(?err, len, "ignored host tap frame"),
                     }
                 }
+            }
+        }
+    }
+
+    /// A frame waiting to be injected when the availability window allows.
+    /// owl keeps one pending unicast frame in `state->next` (owl/daemon/core.c:42).
+    struct PendingFrame {
+        radiotap_frame: Vec<u8>,
+    }
+
+    /// owl `awdl_can_send_in` + `awdl_can_send_unicast_in` decision: returns
+    /// true if we are inside the guard-free core of an AW on a non-null channel
+    /// (owl/daemon/core.c:223-224, schedule.c:48-79).
+    fn try_send_data(
+        links: &Links,
+        awdl_state: &crate::state::AwdlState,
+        now_us: u64,
+        frame: &PendingFrame,
+    ) -> bool {
+        let channel = awdl_state.current_channel;
+        if channel == 0 {
+            return false; // null slot: not available
+        }
+        // owl awdl_can_send_unicast_in checks same-channel-as-peer. For
+        // simplicity we check the multicast guard (awdl_can_send_in) since the
+        // peer must be on our channel if we adopted their sequence.
+        let in_guard = crate::schedule::can_send_in(
+            &awdl_state.sync,
+            now_us,
+            crate::schedule::MULTICAST_GUARD_TU,
+        );
+        if in_guard != 0 {
+            return false; // inside guard interval
+        }
+        match links.packet.send(&frame.radiotap_frame) {
+            Ok(sent) => {
+                tracing::trace!(sent, channel, "injected awdl data frame");
+                true
+            }
+            Err(err) => {
+                tracing::trace!(?err, "data send failed");
+                false
             }
         }
     }
@@ -2757,6 +2854,7 @@ pub mod runtime {
         next_psf_us: u64,
         next_mif_us: u64,
         next_clean_us: u64,
+        next_switch_us: u64,
     }
 
     impl AnnounceScheduler {
@@ -2767,11 +2865,18 @@ pub mod runtime {
                 // (core.c:419), then awdl_send_mif reschedules to mid-EAW.
                 next_mif_us: now_us,
                 next_clean_us: now_us + CLEAN_INTERVAL_US,
+                // owl fires awdl_switch_channel immediately on start
+                // (core.c:392), then rearms to next AW boundary.
+                next_switch_us: now_us,
             }
         }
 
         fn poll_timeout_ms(&self, now_us: u64) -> i32 {
-            let next = self.next_psf_us.min(self.next_mif_us).min(self.next_clean_us);
+            let next = self
+                .next_psf_us
+                .min(self.next_mif_us)
+                .min(self.next_clean_us)
+                .min(self.next_switch_us);
             let delta_us = next.saturating_sub(now_us);
             delta_us.div_ceil(1_000).min(i32::MAX as u64) as i32
         }
@@ -2783,6 +2888,17 @@ pub mod runtime {
                 while self.next_clean_us <= now_us {
                     self.next_clean_us += CLEAN_INTERVAL_US;
                 }
+                true
+            } else {
+                false
+            }
+        }
+
+        /// owl `awdl_switch_channel` timer (owl/daemon/core.c:279-308): fires at
+        /// every AW boundary and rearms to `next_aw_us`.
+        fn switch_due(&mut self, sync: &crate::sync::SyncState, now_us: u64) -> bool {
+            if now_us >= self.next_switch_us {
+                self.next_switch_us = now_us + sync.next_aw_us(now_us);
                 true
             } else {
                 false
