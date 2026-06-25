@@ -90,6 +90,22 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 30 (DISPATCHED pty-3 to fix iPhone /Upload decode — chunked truncation + skip dir CPIO entries).
+- ACTION THIS CYCLE: wrote LUFTLIFT_UPLOAD_DECODE.md + dispatched pty-3 (GLM luftlift, was idle) to fix the
+  empty-"." Upload bug. Two root causes identified from reading the code:
+  1. server.rs::read_chunked_stream (~L226) `usize::from_str_radix(...).unwrap_or(0)` SILENTLY treats any
+     unparseable chunk-size line as the 0 last-chunk => truncates the iPhone body after the first chunk
+     (first zlib block = just the "." CPIO header). Matches the "missing CRLF terminator" WARN + empty file.
+  2. read_odc_cpio/decode_upload_body return the leading "." DIRECTORY entry (c_mode S_IFDIR 0o040000) which
+     server then tries to write => "Is a directory (os error 21)". Must skip dir entries + "."/"..".
+  Also asked pty-3 to add an env-gated raw /Upload body dump (LUFTLIFT_DUMP_UPLOAD=/tmp/upload.bin) so next
+  live test we can diff vs `python3 opendrop-patch/dvzip.py`. NOTE: dvzip/CPIO core logic matches the Python
+  reference byte-for-byte (verified) — Mac's 2 JPEGs decoded fine; bug is iPhone-chunk-framing specific.
+- pty-3 is WORKING on it now (accepted the prompt). pty-2 (gpt-5.5) idle/stood down. notify-1 still armed.
+  NEXT HEARTBEAT: check pty-3 committed the fix + tree green (cargo test -p luftlift-rs + clippy), then have
+  human re-send a PHOTO from the iPhone to re-test. ASK HUMAN what was sent (photo vs link/webloc).
+- STACK on pty-7: filin pid 1763226 + luftlift pid 1763244 (full-Rust). To restart: kill both; filin then luftlift.
+--- PRIOR cycle-29 below ---
 Last updated: cycle 29 (*** FULL-RUST STACK WORKS — but Upload decode yields empty file; live debug w/ human ***).
 - *** MILESTONE: the FULL-RUST stack (filin + luftlift, NO owl, zero C code) works at the
   transport level. Swapped owl->filin: an iPhone DISCOVERED luftlift OVER FILIN (the
