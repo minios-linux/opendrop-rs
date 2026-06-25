@@ -1519,6 +1519,152 @@ pub mod schedule {
         }
     }
 
+    /// Maximum number of pending multicast frames buffered in the spread
+    /// queue. Bounds memory if the host TAP feeds multicast faster than one
+    /// hop cycle can drain it.
+    pub const MULTICAST_SPREAD_CAP: usize = 32;
+
+    /// One full hop cycle in microseconds: 16 EAW slots * 64 TU per EAW
+    /// (presence_mode 4 * aw_period 16 TU) * 1024 us/TU. Pending multicast
+    /// frames older than this are aged out so a frame whose remaining
+    /// channels never recur (e.g. the master sequence changed mid-cycle)
+    /// cannot leak.
+    pub const HOP_CYCLE_US: u64 = 16 * 64 * TU_US;
+
+    /// The distinct non-zero channel numbers in a channel sequence, deduped
+    /// and sorted ascending. These are the channels a multicast/broadcast
+    /// frame must be transmitted on so that a peer listening on ANY slot of
+    /// the adopted master sequence hears it during one hop cycle. If the
+    /// sequence contains no non-zero channels (filin has not adopted a
+    /// master, or all slots are null), falls back to `[anchor]` — i.e. the
+    /// pre-spread single-channel behaviour.
+    pub fn distinct_channels(chanseq: &[[u8; 2]; CHANSEQ_LEN], anchor: u8) -> Vec<u8> {
+        use std::collections::BTreeSet;
+        let mut set: BTreeSet<u8> = BTreeSet::new();
+        for slot in chanseq.iter() {
+            if slot[0] != 0 {
+                set.insert(slot[0]);
+            }
+        }
+        if set.is_empty() {
+            if anchor != 0 {
+                vec![anchor]
+            } else {
+                Vec::new()
+            }
+        } else {
+            set.into_iter().collect()
+        }
+    }
+
+    /// A multicast/broadcast frame pending transmission on the remaining
+    /// channels of the master hop cycle.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PendingMulticast {
+        /// Radiotap-prefixed IEEE 802.11 data frame bytes to inject.
+        pub frame: Vec<u8>,
+        /// Distinct channels this frame has NOT yet been transmitted on.
+        pub channels_todo: std::collections::BTreeSet<u8>,
+        /// Host time when enqueued, for TTL age-out.
+        pub enqueued_at_us: u64,
+    }
+
+    /// Bounded FIFO queue of multicast frames being spread across the hop
+    /// cycle.
+    ///
+    /// Ports owl's intent from `awdl_send_multicast` (owl/daemon/core.c:
+    /// 246-277) but extends it: instead of emitting a multicast frame once
+    /// on the current channel, each enqueued frame is transmitted on every
+    /// distinct channel of the adopted master channel sequence over the next
+    /// hop cycle, so a peer listening on any of those channels (e.g.
+    /// 6/44/149) hears it.
+    ///
+    /// The queue is bounded (`cap`); enqueuing past the cap evicts the oldest
+    /// entry so a host-TAP flood cannot grow it unboundedly. Entries older
+    /// than `ttl_us` (one hop cycle) are aged out during [`Self::drain_for_channel`]
+    /// so a frame whose remaining channels never recur does not leak.
+    #[derive(Debug)]
+    pub struct MulticastSpread {
+        entries: std::collections::VecDeque<PendingMulticast>,
+        cap: usize,
+        ttl_us: u64,
+    }
+
+    impl MulticastSpread {
+        pub fn new(cap: usize, ttl_us: u64) -> Self {
+            Self {
+                entries: std::collections::VecDeque::new(),
+                cap,
+                ttl_us,
+            }
+        }
+
+        pub fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.entries.is_empty()
+        }
+
+        /// Enqueue a frame to be spread across the distinct channels of
+        /// `chanseq` (falling back to `[anchor]` per [`distinct_channels`]).
+        /// Returns `true` iff the frame was enqueued (there was at least one
+        /// target channel). If the queue is full, the oldest entry is evicted
+        /// first so the most recent announce always gets its hop cycle.
+        pub fn enqueue(
+            &mut self,
+            frame: Vec<u8>,
+            chanseq: &[[u8; 2]; CHANSEQ_LEN],
+            anchor: u8,
+            now_us: u64,
+        ) -> bool {
+            let channels: std::collections::BTreeSet<u8> =
+                distinct_channels(chanseq, anchor).into_iter().collect();
+            if channels.is_empty() {
+                return false;
+            }
+            while self.entries.len() >= self.cap {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(PendingMulticast {
+                frame,
+                channels_todo: channels,
+                enqueued_at_us: now_us,
+            });
+            true
+        }
+
+        /// Drain frames that should be transmitted on `channel` now. For each
+        /// pending frame whose remaining-channel set contains `channel`,
+        /// returns its frame bytes and removes `channel` from its todo set;
+        /// frames whose todo set is then empty are dropped (fully spread).
+        /// Entries older than `ttl_us` are dropped without being returned
+        /// (aged out). Returns frame bytes to inject, in FIFO order.
+        pub fn drain_for_channel(&mut self, channel: u8, now_us: u64) -> Vec<Vec<u8>> {
+            let ttl = self.ttl_us;
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut keep = std::collections::VecDeque::with_capacity(self.entries.len());
+            while let Some(mut entry) = self.entries.pop_front() {
+                if now_us.saturating_sub(entry.enqueued_at_us) > ttl {
+                    continue; // aged out: drop without sending
+                }
+                if entry.channels_todo.remove(&channel) {
+                    // Clone: the entry stays queued for its remaining channels,
+                    // so its frame bytes must survive until the todo set empties.
+                    out.push(entry.frame.clone());
+                    if !entry.channels_todo.is_empty() {
+                        keep.push_back(entry);
+                    }
+                } else {
+                    keep.push_back(entry);
+                }
+            }
+            self.entries = keep;
+            out
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1728,6 +1874,144 @@ pub mod schedule {
                 data_send_decision(&peer_addr, 44, &own_seq, &peers, &sync, 1_032_768),
                 DataSendDecision::Hold,
             );
+        }
+
+        // --- MulticastSpread: spread mDNS announce across the hop cycle ---
+
+        /// Build a 16-slot channel sequence from a slice of (chan, opclass)
+        /// pairs, repeating the last pair to fill the remaining slots (so a
+        /// short master chanseq like [6,44,149] fills the 16-slot array).
+        fn chanseq(pairs: &[(u8, u8)]) -> [[u8; 2]; CHANSEQ_LEN] {
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            let last = *pairs.last().unwrap_or(&(0, 0));
+            for (i, p) in pairs.iter().enumerate() {
+                seq[i] = [p.0, 0];
+            }
+            for slot in seq.iter_mut().take(CHANSEQ_LEN).skip(pairs.len()) {
+                slot[0] = last.0;
+            }
+            seq
+        }
+
+        #[test]
+        fn distinct_channels_dedupes_master_sequence() {
+            // Master chanseq hops 6 / 44 / 149 (and repeats). Distinct set is
+            // [6, 44, 149] — the channels a multicast announce must cover.
+            let seq = chanseq(&[(6, 0), (44, 0), (149, 0)]);
+            assert_eq!(distinct_channels(&seq, 44), vec![6, 44, 149]);
+        }
+
+        #[test]
+        fn distinct_channels_ignores_null_slots() {
+            // Null (0) slots are skipped, not treated as channel 0.
+            let seq = chanseq(&[(6, 0), (0, 0), (149, 0)]);
+            assert_eq!(distinct_channels(&seq, 44), vec![6, 149]);
+        }
+
+        #[test]
+        fn distinct_channels_falls_back_to_anchor_when_no_master() {
+            // No master adopted: all-zero sequence → single anchor channel,
+            // i.e. the pre-spread single-channel behaviour.
+            let seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            assert_eq!(distinct_channels(&seq, 44), vec![44]);
+        }
+
+        #[test]
+        fn spread_sends_on_every_distinct_channel_then_drops() {
+            // Core regression: one mDNS announce enqueued while the master
+            // chanseq = [6,44,149] is sent exactly once on each of the three
+            // distinct channels as filin hops through them, then dropped.
+            let mut spread = MulticastSpread::new(MULTICAST_SPREAD_CAP, HOP_CYCLE_US);
+            let seq = chanseq(&[(6, 0), (44, 0), (149, 0)]);
+            assert!(spread.enqueue(vec![0xAA], &seq, 44, 1_000_000));
+            assert_eq!(spread.len(), 1);
+
+            // Hop to ch6 → inject, still pending (44/149 left).
+            assert_eq!(spread.drain_for_channel(6, 1_000_000), vec![vec![0xAA]]);
+            assert_eq!(spread.len(), 1);
+            // Hop to ch44 → inject, still pending (149 left).
+            assert_eq!(spread.drain_for_channel(44, 1_000_000), vec![vec![0xAA]]);
+            assert_eq!(spread.len(), 1);
+            // Hop to ch149 → inject, todo now empty → entry dropped.
+            assert_eq!(spread.drain_for_channel(149, 1_000_000), vec![vec![0xAA]]);
+            assert!(spread.is_empty());
+
+            // Subsequent hop to any channel yields nothing (already spread).
+            assert!(spread.drain_for_channel(6, 1_000_000).is_empty());
+            assert!(spread.drain_for_channel(44, 1_000_000).is_empty());
+        }
+
+        #[test]
+        fn spread_dedupes_duplicate_channels_in_sequence() {
+            // If the master chanseq lists the same channel on multiple slots,
+            // the announce is sent once per DISTINCT channel, not once per
+            // slot.
+            let mut spread = MulticastSpread::new(MULTICAST_SPREAD_CAP, HOP_CYCLE_US);
+            // Sequence full of 6s with a couple of 44s.
+            let mut seq = [[6u8, 0u8]; CHANSEQ_LEN];
+            seq[5] = [44, 0];
+            seq[11] = [44, 0];
+            assert!(spread.enqueue(vec![0xBB], &seq, 44, 1_000_000));
+
+            // First time we hit ch6 → inject. Second time → nothing.
+            assert_eq!(spread.drain_for_channel(6, 1_000_000), vec![vec![0xBB]]);
+            assert!(spread.drain_for_channel(6, 1_000_000).is_empty());
+            // ch44 → inject once, then done (todo empty).
+            assert_eq!(spread.drain_for_channel(44, 1_000_000), vec![vec![0xBB]]);
+            assert!(spread.is_empty());
+        }
+
+        #[test]
+        fn spread_falls_back_to_single_anchor_channel() {
+            // No master adopted: distinct_channels = [anchor], so the frame
+            // is sent once on the anchor and then dropped — same observable
+            // behaviour as the pre-spread code.
+            let mut spread = MulticastSpread::new(MULTICAST_SPREAD_CAP, HOP_CYCLE_US);
+            let seq = [[0u8, 0u8]; CHANSEQ_LEN]; // all null
+            assert!(spread.enqueue(vec![0xCC], &seq, 44, 1_000_000));
+            assert_eq!(spread.drain_for_channel(44, 1_000_000), vec![vec![0xCC]]);
+            assert!(spread.is_empty());
+        }
+
+        #[test]
+        fn spread_evicts_oldest_when_full() {
+            // A bounded queue: when full, the oldest entry is dropped so the
+            // newest announce still gets its hop cycle (no unbounded growth).
+            let mut spread = MulticastSpread::new(2, HOP_CYCLE_US);
+            let seq = chanseq(&[(6, 0), (44, 0)]);
+            assert!(spread.enqueue(vec![0x01], &seq, 44, 1_000_000));
+            assert!(spread.enqueue(vec![0x02], &seq, 44, 1_000_001));
+            assert_eq!(spread.len(), 2);
+            // Third enqueue evicts the first (0x01).
+            assert!(spread.enqueue(vec![0x03], &seq, 44, 1_000_002));
+            assert_eq!(spread.len(), 2);
+            // Draining ch6 should yield only 0x02 and 0x03 (0x01 was evicted).
+            let drained = spread.drain_for_channel(6, 1_000_002);
+            assert_eq!(drained, vec![vec![0x02], vec![0x03]]);
+        }
+
+        #[test]
+        fn spread_ages_out_stale_entries_past_one_cycle() {
+            // If a frame's remaining channels never recur (e.g. the master
+            // sequence changed mid-cycle), the TTL guard drops it instead of
+            // leaking forever.
+            let mut spread = MulticastSpread::new(MULTICAST_SPREAD_CAP, HOP_CYCLE_US);
+            let seq = chanseq(&[(6, 0), (44, 0), (149, 0)]);
+            assert!(spread.enqueue(vec![0xDD], &seq, 44, 1_000_000));
+            // Channel 149 never recurs; advance past one hop cycle.
+            let stale = 1_000_000 + HOP_CYCLE_US + 1;
+            // Drain on a channel that IS in the todo: aged out → not returned.
+            assert!(spread.drain_for_channel(6, stale).is_empty());
+            assert!(spread.is_empty());
+        }
+
+        #[test]
+        fn spread_enqueue_returns_false_when_no_target_channels() {
+            // Defensive: all-zero sequence AND zero anchor → nothing to send.
+            let mut spread = MulticastSpread::new(MULTICAST_SPREAD_CAP, HOP_CYCLE_US);
+            let seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            assert!(!spread.enqueue(vec![0xEE], &seq, 0, 1_000_000));
+            assert!(spread.is_empty());
         }
     }
 }
@@ -2960,6 +3244,15 @@ pub mod runtime {
         // owl keeps at most one pending unicast frame (`state->next`,
         // owl/daemon/core.c:42) and retries it when the AW/guard allows.
         let mut pending_tx: Option<PendingFrame> = None;
+        // Multicast/broadcast frames (mDNS announce, NDP, broadcast) are
+        // spread across every distinct channel of the master hop cycle so a
+        // peer listening on any of those channels hears them. owl emits these
+        // once on the current channel (`awdl_send_multicast`, core.c:246-277);
+        // filin extends that to the full cycle because it channel-hops.
+        let mut mcast_spread = crate::schedule::MulticastSpread::new(
+            crate::schedule::MULTICAST_SPREAD_CAP,
+            crate::schedule::HOP_CYCLE_US,
+        );
 
         loop {
             let now_us = host_time_us();
@@ -2994,6 +3287,16 @@ pub mod runtime {
                         "peer table cleaned"
                     );
                 }
+            }
+
+            // --- multicast spread TX: drain pending multicast/broadcast
+            //     frames whose remaining channels include the current hop
+            //     channel. Runs every iteration so a freshly-enqueued mDNS
+            //     announce is injected on the current channel now AND on each
+            //     distinct channel as filin hops through the master cycle
+            //     (owl awdl_send_multicast, core.c:246-277, extended). ---
+            if !mcast_spread.is_empty() {
+                drain_mcast_spread(&links, &awdl_state, &mut mcast_spread, now_us);
             }
 
             // --- action frame TX: PSF/MIF (owl awdl_send_psf/mif) ---
@@ -3129,9 +3432,37 @@ pub mod runtime {
                                 )),
                                 dst,
                             };
-                            // Try to send immediately; if we can't (wrong
-                            // channel, guard interval), buffer for retry.
-                            if !try_send_data(&links, &awdl_state, host_time_us(), &frame) {
+                            // Multicast/broadcast frames (mDNS announce,
+                            // NDP, broadcast) are spread across every
+                            // distinct channel of the master hop cycle so a
+                            // peer listening on any channel hears them.
+                            // Unicast keeps owl's AW-gated single-send path.
+                            if frame.dst[0] & 0x01 == 1 {
+                                if mcast_spread.enqueue(
+                                    frame.radiotap_frame,
+                                    &awdl_state.channel_sequence,
+                                    awdl_state.anchor_channel as u8,
+                                    host_time_us(),
+                                ) {
+                                    tracing::trace!(
+                                        pending = mcast_spread.len(),
+                                        "enqueued multicast frame for hop-cycle spread"
+                                    );
+                                    // Inject on the current channel now too
+                                    // (it is one of the target channels).
+                                    drain_mcast_spread(
+                                        &links,
+                                        &awdl_state,
+                                        &mut mcast_spread,
+                                        host_time_us(),
+                                    );
+                                }
+                            } else if !try_send_data(
+                                &links,
+                                &awdl_state,
+                                host_time_us(),
+                                &frame,
+                            ) {
                                 pending_tx = Some(frame);
                                 tracing::trace!(
                                     pending = true,
@@ -3186,6 +3517,43 @@ pub mod runtime {
             Err(err) => {
                 tracing::trace!(?err, "data send failed");
                 false
+            }
+        }
+    }
+
+    /// Inject any pending multicast-spread frames whose remaining channels
+    /// include the current hop channel. Gated by the multicast guard interval
+    /// (owl `awdl_can_send_in` with `AWDL_MULTICAST_GUARD_TU`) so we only
+    /// inject in the sendable core of the current availability window; if we
+    /// are inside the guard, the frames stay queued and are retried on the
+    /// next iteration (or the next hop onto that channel). The pure
+    /// scheduling decision lives in [`crate::schedule::MulticastSpread`].
+    fn drain_mcast_spread(
+        links: &Links,
+        awdl_state: &crate::state::AwdlState,
+        spread: &mut crate::schedule::MulticastSpread,
+        now_us: u64,
+    ) {
+        let channel = awdl_state.current_channel;
+        if channel == 0 {
+            return; // null slot: nothing to transmit
+        }
+        if crate::schedule::can_send_in(
+            &awdl_state.sync,
+            now_us,
+            crate::schedule::MULTICAST_GUARD_TU,
+        ) != 0 {
+            return; // inside multicast guard; retry next iteration
+        }
+        for frame in spread.drain_for_channel(channel, now_us) {
+            match links.packet.send(&frame) {
+                Ok(sent) => tracing::trace!(
+                    sent,
+                    channel,
+                    pending = spread.len(),
+                    "injected spread multicast frame on hop channel"
+                ),
+                Err(err) => tracing::trace!(?err, channel, "spread multicast send failed"),
             }
         }
     }
