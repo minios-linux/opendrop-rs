@@ -1223,6 +1223,39 @@ pub mod rx {
             assert_eq!(parsed.action.subtype, awdl::ActionSubtype::Mif);
             assert_eq!(parsed.tlvs[0].kind, 0x04);
         }
+
+        #[test]
+        fn falls_back_to_host_time_when_radiotap_has_no_tsft() {
+            let mut frame = vec![
+                0x00, 0x00, 0x12, 0x00, // radiotap version, pad, len
+                0x2e, 0x48, 0x00, 0x00, // flags, rate, channel, signal, antenna, rx flags
+                0x00, // flags
+                0x0c, // rate
+                0x64, 0x14, 0x40, 0x01, // channel frequency 5220 + flags
+                0xc3, // -61 dBm
+                0x05, // antenna
+                0x00, 0x00, // RX flags
+            ];
+            frame.extend_from_slice(&[
+                0xd0, 0x00, 0x00, 0x00, // action header
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // destination
+                0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, // source
+                0x00, 0x25, 0x00, 0xff, 0x94, 0x73, // bssid
+                0x00, 0x00, // sequence control
+                0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10, 0x03, 0x00, // AWDL MIF
+                0x00, 0x00, 0x00, 0x00, // phy_tx
+                0x00, 0x00, 0x00, 0x00, // target_tx
+                0x04, 0x02, 0x00, 0xaa, 0xbb, // TLV
+            ]);
+
+            let mut bridge = TsftBridge::default();
+            let parsed = parse_action_frame(&frame, 202_000, &mut bridge)
+                .expect("valid RX AWDL action frame without TSFT");
+
+            assert_eq!(parsed.rx_time_us, 202_000);
+            assert_eq!(parsed.rssi_dbm, Some(-61));
+            assert_eq!(parsed.action.subtype, awdl::ActionSubtype::Mif);
+        }
     }
 }
 
