@@ -90,6 +90,36 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 20 (AUTONOMOUS — human ASLEEP; two parallel GLM audits running; "make it work well").
+- HUMAN ASLEEP, fully autonomous, wants MOST COMPLETE/FAITHFUL impl possible. Don't
+  rely on Mac-initiated sends (intermittent + nobody to tap). Keep tree green, commit,
+  loop via ScheduleWakeup.
+- LIVE TEST RESULT (filin w/ GLM's lower-layer fixes): RX/sync EXCELLENT (error_tu 0,
+  peer table works, AwdlTlv=0), BUT luftlift never appears in Mac picker over filin
+  (does over owl). ROOT CAUSE = filin stays fixed on ch44, no CHANNEL HOPPING; Apple
+  listens across its channel seq (6/44/149) so filin's TX (announce+data) misses the
+  Mac's windows. force-master on filin did NOT fix it (tried, reverted) -> the gap is
+  channel hopping, not election. owl works because owl hops channels.
+- DELEGATED NOW (both GLM-5.2, different crates, no conflict):
+  - pty-5 filin: implement CHANNEL HOPPING + AW-gated TX (FILIN_AUDIT.md §7, port owl
+    schedule.c/channel.c/sync.c/core.c: switch monitor chan via nl80211 per AW slot,
+    gate TX to peer's listen channel), THEN finish all remaining FILIN_AUDIT gaps
+    (§6 chanseq opclass, §9 election TLV values, §1 QoS/A-MSDU). Context ~178K (FULL —
+    watch for compaction/limits). filin election stays faithful 60/0 as committed.
+  - pty-3 luftlift (FRESH context via /new): faithfulness audit per LUFTLIFT_AUDIT_TASK.md
+    -> LUFTLIFT_AUDIT.md + fixes (dvzip/CPIO/chunked-HTTP/plist/mDNS-flags/TLS/handlers/
+    send), vs opendrop-patch python + docs/airdrop-protocol.md. Only edits luftlift.
+  - pty-3 DONE earlier: c088323 fix(luftlift) mDNS goodbye on shutdown (ctrlc) + PID in
+    name (luftlift-<pid>) + host_ttl=120. SHORT-TTL CAVEAT: mdns-sd 0.11 hardcodes
+    other_ttl=4500 (PTR/TXT linger 75min on crash), setter is pub(crate) — would need a
+    3-line mdns-sd vendor patch; deferred (goodbye+PID cover it).
+- TOOLING LESSON: long multi-line prompts to OpenCode (pty-3/5) get eval'd by the shell
+  / mangle on paste. WRITE the brief to a *.md file and send a SHORT one-line "read X
+  and do it" instead. (I crashed pty-3's TUI doing this; relaunched with `opencode`.)
+- tree state: filin 61 tests + luftlift 66 tests green, both build. My filin force-master
+  test edit REVERTED (committed code faithful). owl still patched force-master
+  (owl/src/election.h) + running on pty-7; bluetoothd stopped on pty-8.
+--- PRIOR cycle-19 below ---
 Last updated: cycle 19 (AUTONOMOUS mode — human napping; force-master WORKED; GLM deep in filin layers).
 *** AUTONOMOUS: human asleep (hot weather), I test filin vs hardware on my own.
     Do NOT rely on Mac-initiated sends (need a human tap). Measure objective
