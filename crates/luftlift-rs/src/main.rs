@@ -41,6 +41,13 @@ enum Command {
         /// experimentation; e.g. `--flags 0x01`.
         #[arg(short = 'F', long, default_value_t = DEFAULT_FLAGS, value_parser = parse_flags)]
         flags: u32,
+        /// Receiver display name shown in the Apple AirDrop picker
+        /// (ReceiverComputerName in /Discover + /Ask responses). Defaults to
+        /// `<base>-<pid>` so a fresh run is distinguishable from stale ghosts;
+        /// the base comes from LUFTLIFT_NAME or "luftlift". An explicit
+        /// `--name foo` is used verbatim (no PID suffix).
+        #[arg(short = 'n', long)]
+        name: Option<String>,
     },
     /// Find AirDrop senders on the local network.
     Find {
@@ -84,13 +91,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Receive { output, flags } => receive(&cli.interface, output, flags),
+        Command::Receive { output, flags, name } => receive(&cli.interface, output, flags, name),
         Command::Find { duration } => find(duration),
         Command::Send { recipient, file } => send(&cli.interface, &recipient, file),
     }
 }
 
-fn receive(interface: &str, output: PathBuf, flags: u32) -> Result<()> {
+fn receive(interface: &str, output: PathBuf, flags: u32, name: Option<String>) -> Result<()> {
     let addr = netutil::get_ipv6_for_interface(interface)
         .ok_or_else(|| anyhow::anyhow!("interface {interface} has no IPv6 address — is filin-rs/awdl0 running?"))?;
     tracing::info!(interface, %addr, flags = format!("0x{flags:02x}"), "starting AirDrop receiver");
@@ -99,13 +106,23 @@ fn receive(interface: &str, output: PathBuf, flags: u32) -> Result<()> {
     let tls_config = tls::build_server_config(&cert)?;
     tracing::info!("TLS cert generated");
 
+    // The AirDrop picker displays ReceiverComputerName (from the /Discover and
+    // /Ask response plists), NOT the mDNS instance name. Default to
+    // `<base>-<pid>` so a fresh run is distinguishable from stale ghosts; an
+    // explicit --name is used verbatim. The mDNS instance name continues to
+    // embed the PID separately (in build_airdrop_service_info) for the same
+    // reason at the mDNS layer.
+    let base_name = default_base_name();
+    let receiver_name = resolve_receiver_name(&name, &base_name);
+    tracing::info!(receiver_name = %receiver_name, "receiver display name (shown in AirDrop picker)");
+
     let cfg = ReceiverConfig {
-        computer_name: hostname(),
+        computer_name: receiver_name,
         computer_model: "MacBookPro".into(),
         record_data: None,
     };
     let mdns_cfg = mdns::MdnsConfig {
-        computer_name: cfg.computer_name.clone(),
+        computer_name: base_name,
         port: 8771,
         flags,
     };
@@ -154,10 +171,28 @@ fn find(duration: u64) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort hostname for the receiver identity.
+/// Base name for mDNS instance/hostname and the receiver name. Respects the
+/// `LUFTLIFT_NAME` environment variable; defaults to "luftlift".
+fn default_base_name() -> String {
+    std::env::var("LUFTLIFT_NAME").unwrap_or_else(|_| "luftlift".to_string())
+}
+
+/// Resolve the ReceiverComputerName (what the Apple AirDrop picker displays).
+///
+/// - `--name foo` → `"foo"` (user's explicit choice, no PID suffix).
+/// - no `--name` → `"<base>-<pid>"` (default; PID lets the human tell a fresh
+///   run from a stale ghost in the picker, since the picker shows
+///   ReceiverComputerName, not the mDNS instance name).
+fn resolve_receiver_name(cli_name: &Option<String>, base: &str) -> String {
+    match cli_name {
+        Some(n) => n.clone(),
+        None => format!("{}-{}", base, std::process::id()),
+    }
+}
+
+/// Best-effort name for the sender identity.
 fn hostname() -> String {
-    std::env::var("LUFTLIFT_NAME")
-        .unwrap_or_else(|_| "luftlift".to_string())
+    default_base_name()
 }
 
 /// Send a file to an AirDrop receiver. `recipient` is matched against mDNS
@@ -252,4 +287,32 @@ fn rand_u64() -> u64 {
     use std::time::SystemTime;
     let s = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     s.as_nanos() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_receiver_name_default_includes_pid() {
+        // No --name: default receiver name is "<base>-<pid>" so the Apple
+        // picker (which shows ReceiverComputerName, not the mDNS instance
+        // name) distinguishes fresh runs from stale ghosts.
+        let name = resolve_receiver_name(&None, "luftlift");
+        assert_eq!(name, format!("luftlift-{}", std::process::id()));
+    }
+
+    #[test]
+    fn resolve_receiver_name_explicit_override_uses_verbatim() {
+        // --name foo: the explicit name is used as-is (no PID suffix).
+        let name = resolve_receiver_name(&Some("my-mac".into()), "luftlift");
+        assert_eq!(name, "my-mac");
+    }
+
+    #[test]
+    fn resolve_receiver_name_empty_string_override_is_verbatim() {
+        // An explicit empty --name "" is still an override (edge case).
+        let name = resolve_receiver_name(&Some(String::new()), "luftlift");
+        assert_eq!(name, "");
+    }
 }
