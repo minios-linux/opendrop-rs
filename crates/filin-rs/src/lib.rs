@@ -1081,11 +1081,18 @@ pub mod awdl {
 
             let body = encapsulate_ethernet_payload(&ethernet, 7).expect("valid ethernet frame");
 
+            // owl AWDL_DATA_HEAD = 0x0403 (owl/src/tx.c:33, frame.h:37). A real
+            // Apple peer may reject data frames with head=0; filin's own decap
+            // ignores the field so loopback tests won't catch this.
             assert_eq!(
                 body,
                 vec![
-                    0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
-                    0x00, 0x86, 0xdd, 0x60, 0x00,
+                    0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00,
+                    0x03, 0x04, // head = AWDL_DATA_HEAD = 0x0403 little-endian
+                    0x07, 0x00, // seq
+                    0x00, 0x00, // reserved
+                    0x86, 0xdd, // ethertype
+                    0x60, 0x00, // payload
                 ]
             );
         }
