@@ -1696,6 +1696,12 @@ pub mod schedule {
     /// at least one occurrence of every distinct channel. Returns the
     /// channels that were injected (empty if the sequence already covered
     /// all social channels).
+    ///
+    /// After guaranteeing one slot per social channel, any REMAINING null
+    /// slots are filled round-robin with the social channels (Part B: denser
+    /// dwell) so filin spends several slots on 149 — not just one — and
+    /// overlaps the iPhone's 149 listen windows more often. The round-robin
+    /// starts at 149 to maximise 149 dwell first.
     pub fn ensure_social_coverage(seq: &mut [[u8; 2]; CHANSEQ_LEN]) -> Vec<u8> {
         let mut injected = Vec::new();
         for &(ch, opclass) in &AWDL_SOCIAL_CHANNELS {
@@ -1707,7 +1713,29 @@ pub mod schedule {
                 injected.push(ch);
             }
         }
+        // Part B: fill any remaining null slots round-robin with the social
+        // channels (starting at 149) so filin dwells on 149 in several slots,
+        // not just one. Only nulls are filled — master-advertised channels
+        // are left untouched.
+        fill_nulls_round_robin(seq);
         injected
+    }
+
+    /// Fill remaining null (channel-0) slots round-robin with the AWDL social
+    /// channels, starting at 149 so 149 gets the first (and thus most) slots.
+    /// Non-null slots are never touched, so the master's real channels stay
+    /// intact.
+    fn fill_nulls_round_robin(seq: &mut [[u8; 2]; CHANSEQ_LEN]) {
+        // Round-robin order starting at 149 for maximum 149 dwell.
+        let order = [(149u8, 0x80u8), (6, 0x51), (44, 0x80)];
+        let mut idx = 0;
+        for slot in seq.iter_mut() {
+            if slot[0] == 0 {
+                let (ch, opclass) = order[idx % order.len()];
+                *slot = [ch, opclass];
+                idx += 1;
+            }
+        }
     }
 
     /// Find a slot suitable for social-channel injection: a null slot, or
@@ -2537,6 +2565,62 @@ pub mod schedule {
             let injected = ensure_social_coverage(&mut seq);
             assert_eq!(injected.len(), 3);
             assert!(seq.iter().any(|s| s[0] == 36), "ch36 must survive");
+        }
+
+        // --- Part B: denser social-channel dwell (fill nulls round-robin) ---
+
+        #[test]
+        fn social_coverage_fills_nulls_round_robin_for_dense_149() {
+            // A master seq with many nulls: after ensure_social_coverage, 149
+            // appears in MORE than one slot (round-robin fill starting at
+            // 149), so filin dwells on 149 several times per cycle.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [44, 0x80]; // one real master channel
+            // 15 nulls. ensure_social_coverage injects the missing 6/149
+            // (44 already present), then fills the remaining 13 nulls
+            // round-robin 149/6/44 starting at 149.
+            ensure_social_coverage(&mut seq);
+            let count_149 = seq.iter().filter(|s| s[0] == 149).count();
+            assert!(
+                count_149 > 1,
+                "149 must appear in >1 slot (got {})",
+                count_149
+            );
+            // No null slots remain.
+            assert!(!seq.iter().any(|s| s[0] == 0), "no nulls remain");
+            // 44 (master's real channel) survives.
+            assert!(seq.iter().any(|s| s[0] == 44));
+        }
+
+        #[test]
+        fn social_coverage_round_robin_starts_at_149() {
+            // The round-robin starts at 149 so 149 gets the most slots.
+            // With exactly 3 nulls and all three socials missing, each gets
+            // exactly one — but 149 is first.
+            let mut seq = [[44u8, 0x80]; CHANSEQ_LEN];
+            seq[0] = [0, 0];
+            seq[1] = [0, 0];
+            seq[2] = [0, 0];
+            // 44 already present (13 slots); 6 and 149 missing → 2 injected
+            // into nulls; the 3rd null filled round-robin (starts at 149).
+            ensure_social_coverage(&mut seq);
+            // No nulls remain.
+            assert!(!seq.iter().any(|s| s[0] == 0));
+            // 149 present at least twice (1 injected + 1 round-robin).
+            let count_149 = seq.iter().filter(|s| s[0] == 149).count();
+            assert!(count_149 >= 2, "149 should get round-robin dwell");
+        }
+
+        #[test]
+        fn social_coverage_does_not_touch_non_null_master_slots() {
+            // Master-advertised channels in non-null slots must survive the
+            // round-robin fill — only nulls are overwritten.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [36, 0x80]; // non-social master channel
+            seq[5] = [149, 0x80]; // social, already present
+            ensure_social_coverage(&mut seq);
+            assert_eq!(seq[0], [36, 0x80], "master ch36 slot untouched");
+            assert_eq!(seq[5], [149, 0x80], "master ch149 slot untouched");
         }
 
         // --- Part A: AnnounceCache cached mDNS re-broadcast ---
