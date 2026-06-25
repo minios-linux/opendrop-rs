@@ -244,3 +244,79 @@ done).
 7. Data path — QoS strip + A-MSDU + peer gating (MEDIUM)
 
 (RESULT notes appended below per layer as each lands.)
+
+---
+
+# RESULT — implementation log
+
+All layers below implemented in `crates/filin-rs/src/lib.rs`, committed
+individually. Final state: `cargo test -p filin-rs` = **61 passed**,
+`cargo clippy -p filin-rs --all-targets -- -D warnings` clean,
+`cargo build --release -p filin-rs` succeeds.
+
+## Layer 0 — radiotap RX/TX  (no change)
+Already faithful after the prior FCS-strip fix (commit a75412d). TX header
+(`radiotap::build_tx_header`) matches owl byte-for-byte
+(`00 00 09 00 04 00 00 00 18`).
+
+## Layer 3 — ELECTION  (commit `fix(filin): real election state matching owl`)
+Rewrote `election` module as a faithful port of `owl/src/election.c`:
+`ElectionState` gained `self_counter`; constants `METRIC_INIT=60`,
+`COUNTER_INIT=0`, `TREE_MAX_HEIGHT=10`. `ElectionState::new`/`run`/`is_sync_master`
+mirror owl's init/run/is_sync_master including cycle prevention, max-height
+rejection, validity filter, and the (counter, metric, height, address)
+tie-breaks. Removed the fabricated `0x80000000`-based `self_metric`.
+
+## Layer 4 — PEER TABLE  (commit `fix(filin): add owl-faithful peer table`)
+New `peers` module: `Peer` (addr, last_update, election state, 16-slot
+`(chan_num, opclass)` sequence, name, version/devclass, sent_mif,
+supports_v2, is_valid) and `PeerTable` with `touch` (owl `awdl_peer_add` +
+`is_complete = sent_mif && devclass && version` validity recompute), `get`,
+`election_views`, `remove_stale` (owl `awdl_peers_remove`, 2 s timeout).
+
+## Layer 2 — TLV tolerance  (commit `fix(filin): tolerate incomplete trailing TLVs`)
+`awdl::parse_tlvs` now stops cleanly on an incomplete trailing TLV instead
+of returning `TooShort`, matching owl's `read_tlv` loop (`owl/src/rx.c:295`).
+This unblocks real Apple MIF frames that carry extra TLVs + trailing padding.
+
+## Layer 8 — STATE aggregation + sync gating  (commit `fix(filin): aggregate state…`)
+New `state` module: `AwdlState` owns election + sync + peers + own channel
+sequence + version/devclass + tx_seq. `apply_action` mirrors owl
+`awdl_rx_action`: registers the peer, folds TLVs into peer state (election
+v1/v2, chanseq, version, arpa), marks MIF, recomputes validity, re-runs
+election, and **only adopts sync from the elected master** (owl `rx.c:39`).
+`clean_peers` drops stale peers + re-runs election. Added
+`awdl::parse_election_parameters` (v1) for owl `rx.c:111-131`.
+
+## Layer 9/3/6 — TX content (real election + opclass chanseq)  (commit `fix(filin): wire runtime to real…`)
+Announce builders now take `&AwdlState` and serialize the **real** election
+state (master_addr, sync_addr, master_counter, master_metric, self_metric,
+self_counter, height) in both election TLVs and the sync-params
+`master_addr`. Channel-sequence TLV switched to owl **OPCLASS encoding (3)**
+with opclass byte `0x80` (was encoding 2 / opclass 0). Removed fabricated
+`self_metric`. ARPA TLV carries the real hostname. Runtime `run()` rewired
+to `AwdlState`; periodic clean timer (1 s) added.
+
+## Layer 7 — AW-gated MIF timing  (commit `fix(filin): AW-gated MIF timing…`)
+New `schedule` module porting `owl/src/schedule.c` (`is_multicast_eaw`,
+`slot_channel`, `can_send_in`). Added `SyncState::next_aw_us`. MIF is now
+rescheduled to the **middle of each EAW** (`next_aw + eaw_len/2`, owl
+`awdl_send_mif`) and gated to a non-null channel slot, replacing the blind
+110 TU interval. PSF stays on the 110 TU master interval.
+
+## Layer 1 — ieee80211 QoS + Layer 1 data peer gating  (commit `fix(filin): QoS data strip + peer-gated data RX`)
+`ieee80211::parse_mac_header` now strips the 2-byte QoS control field for
+QoS data subtypes (`fc & 0x0088`) so Apple's QoS data frames (fc `0x0888`)
+de-encapsulate correctly. Data RX is peer-gated: frames from unknown sources
+are dropped, matching owl `awdl_rx_data` (`owl/src/rx.c:361`).
+
+## Known follow-ups (lower severity, not peering-blockers)
+- A-MSDU aggregation (`awdl_rx_data_amsdu`) — owl supports it; filin handles
+  single-MSDU only. Apple usually uses non-A-MSDU for AWDL data.
+- Channel hopping per the peer's channel sequence: owl defaults to a static
+  all-anchor sequence (as filin now does), so this only matters if a peer
+  demands a non-static sequence. `schedule::slot_channel` + `can_send_in`
+  provide the hooks.
+- Unicast data TX guard gating (`awdl_can_send_unicast_in`) — multicast/data
+  TX timing uses the multicast guard; unicast per-peer same-channel gating is
+  scaffolded but not yet wired into the data TX path.
