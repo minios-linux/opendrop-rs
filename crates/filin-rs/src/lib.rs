@@ -1367,9 +1367,12 @@ pub mod os {
     }
 
     pub mod netdev {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
         #[derive(Debug, PartialEq, Eq)]
         pub enum Error {
             InvalidName,
+            Io(i32),
         }
 
         #[derive(Debug, PartialEq, Eq)]
@@ -1389,6 +1392,173 @@ pub mod os {
 
         pub fn up_flags(existing: libc::c_short) -> libc::c_short {
             existing | (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short
+        }
+
+        pub fn get_hwaddr(iface: &str) -> Result<[u8; 6], Error> {
+            let socket = control_socket()?;
+            let mut request = IfReqHwAddr::new(iface)?;
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCGIFHWADDR.
+            let rc = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCGIFHWADDR,
+                    &mut request as *mut IfReqHwAddr,
+                )
+            };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+            Ok(request.hwaddr())
+        }
+
+        pub fn set_hwaddr(iface: &str, hwaddr: [u8; 6]) -> Result<(), Error> {
+            let socket = control_socket()?;
+            let mut request = IfReqHwAddr::new(iface)?;
+            request.set_hwaddr(hwaddr);
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCSIFHWADDR.
+            let rc = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCSIFHWADDR,
+                    &mut request as *mut IfReqHwAddr,
+                )
+            };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+            Ok(())
+        }
+
+        pub fn set_mtu(iface: &str, mtu: libc::c_int) -> Result<(), Error> {
+            let socket = control_socket()?;
+            let mut request = IfReqMtu::new(iface, mtu)?;
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCSIFMTU.
+            let rc = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCSIFMTU,
+                    &mut request as *mut IfReqMtu,
+                )
+            };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+            Ok(())
+        }
+
+        pub fn set_up(iface: &str) -> Result<(), Error> {
+            let socket = control_socket()?;
+            let mut request = IfReqFlags::new(iface, 0)?;
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCGIFFLAGS.
+            let rc = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCGIFFLAGS,
+                    &mut request as *mut IfReqFlags,
+                )
+            };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+            request.flags = up_flags(request.flags);
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCSIFFLAGS.
+            let rc = unsafe {
+                libc::ioctl(
+                    socket.as_raw_fd(),
+                    libc::SIOCSIFFLAGS,
+                    &mut request as *mut IfReqFlags,
+                )
+            };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+            Ok(())
+        }
+
+        fn control_socket() -> Result<OwnedFd, Error> {
+            // SAFETY: socket arguments open a datagram IPv4 control socket for ioctls.
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            if fd < 0 {
+                return Err(last_errno());
+            }
+            // SAFETY: fd was just returned by socket and is uniquely owned here.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+
+        #[repr(C)]
+        struct IfReqFlags {
+            name: [libc::c_char; libc::IFNAMSIZ],
+            flags: libc::c_short,
+        }
+
+        #[repr(C)]
+        struct IfReqMtu {
+            name: [libc::c_char; libc::IFNAMSIZ],
+            mtu: libc::c_int,
+        }
+
+        #[repr(C)]
+        struct IfReqHwAddr {
+            name: [libc::c_char; libc::IFNAMSIZ],
+            addr: libc::sockaddr,
+        }
+
+        impl IfReqFlags {
+            fn new(iface: &str, flags: libc::c_short) -> Result<Self, Error> {
+                Ok(Self {
+                    name: c_name(iface)?,
+                    flags,
+                })
+            }
+        }
+
+        impl IfReqMtu {
+            fn new(iface: &str, mtu: libc::c_int) -> Result<Self, Error> {
+                Ok(Self {
+                    name: c_name(iface)?,
+                    mtu,
+                })
+            }
+        }
+
+        impl IfReqHwAddr {
+            fn new(iface: &str) -> Result<Self, Error> {
+                Ok(Self {
+                    name: c_name(iface)?,
+                    addr: libc::sockaddr {
+                        sa_family: libc::ARPHRD_ETHER as libc::sa_family_t,
+                        sa_data: [0; 14],
+                    },
+                })
+            }
+
+            fn set_hwaddr(&mut self, hwaddr: [u8; 6]) {
+                self.addr.sa_family = libc::ARPHRD_ETHER as libc::sa_family_t;
+                for (dst, src) in self.addr.sa_data.iter_mut().zip(hwaddr) {
+                    *dst = src as libc::c_char;
+                }
+            }
+
+            fn hwaddr(&self) -> [u8; 6] {
+                let mut hwaddr = [0u8; 6];
+                for (dst, src) in hwaddr.iter_mut().zip(self.addr.sa_data) {
+                    *dst = src as u8;
+                }
+                hwaddr
+            }
+        }
+
+        fn c_name(name: &str) -> Result<[libc::c_char; libc::IFNAMSIZ], Error> {
+            let planned = plan_if_name(name)?;
+            let mut out = [0; libc::IFNAMSIZ];
+            for (dst, src) in out.iter_mut().zip(planned.bytes) {
+                *dst = src as libc::c_char;
+            }
+            Ok(out)
+        }
+
+        fn last_errno() -> Error {
+            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
         }
 
         #[cfg(test)]
