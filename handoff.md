@@ -90,6 +90,22 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 8 (TREE GREEN 62 tests; filin unblocked into HW syscalls; luftlift ~done).
+- ***libc = "0.2" added to [workspace.dependencies]*** (commit) to unblock filin's
+  tun/AF_PACKET/netlink work. filin uses `libc = { workspace = true }` in its crate.
+- filin (gpt-5.5): ALL pure-software done — RX/TX encode+decode, election, sync, TSFT
+  bridge, channel, CLI, full injectable 802.11 action frames. 21 tests pass, clippy
+  -D warnings clean. Now implementing the REAL awdl0 bring-up (/dev/net/tun + AF_PACKET
+  RX/TX + ioctl/netlink) — told to keep raw syscalls in a thin commented unsafe layer
+  w/ testable logic factored out. This is the hardware-touching code; compiles != live-
+  validated (still needs the carl9170 + iPhone pass with the human).
+- luftlift (GLM-5.2): chunked/plist/HTTP/handlers/TLS/mDNS-announce/HTTPS-accept-loop
+  ALL green (41 tests). Now: netutil (iface IPv6 link-local resolution) + main.rs
+  receive-flow wiring, then sender-side `find` (mDNS browse). Autonomous, no blocker.
+- Tree: `cargo test --workspace` = 62 passing, 0 fail. Endgame is close.
+- Housekeeping: `.claude/` is untracked (orchestrator/notify cfg) — leave it; don't
+  `git add -A`, only add specific files so agents' WIP/.claude don't get co-committed.
+--- (prior cycle notes below) ---
 Last updated: cycle 7 (filin binary wired w/ honest hw TODO; luftlift on server loop).
 - filin (gpt-5.5): + integrated RX (TSFT-required), AWDL data->Ethernet decap, clap
   CLI (-i/-c/-h/-N), binary uses validated config. The ONE remaining gap is the
