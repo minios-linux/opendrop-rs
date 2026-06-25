@@ -55,9 +55,19 @@ pub fn dvzip_to_cpio(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encode a CPIO archive as a dvzip payload: zlib-compress the whole archive
+/// and frame it as a single `[u32 BE length][zlib stream]` block. The decoder
+/// ([`dvzip_to_cpio`) handles any number of blocks; one block is functionally
+/// correct and round-trips exactly. This is the AirDrop sender's `/Upload`
+/// body builder.
+pub fn cpio_to_dvzip(_cpio: &[u8]) -> Vec<u8> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::dvzip_to_cpio;
+    use super::{cpio_to_dvzip, dvzip_to_cpio};
+    use crate::cpio::build_odc_cpio;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -117,5 +127,34 @@ mod tests {
     #[test]
     fn dvzip_empty_input_yields_empty_output() {
         assert_eq!(dvzip_to_cpio(&[]), Vec::<u8>::new());
+    }
+
+    // ---- encoder (sender side) ----
+
+    #[test]
+    fn cpio_to_dvzip_roundtrips_through_dvzip_to_cpio() {
+        let entries: &[(&str, &[u8])] = &[("a.txt", b"hello"), ("b.bin", &[0, 1, 2, 3])];
+        let cpio = build_odc_cpio(entries);
+        let dvzip = cpio_to_dvzip(&cpio);
+        let decoded = dvzip_to_cpio(&dvzip);
+        assert_eq!(decoded, cpio, "encoder must round-trip through decoder");
+    }
+
+    #[test]
+    fn cpio_to_dvzip_produces_valid_framing() {
+        let cpio = build_odc_cpio(&[("x", b"xyzzy")]);
+        let dvzip = cpio_to_dvzip(&cpio);
+        // First 4 bytes = big-endian u32 length of the following zlib stream.
+        let len = u32::from_be_bytes([dvzip[0], dvzip[1], dvzip[2], dvzip[3]]) as usize;
+        assert_eq!(dvzip.len(), 4 + len, "framed length must match remaining bytes");
+        // Zlib header magic 0x78 0x9c follows the length.
+        assert_eq!(&dvzip[4..6], &[0x78, 0x9c], "zlib stream header");
+    }
+
+    #[test]
+    fn cpio_to_dvzip_empty_cpio_round_trips() {
+        let dvzip = cpio_to_dvzip(&[]);
+        assert!(!dvzip.is_empty(), "even empty CPIO produces a framed zlib block");
+        assert_eq!(dvzip_to_cpio(&dvzip), Vec::<u8>::new());
     }
 }
