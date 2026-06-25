@@ -8,7 +8,9 @@
 
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use std::collections::HashMap;
 use std::net::IpAddr;
+use tracing::info;
 
 /// Configuration for the mDNS announcement.
 pub struct MdnsConfig {
@@ -19,14 +21,33 @@ pub struct MdnsConfig {
 }
 
 /// Build the `_airdrop._tcp` ServiceInfo for announcement.
-pub fn build_airdrop_service_info(_cfg: &MdnsConfig, _addr: IpAddr) -> Result<ServiceInfo> {
-    anyhow::bail!("unimplemented")
+pub fn build_airdrop_service_info(cfg: &MdnsConfig, addr: IpAddr) -> Result<ServiceInfo> {
+    // The instance name doubles as the AirDrop receiver identity hash in
+    // opendrop; we derive a simple deterministic prefix from the computer name.
+    let instance = format!("{}-{}", cfg.computer_name, cfg.flags);
+    let hostname = format!("{}.local.", cfg.computer_name);
+    let mut props = HashMap::new();
+    props.insert("flags".to_string(), cfg.flags.to_string());
+
+    let info = ServiceInfo::new(
+        "_airdrop._tcp.local.",
+        &instance,
+        &hostname,
+        addr,
+        cfg.port,
+        Some(props),
+    )?;
+    Ok(info)
 }
 
 /// Register the AirDrop service on the local network. Returns the daemon
 /// (keep alive to maintain the announcement) and the registered info.
-pub fn announce(_cfg: &MdnsConfig, _addr: IpAddr) -> Result<(ServiceDaemon, ServiceInfo)> {
-    anyhow::bail!("unimplemented")
+pub fn announce(cfg: &MdnsConfig, addr: IpAddr) -> Result<(ServiceDaemon, ServiceInfo)> {
+    let daemon = ServiceDaemon::new()?;
+    let info = build_airdrop_service_info(cfg, addr)?;
+    daemon.register(info.clone())?;
+    info!(name = %cfg.computer_name, addr = %addr, port = cfg.port, "mDNS _airdrop._tcp announced");
+    Ok((daemon, info))
 }
 
 #[cfg(test)]
