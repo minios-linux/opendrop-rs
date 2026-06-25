@@ -7216,6 +7216,19 @@ pub mod introspect {
         }
 
         #[test]
+        fn rebroadcast_counter_tracks_arbitrary_anchor_channel() {
+            // FILIN_ANCHOR_REBROADCAST.md: /status rebroadcast_counts must
+            // show the anchor channel (e.g. 52) incrementing — not just the
+            // hardcoded 6/44/149.
+            let c = Counters::new();
+            c.inc_rebroadcast(52);
+            c.inc_rebroadcast(52);
+            c.inc_rebroadcast(52);
+            assert_eq!(c.rebroadcast_for(52), 3);
+            assert!(c.rebroadcast_pairs().contains(&(52, 3)));
+        }
+
+        #[test]
         fn status_snapshot_serializes_to_required_json_keys() {
             let snapshot = StatusSnapshot {
                 current_channel: 44,
