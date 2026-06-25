@@ -372,6 +372,15 @@ pub mod awdl {
         Ok(EthernetFrame { bytes })
     }
 
+    pub fn build_action_body(
+        _subtype: ActionSubtype,
+        _phy_tx: u32,
+        _target_tx: u32,
+        _tlvs: &[u8],
+    ) -> Vec<u8> {
+        unimplemented!("RED: action body builder not implemented yet")
+    }
+
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
         let field = bytes.get(offset..offset + 2).ok_or(ParseError::TooShort)?;
         Ok(u16::from_le_bytes([field[0], field[1]]))
@@ -528,6 +537,21 @@ pub mod awdl {
                     0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
                     0x86, 0xdd,
                     0x60, 0x00, 0x00, 0x00,
+                ]
+            );
+        }
+
+        #[test]
+        fn builds_mif_vendor_action_body() {
+            let body = build_action_body(ActionSubtype::Mif, 0x1122_3344, 0x5566_7788, &[0x04, 0, 0]);
+
+            assert_eq!(
+                body,
+                vec![
+                    0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10, 0x03, 0x00,
+                    0x44, 0x33, 0x22, 0x11,
+                    0x88, 0x77, 0x66, 0x55,
+                    0x04, 0x00, 0x00,
                 ]
             );
         }
