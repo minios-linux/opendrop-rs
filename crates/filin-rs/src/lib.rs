@@ -4631,6 +4631,69 @@ pub mod state {
             assert_eq!(state.desired_channel(65536), 0);
         }
 
+        // --- FILIN_SYNC_QUALITY.md pivot: single-channel park mode ---
+
+        #[test]
+        fn park_channel_picks_top_master_anchor_from_peers() {
+            // Two peers report the SAME top master_addr; their slot-0 channels
+            // are 52 and 52 (and one says 44). The dominant slot-0 across
+            // peers reporting the elected master_addr is 52 → park there.
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let top = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            state.election.master_addr = top;
+
+            let p1 = [0x02, 0xc1, 0, 0, 0, 1];
+            let p2 = [0x02, 0xc2, 0, 0, 0, 2];
+            state.peers.touch(p1, 0);
+            state.peers.touch(p2, 0);
+            {
+                let peer = state.peers.get_mut(&p1).unwrap();
+                peer.election.master_addr = top;
+                peer.sequence[0] = [52, 0x80];
+            }
+            {
+                let peer = state.peers.get_mut(&p2).unwrap();
+                peer.election.master_addr = top;
+                peer.sequence[0] = [52, 0x80];
+            }
+            assert_eq!(state.park_channel(), 52);
+        }
+
+        #[test]
+        fn park_channel_falls_back_to_anchor_when_no_peers() {
+            // No peers heard yet → park on the configured anchor (44).
+            let state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            assert_eq!(state.park_channel(), 44);
+        }
+
+        #[test]
+        fn desired_channel_in_park_mode_ignores_eaw_slot() {
+            // In park mode desired_channel returns the parked channel for
+            // EVERY slot — no hopping. Even a null slot in the sequence must
+            // not produce channel 0.
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            state.channel_sequence[1] = [0, 0]; // would be 0 in hop mode
+            state.enable_park(52);
+            assert_eq!(state.desired_channel(0), 52);
+            assert_eq!(state.desired_channel(65536), 52, "park ignores slot 1 null");
+        }
+
+        #[test]
+        fn update_channel_in_park_mode_only_switches_when_park_channel_changes() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            state.enable_park(52);
+            // First call: switch to 52.
+            assert_eq!(state.update_channel(0), Some(52));
+            assert_eq!(state.current_channel, 52);
+            // Subsequent calls: no switch (parked).
+            assert_eq!(state.update_channel(65536), None);
+            assert_eq!(state.update_channel(131072), None);
+            // Park channel changes (top master anchor moved) → switch once.
+            state.enable_park(44);
+            assert_eq!(state.update_channel(131072), Some(44));
+            assert_eq!(state.current_channel, 44);
+        }
+
         // --- FILIN_SYNC_QUALITY.md: master_addr vs sync_addr transitions ---
 
         #[test]
