@@ -3752,6 +3752,46 @@ pub mod rx {
 
             assert_eq!(err, ParseError::BadFcs);
         }
+
+        // --- RSSI admission filter (FILIN_AUDIT_FIXES.md #1 / owl rx.c:273-278) ---
+
+        #[test]
+        fn rssi_admits_unknown_peer_at_threshold() {
+            // Unknown peer at exactly -65 dBm → admitted (>= threshold).
+            assert!(rssi_admits(Some(-65), false, -65, -5));
+        }
+
+        #[test]
+        fn rssi_drops_unknown_peer_below_threshold() {
+            // Unknown peer at -66 → dropped (< -65).
+            assert!(!rssi_admits(Some(-66), false, -65, -5));
+        }
+
+        #[test]
+        fn rssi_admits_known_peer_with_grace_below_threshold() {
+            // Known peer at -70 → admitted: threshold + grace = -65 + -5 = -70.
+            assert!(rssi_admits(Some(-70), true, -65, -5));
+        }
+
+        #[test]
+        fn rssi_drops_known_peer_below_grace_threshold() {
+            // Known peer at -71 → dropped (< -70).
+            assert!(!rssi_admits(Some(-71), true, -65, -5));
+        }
+
+        #[test]
+        fn rssi_admits_when_no_rssi_available() {
+            // No RSSI info → don't filter (can't make a decision).
+            assert!(rssi_admits(None, false, -65, -5));
+            assert!(rssi_admits(None, true, -65, -5));
+        }
+
+        #[test]
+        fn rssi_strong_signal_always_admitted() {
+            // Strong signal (-40) always admitted regardless of known/unknown.
+            assert!(rssi_admits(Some(-40), false, -65, -5));
+            assert!(rssi_admits(Some(-40), true, -65, -5));
+        }
     }
 }
 
