@@ -62,6 +62,11 @@ pub fn read_request_respecting_expect(
     if let Some(expect) = parse_header_value(head_str, "expect") {
         if expect.eq_ignore_ascii_case("100-continue") {
             writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            // CRITICAL: flush so the 100 Continue actually reaches the peer.
+            // On the TLS path rustls buffers writes internally; without an
+            // explicit flush the 100 Continue is never sent, the Apple sender
+            // waits forever for it, and the connection deadlocks.
+            writer.flush()?;
         }
     }
     let body = read_body(reader, &header_bytes)?;
@@ -159,6 +164,13 @@ fn handle_tls_connection(
     if let Some(expect) = parse_header_value(head_str, "expect") {
         if expect.eq_ignore_ascii_case("100-continue") {
             reader.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            // CRITICAL: flush the 100 Continue through the TLS encryption
+            // layer so it reaches the Apple sender. Without this, rustls
+            // buffers the plaintext and the sender never sees the 100,
+            // deadlocking the /Upload (sender waits for 100, server waits
+            // for body). This was the regression introduced when the
+            // Expect:100-continue support was added without a flush.
+            reader.get_mut().flush()?;
         }
     }
     let body = read_body(&mut reader, &header_bytes)?;
@@ -370,5 +382,148 @@ mod tests {
         let out = String::from_utf8_lossy(&writer);
         assert!(!out.contains("100 Continue"), "no 100 Continue without Expect header");
         assert!(out.starts_with("HTTP/1.1 200"));
+    }
+
+    // ---- 100 Continue flush regression tests ----
+    //
+    // On the TLS path, rustls buffers writes internally. If the 100 Continue
+    // is written but not flushed, it stays in the buffer and never reaches
+    // the Apple sender — which waits forever for the 100 before sending the
+    // body, deadlocking the /Upload. The in-memory Cursor+Vec tests above do
+    // NOT catch this because Vec writes are immediate. The tests below verify
+    // (a) flush() is called after 100 Continue, and (b) a real socket-pair
+    // integration with BufWriter (simulating TLS buffering) completes.
+
+    /// A writer wrapper that records whether flush() was called.
+    struct FlushTracker<W: std::io::Write> {
+        inner: W,
+        flush_count: u32,
+    }
+    impl<W: std::io::Write> std::io::Write for FlushTracker<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_count += 1;
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn read_request_respecting_expect_flushes_100_continue() {
+        // After writing 100 Continue, flush() MUST be called — without it,
+        // the response stays in the TLS encryption buffer and the Apple
+        // sender deadlocks waiting for the 100.
+        let request = b"POST /Upload HTTP/1.1\r\n\
+                         Expect: 100-continue\r\n\
+                         Content-Length: 5\r\n\
+                         \r\n\
+                         hello";
+        let mut reader = Cursor::new(&request[..]);
+        let mut writer = FlushTracker { inner: Vec::new(), flush_count: 0 };
+
+        let raw = read_request_respecting_expect(&mut reader, &mut writer).unwrap();
+
+        // 100 Continue was written.
+        assert!(
+            writer.inner.starts_with(b"HTTP/1.1 100 Continue\r\n\r\n"),
+            "100 Continue must be written to the writer"
+        );
+        // flush() was called at least once after the 100 Continue.
+        assert!(
+            writer.flush_count > 0,
+            "flush() must be called after 100 Continue — without it, the \
+             response stays buffered in TLS/BufWriter and the Apple sender \
+             deadlocks waiting for it"
+        );
+        // Body was still read correctly.
+        assert!(raw.windows(5).any(|w| w == b"hello"), "body must be present in raw");
+    }
+
+    #[test]
+    fn handle_upload_chunked_expect_100_continue_full_flow_no_deadlock() {
+        // Full Apple-style Upload: chunked + Expect:100-continue, multi-chunk
+        // dvzip body, over a real TCP socket pair with a BufWriter on the
+        // server side (to simulate TLS write buffering). Without the flush
+        // after 100 Continue, the client's read for the 100 times out
+        // (deadlock caught by set_read_timeout).
+        use std::io::{Read, Write as IoWrite};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        // Build a real dvzip(CPIO) payload with a test file.
+        let entries: &[(&str, &[u8])] = &[("expect_test.txt", b"chunked + expect body")];
+        let cpio = crate::cpio::build_odc_cpio(entries);
+        let dvzip = crate::dvzip::cpio_to_dvzip(&cpio);
+
+        // Frame as chunked, split into 2 chunks to exercise multi-chunk decoding.
+        let mid = dvzip.len() / 2;
+        let rest = dvzip.len() - mid;
+        let mut chunked_body = Vec::new();
+        chunked_body.extend_from_slice(format!("{:x}\r\n", mid).as_bytes());
+        chunked_body.extend_from_slice(&dvzip[..mid]);
+        chunked_body.extend_from_slice(b"\r\n");
+        chunked_body.extend_from_slice(format!("{:x}\r\n", rest).as_bytes());
+        chunked_body.extend_from_slice(&dvzip[mid..]);
+        chunked_body.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        // Bind a local listener for a real TCP socket pair.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Server in background thread. BufWriter simulates TLS's internal
+        // write buffering — if 100 Continue isn't explicitly flushed, it
+        // stays in the BufWriter and never reaches the client.
+        let server_cfg = cfg();
+        let server_thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let write_stream = stream.try_clone().expect("try_clone");
+            let mut reader = std::io::BufReader::new(stream);
+            let mut writer = std::io::BufWriter::new(write_stream);
+            handle_one_connection(&mut reader, &mut writer, &server_cfg)
+        });
+
+        // Client (Apple sender simulation): send headers with chunked +
+        // Expect:100-continue, WAIT for 100 Continue, then send the body.
+        let mut stream =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set_read_timeout");
+
+        let headers = "POST /Upload HTTP/1.1\r\n\
+                       Host: localhost\r\n\
+                       Content-Type: application/x-dvzip\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       Expect: 100-continue\r\n\
+                       \r\n";
+        stream.write_all(headers.as_bytes()).expect("write headers");
+        stream.flush().expect("flush headers");
+
+        // WAIT for 100 Continue. If the server didn't flush, this read times
+        // out after 10s and .expect() panics — catching the regression.
+        let mut buf = [0u8; 1024];
+        let n = stream
+            .read(&mut buf)
+            .expect("read 100-continue (timed out = server didn't flush the 100 Continue)");
+        let cont = String::from_utf8_lossy(&buf[..n]);
+        assert!(cont.contains("100 Continue"), "expected 100 Continue, got: {cont}");
+
+        // 100 Continue received — send the chunked body.
+        stream.write_all(&chunked_body).expect("write chunked body");
+        stream.flush().expect("flush body");
+
+        // Read the final 200 response.
+        let mut resp_buf = Vec::new();
+        stream.read_to_end(&mut resp_buf).expect("read final response");
+        let resp = String::from_utf8_lossy(&resp_buf);
+        assert!(resp.contains("200"), "final response should be 200: {resp}");
+
+        // Verify the server-side result.
+        let result = server_thread.join().expect("server thread").expect("handle");
+        assert_eq!(result.response.status, 200);
+        assert_eq!(result.received_files.len(), 1);
+        assert_eq!(result.received_files[0].name, "expect_test.txt");
+        assert_eq!(result.received_files[0].bytes, b"chunked + expect body");
     }
 }

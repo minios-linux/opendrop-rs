@@ -308,6 +308,44 @@ mistaken for the final response (RFC 7231 §6.2 violation).
 - `read_full_response` now loops past interim `1xx` responses and returns the
   first final (non-1xx) response, per RFC 7231 §6.2.
 
+### §3 follow-up (live regression found in cycle 25): flush the 100 Continue
+
+**Symptom (live, real Mac sender):** `/Discover` and `/Ask` completed, but
+`/Upload` never finished — awdl0 RX climbed in one burst then froze; no
+"Upload complete" log; no file landed. The luftlift→luftlift round-trip
+passed (incl. 512 KB), so the bug only triggered against a real Apple
+sender, which uses `Expect: 100-continue` on the chunked `/Upload`.
+
+**Root cause:** commit `614818e` added the `100 Continue` interim response
+but did **not flush** after writing it. On the TLS path rustls buffers
+plaintext writes internally; without `writer.flush()` the `100 Continue`
+stayed in rustls's buffer and never reached the Apple sender. The sender
+waited forever for the 100, the server blocked reading a body the peer would
+never ship → deadlock. The in-memory `Cursor+Vec` tests didn't catch this
+because `Vec` writes are immediate (no buffering to flush through).
+
+**Fix:** call `writer.flush()` immediately after writing `100 Continue` in
+both `read_request_respecting_expect` (the pure path) and
+`handle_tls_connection` (the TLS path, flushing through `reader.get_mut()`).
+
+**Regression tests** (both verified to fail without the flush):
+- `read_request_respecting_expect_flushes_100_continue` — a `FlushTracker`
+  writer wrapper asserts `flush()` was called at least once after the 100.
+- `handle_upload_chunked_expect_100_continue_full_flow_no_deadlock` — a real
+  TCP socket pair with a `BufWriter` on the server side (simulating TLS
+  buffering); the client sends chunked + `Expect: 100-continue`, waits for
+  the 100 with a 10 s read timeout, then ships the dvzip(CPIO) body. Without
+  the flush the client's read of the 100 times out (test panics); with the
+  fix the full Discover-style flow completes and the file is decoded.
+
+**Sender alignment:** `send_files` now re-frames the `/Upload` body as
+`Transfer-Encoding: chunked` + `Expect: 100-continue` to mimic a real Apple
+sender (via `chunk_frame`), so the luftlift sender exercises the same
+server path a Mac uses. Covered by `send_files_upload_uses_chunked_and_expect_100_continue`.
+
+**Live validation:** a real Mac AirDropped 2 JPEGs to a luftlift receiver
+running this fix; both decoded successfully.
+
 ---
 
 ## Summary of fixes landed
@@ -321,9 +359,10 @@ mistaken for the final response (RFC 7231 §6.2 violation).
 | §6 | 406 response `Content-Type: application/x-cpio` | LOW | `9fa877c` |
 | §6 | `Connection: close` on all responses | LOW | `9fa877c` |
 | §3/§7 | client must skip interim `1xx` responses (RFC 7231) | MEDIUM | `71a99c4` |
+| §3 follow-up | flush `100 Continue` on TLS path (Apple /Upload stall) | HIGH | (this commit) |
 
 Layers with no gap (§1 dvzip, §2 CPIO, §5 TLS) are left unchanged.
 
-Baseline → final: `cargo test -p luftlift-rs` 66 → **77 passed**;
+Baseline → final: `cargo test -p luftlift-rs` 66 → **92 passed** (89 lib + 3 bin);
 `cargo clippy -p luftlift-rs --all-targets -- -D warnings` clean throughout;
 release binary builds (`cargo build -p luftlift-rs --release`).

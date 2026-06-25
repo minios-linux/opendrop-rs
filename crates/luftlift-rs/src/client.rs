@@ -15,6 +15,20 @@ use plist::{Dictionary, Value};
 use std::collections::HashMap;
 use tracing::info;
 
+/// Frame a payload as an HTTP/1.1 chunked body: a single chunk of `body`
+/// followed by the terminating `0\r\n\r\n`. Used to re-frame the /Upload body
+/// as chunked to mimic a real Apple sender.
+fn chunk_frame(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 16);
+    if !body.is_empty() {
+        out.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\n\r\n");
+    out
+}
+
 /// Sender identity/configuration used to build /Discover and /Ask requests.
 #[derive(Debug, Clone)]
 pub struct SenderConfig {
@@ -229,7 +243,16 @@ pub fn send_files(
     info!("receiver accepted transfer");
 
     info!("POST /Upload ({} files)", files.len());
-    let req = build_upload_request(files);
+    let mut req = build_upload_request(files);
+    // Re-frame the /Upload body as chunked + Expect:100-continue, mimicking
+    // a real Apple sender. The server's Expect:100-continue + flush path is
+    // exercised (commit fix for the /Upload stall), and read_full_response
+    // on the client side skips the interim 100. The in-memory transport test
+    // still works because format_request → parse_request transparently
+    // decodes the chunked body before handle_post sees it.
+    req.headers.insert("transfer-encoding".into(), "chunked".into());
+    req.headers.insert("expect".into(), "100-continue".into());
+    req.body = chunk_frame(&req.body);
     let resp = transport.send(&req)?;
     if resp.status != 200 {
         anyhow::bail!("/Upload failed (status {})", resp.status);
@@ -578,5 +601,74 @@ mod tests {
         let resp = crate::http::parse_response(&bytes).unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"abc");
+    }
+
+    // ---- chunk_frame + Apple-style Upload ----
+
+    #[test]
+    fn chunk_frame_single_chunk_roundtrips_through_decode_chunked() {
+        let body = b"hello world";
+        let framed = chunk_frame(body);
+        // Must be: b\r\nhello world\r\n0\r\n\r\n
+        assert_eq!(decode_chunked(&framed).unwrap(), body);
+    }
+
+    #[test]
+    fn chunk_frame_empty_body_yields_just_terminator() {
+        let framed = chunk_frame(b"");
+        assert_eq!(framed, b"0\r\n\r\n");
+        assert_eq!(decode_chunked(&framed).unwrap(), b"");
+    }
+
+    #[test]
+    fn send_files_upload_uses_chunked_and_expect_100_continue() {
+        // Verify the /Upload re-frames the body as chunked + Expect:100-continue,
+        // mimicking a real Apple sender. Use the InMemoryTransport (which
+        // serialises/deserialises through the wire format) and intercept the
+        // upload request by capturing the wire bytes it produces.
+        struct WireCapturingTransport;
+        impl AirDropTransport for WireCapturingTransport {
+            fn send(&mut self, req: &HttpRequest) -> Result<HttpResponse> {
+                // For /Upload, verify the headers are set correctly.
+                if req.path == "/Upload" {
+                    assert_eq!(
+                        req.header("transfer-encoding"),
+                        Some("chunked"),
+                        "Upload must use chunked to mimic Apple sender"
+                    );
+                    assert_eq!(
+                        req.header("expect"),
+                        Some("100-continue"),
+                        "Upload must send Expect:100-continue to mimic Apple sender"
+                    );
+                    // The body must be chunk-framed (not raw dvzip) — decode it.
+                    let decoded =
+                        decode_chunked(&req.body).expect("Upload body must be chunked-framed");
+                    let cpio = dvzip_to_cpio(&decoded);
+                    let entries = read_odc_cpio(&cpio);
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].name, "f.txt");
+                }
+                // Return synthetic responses so send_files progresses.
+                if req.path == "/Discover" {
+                    let cfg = rcfg();
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: crate::plist_impl::build_discover_response(&cfg),
+                        headers: Vec::new(),
+                    })
+                } else {
+                    Ok(HttpResponse { status: 200, body: Vec::new(), headers: Vec::new() })
+                }
+            }
+        }
+
+        let mut transport = WireCapturingTransport;
+        let files = vec![FileToSend {
+            name: "f.txt".into(),
+            uti_type: "public.data".into(),
+            data: b"data".to_vec(),
+        }];
+        send_files(&mut transport, &sender(), &files, "TID-X").unwrap();
     }
 }
