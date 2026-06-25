@@ -13,4 +13,5 @@ pub mod handlers;
 pub mod http;
 pub mod mdns;
 pub mod plist_impl;
+pub mod server;
 pub mod tls;
