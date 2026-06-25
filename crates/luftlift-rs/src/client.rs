@@ -21,6 +21,64 @@ pub struct SenderConfig {
     pub computer_name: String,
     pub model_name: String,
     pub bundle_id: String,
+    /// `SenderID` included in the /Ask request body (as `Value::Data`). A
+    /// real Apple sender derives this from its Apple ID / phone-number hash
+    /// (used by the receiver for "Contacts Only" filtering and logging). For
+    /// "Everyone" mode any stable non-empty byte sequence is accepted; we
+    /// populate it from [`SenderConfig::with_default_sender_id`].
+    pub sender_id: Vec<u8>,
+}
+
+impl SenderConfig {
+    /// Build a `SenderConfig` with a freshly generated 6-byte `SenderID`.
+    /// The value is random-but-stable-for-the-process so multiple transfers
+    /// from one `luftlift send` invocation share a sender identity.
+    pub fn new(computer_name: impl Into<String>, model_name: impl Into<String>, bundle_id: impl Into<String>) -> Self {
+        Self {
+            computer_name: computer_name.into(),
+            model_name: model_name.into(),
+            bundle_id: bundle_id.into(),
+            sender_id: random_sender_id(),
+        }
+    }
+
+    /// Convenience for tests: explicit sender_id bytes.
+    #[cfg(test)]
+    pub fn with_sender_id(
+        computer_name: impl Into<String>,
+        model_name: impl Into<String>,
+        bundle_id: impl Into<String>,
+        sender_id: Vec<u8>,
+    ) -> Self {
+        Self {
+            computer_name: computer_name.into(),
+            model_name: model_name.into(),
+            bundle_id: bundle_id.into(),
+            sender_id,
+        }
+    }
+}
+
+/// Generate a 6-byte pseudo-random sender ID (MAC-address-sized, matching the
+/// shape real Apple senders use). Uses the same time-seeded PRNG as the
+/// transfer-id generator in main.rs — not cryptographic, but adequate for an
+/// AirDrop sender identifier that only needs to be unique per process.
+fn random_sender_id() -> Vec<u8> {
+    use std::time::SystemTime;
+    let s = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seed = s.as_nanos() as u64 ^ (std::process::id() as u64).rotate_left(17);
+    // xorshift64* → 6 bytes. Good enough dispersion for a non-crypto ID.
+    let mut x = seed.wrapping_mul(0x2545F4914F6CDD1D).max(1);
+    let mut out = [0u8; 6];
+    for byte in &mut out {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *byte = (x >> 24) as u8;
+    }
+    out.to_vec()
 }
 
 /// One file to send.
@@ -71,6 +129,11 @@ pub fn build_ask_request(cfg: &SenderConfig, transfer_id: &str, files: &[FileToS
     let mut root = Dictionary::new();
     root.insert("TransferID".into(), Value::String(transfer_id.into()));
     root.insert("TransferType".into(), Value::String("files".into()));
+    // SenderID is a Data blob real Apple senders include (docs/airdrop-
+    // protocol.md Ask-request capture: "SenderID: <hex>"). Some receivers key
+    // logging/dedup off it and "Contacts Only" mode filters on it; we always
+    // include it so our Ask body matches the captured shape byte-for-byte.
+    root.insert("SenderID".into(), Value::Data(cfg.sender_id.clone()));
     root.insert("SenderComputerName".into(), Value::String(cfg.computer_name.clone()));
     root.insert("SenderModelName".into(), Value::String(cfg.model_name.clone()));
     root.insert("BundleID".into(), Value::String(cfg.bundle_id.clone()));
@@ -271,11 +334,12 @@ mod tests {
     use crate::plist_impl::ReceiverConfig;
 
     fn sender() -> SenderConfig {
-        SenderConfig {
-            computer_name: "luftlift-sender".into(),
-            model_name: "MacBookPro".into(),
-            bundle_id: "com.luftlift.app".into(),
-        }
+        SenderConfig::with_sender_id(
+            "luftlift-sender",
+            "MacBookPro",
+            "com.luftlift.app",
+            vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE],
+        )
     }
 
     // ---- build_discover_request ----
@@ -306,6 +370,33 @@ mod tests {
         // Receiver should be able to parse our Ask and accept.
         let resp = handle_post(&req, &rcfg());
         assert_eq!(resp.response.status, 200);
+    }
+
+    #[test]
+    fn build_ask_request_includes_sender_id_data_field() {
+        // Real Apple senders include SenderID (Data) in the Ask body — see
+        // docs/airdrop-protocol.md. Our Ask body must carry it so the shape
+        // matches the capture byte-for-byte.
+        let files = vec![FileToSend {
+            name: "note.txt".into(),
+            uti_type: "public.data".into(),
+            data: b"hello".to_vec(),
+        }];
+        let req = build_ask_request(&sender(), "TID-SID", &files);
+        let val = Value::from_reader(std::io::Cursor::new(&req.body)).unwrap();
+        let dict = val.as_dictionary().unwrap();
+        let sid = dict.get("SenderID").expect("SenderID must be present in Ask body");
+        let sid_bytes = sid.as_data().expect("SenderID must be a Data value");
+        assert_eq!(sid_bytes, &[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]);
+    }
+
+    #[test]
+    fn sender_config_new_generates_non_empty_sender_id() {
+        let cfg = SenderConfig::new("n", "m", "b");
+        assert!(!cfg.sender_id.is_empty(), "default SenderID must not be empty");
+        // Two constructions in the same process should be distinct (time-seeded).
+        let other = SenderConfig::new("n", "m", "b");
+        assert_ne!(cfg.sender_id, other.sender_id, "SenderIDs should differ");
     }
 
     // ---- build_upload_request ----

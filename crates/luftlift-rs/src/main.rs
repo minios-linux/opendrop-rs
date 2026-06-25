@@ -191,11 +191,7 @@ fn send(interface: &str, recipient: &str, file: PathBuf) -> Result<()> {
     let peer_addr = std::net::SocketAddr::new(*addr, port);
     let mut transport = RustlsTransport::new(tls_config, peer_addr);
 
-    let sender = SenderConfig {
-        computer_name: hostname(),
-        model_name: "MacBookPro".into(),
-        bundle_id: "com.luftlift.app".into(),
-    };
+    let sender = SenderConfig::new(hostname(), "MacBookPro", "com.luftlift.app");
     let file_name = file
         .file_name()
         .and_then(|n| n.to_str())
