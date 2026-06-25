@@ -25,11 +25,13 @@ Every cycle:
    blockers/decisions). Commit it: `git add handoff.md && git commit -m "chore(handoff): <state>"`.
 3. Schedule the next heartbeat with **ScheduleWakeup** (delaySeconds ~180), prompt =
    "HEARTBEAT: read /home/ayourtch/rust/opendrop/handoff.md fully and continue
-   orchestrating per it."
-4. Self-clear: `mcp__tttt__tttt_self_inject(session_id="pty-1", text="/clear")`.
-   (pty-1 is YOUR session.) Then stop — the heartbeat re-fires you fresh.
+   orchestrating per it." Then STOP — the wakeup re-fires you fresh, which both
+   clears stale context AND reliably makes you re-read this file.
+   **DO NOT use `mcp__tttt__tttt_self_inject` for the self-clear.** It dumps text
+   into your own stdin without re-reading handoff.md and the submit/enter gets
+   dropped — the ScheduleWakeup internal heartbeat is the correct, only mechanism.
 Tune the interval up (e.g. 300-600s) if agents need more time per milestone; down
-if Codex is blocking on approvals. Cache cost is irrelevant post-clear.
+if Codex is blocking on approvals. Cache cost is irrelevant across heartbeats.
 
 ## THE AGENTS & TERMINALS (tttt PTYs)
 - **pty-1** = YOU (claude, root). Self-inject /clear here.
@@ -80,19 +82,27 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
-Last updated: cycle 0 (just set up the autonomous run + this protocol).
-- git log so far:
+Last updated: cycle 1 (fixed loop protocol: ScheduleWakeup, NOT self_inject).
+- git log so far (newest first):
+  - `82ec662 chore(handoff): orchestrator self-clear context (cycle 0)`
+  - `529eea6 green(filin): parse radiotap header metadata` (gpt-5.5)
+  - `ee15bb2 green(luftlift): odc cpio entry reader` (GLM)
+  - `fe338ce red(luftlift): odc cpio entry reader`
   - `0f922b6 rename(crates): awdl-rs -> filin-rs, airdrop-rs -> luftlift-rs`
-  - `3a5acbf red(awdl): parse radiotap header metadata` (gpt-5.5)
-  - `fb2ec41 green(airdrop): dvzip framed-zlib round-trip` (GLM, 3 passing tests)
-  - `c4d24db red(airdrop): dvzip framed-zlib round-trip`
-  - scaffold + workflow commits before that.
-- gpt-5.5 (filin): was implementing the radiotap **green** for `parse_header`; just
-  told to then continue autonomously through ALL filin PORT.md milestones.
-- GLM-5.2 (luftlift): finished dvzip (milestone 1, green); just told to continue
-  autonomously through ALL luftlift PORT.md milestones (CPIO reader next).
-- Both given an AUTONOMOUS directive (don't wait between milestones; only stop on a
-  real blocker: needing a workspace dep [name it], cross-crate contract, design fork).
+  - `3a5acbf red(awdl): parse radiotap header metadata`
+  - `fb2ec41 green(airdrop): dvzip framed-zlib round-trip`
+  - `c4d24db red(airdrop): dvzip framed-zlib round-trip` + scaffold/workflow.
+- gpt-5.5 (filin): radiotap done (green). Wrote+committed `red(filin): parse 80211
+  mac header` this cycle; now working the AWDL PSF vendor-action-frame parser
+  (parse_action_frame, ActionSubtype::Psf, phy_tx/target_tx/TLVs). Continuing
+  autonomously through filin PORT.md.
+- GLM-5.2 (luftlift): dvzip + ODC CPIO reader done (green). Working autonomously on
+  milestones 3→5: chunked HTTP body decode + minimal HTTP/1.1 request parser +
+  plist + mDNS/TLS handlers. Read server.py.patched for grounding.
+- Tree status: `cargo test` shows 1 expected RED failure (filin 802.11 header test,
+  just committed as the red stage); gpt-5.5 is implementing its green now.
+- Both on AUTONOMOUS directive (only stop on real blocker: workspace dep [name it],
+  cross-crate contract, design fork).
 
 ## YOUR PER-HEARTBEAT CHECKLIST
 1. `git -C /home/ayourtch/rust/opendrop log --oneline -15` — see new commits; sanity
