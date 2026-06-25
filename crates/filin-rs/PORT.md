@@ -70,14 +70,34 @@ grepping `/tmp/fF.log`. See `FILIN_HTTP_INTROSPECT.md` for the full rationale.
   snapshot — it never takes a lock on the hot path.
 - **Endpoints** (JSON):
   - `GET /status` → `current_channel`, `master_mac`, `master_seq`,
-    `synced`, `peer_count`, `rebroadcast_counts: {"6":N,"44":N,"149":N}`,
-    `mdns_rx_self`, `mdns_rx_other`. The `mdns_rx_other` counter is the direct
-    "are we hearing the iPhone at all?" signal.
+    `synced`, `peer_count`, `master_anchor`, `rebroadcast_counts: {"<chan>":N,...}`
+    (adaptive — includes the anchor), `mdns_rx_self`, `mdns_rx_other`. The
+    `mdns_rx_other` counter is the direct "are we hearing the iPhone at all?"
+    signal.
   - `GET /peers` → array of `{ mac, last_seen_ms_ago, decoded_chanseq, current_channel }`.
   - `GET /trace?n=300` → last N structured trace events from a 2000-cap ring.
   - `POST /trace` with `{"level":"off|debug|trace"}` → flips the `AtomicU8` that
     gates whether the custom `tracing` Layer pushes events into the ring (off
     by default, so the hot path is one relaxed load + compare).
+
+## Adaptive anchor re-broadcast + dwell (FILIN_ANCHOR_REBROADCAST.md)
+On a cluster whose master anchors on a non-social channel (e.g. **52** DFS),
+filin previously only re-broadcast the cached announce on the hardcoded
+6/44/149 and barely dwelled on 52 — the iPhone never heard us. filin now reads
+the **anchor** from the adopted master's decoded channel sequence (slot-0 /
+dominant channel) at runtime and:
+
+1. **Re-broadcasts** the cached mDNS announce on the anchor in addition to
+   6/44/149 (`rebroadcast_channels(anchor)` → `AnnounceCache::rebroadcast`
+   allowed set). The `/status` `rebroadcast_counts` map now tracks any channel
+   (e.g. `"52"`), not just the three socials.
+2. **Dwells** on the anchor: `ensure_social_coverage(seq, anchor)` fills null
+   slots alternating anchor / social so the anchor gets ~50% of fills —
+   materially more than the bare ~6% from the master's sequence alone.
+
+Key types: `schedule::master_anchor_channel`, `schedule::rebroadcast_channels`,
+`state::AwdlState::master_anchor`. All read at runtime — no hardcoded channel
+numbers beyond the AWDL social baseline.
 
 Coordinate with Claude (orchestrator) for: workspace dep additions, the awdl0
 contract, and anything that would touch shared files. Keep all your code under

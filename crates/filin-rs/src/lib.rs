@@ -5078,10 +5078,10 @@ pub mod runtime {
         ) != 0 {
             return; // inside multicast guard; retry next iteration
         }
-        // TEMP: use static social channels; the integration step swaps this
-        // for rebroadcast_channels(awdl_state.master_anchor) so the anchor is
-        // included adaptively.
-        let allowed = crate::schedule::AWDL_SOCIAL_CHANNEL_NUMS;
+        // Adaptive allowed set: social channels PLUS the adopted master's
+        // anchor channel (e.g. 52 on a DFS-anchored cluster), so the cached
+        // announce is re-broadcast on the anchor too.
+        let allowed = crate::schedule::rebroadcast_channels(awdl_state.master_anchor);
         if let Some(frame) = cache.rebroadcast(channel, now_us, &allowed) {
             match links.packet.send(frame) {
                 Ok(sent) => {
@@ -5490,6 +5490,7 @@ pub mod runtime {
             master_seq: last_injected_seq,
             synced: state.election.sync_addr != state.self_addr,
             peer_count: state.peers.len(),
+            master_anchor: state.master_anchor,
         }
     }
 
@@ -6621,6 +6622,9 @@ pub mod introspect {
         pub master_seq: u16,
         pub synced: bool,
         pub peer_count: usize,
+        /// The adopted master's anchor channel (slot-0 / dominant). 0 when
+        /// self-master or no master. Surfaced in /status for debugging.
+        pub master_anchor: u8,
     }
 
     /// Capacity of the trace ring buffer (FILIN_HTTP_INTROSPECT.md: ~2000).
@@ -6954,6 +6958,7 @@ pub mod introspect {
             master_seq: u16,
             synced: bool,
             peer_count: usize,
+            master_anchor: u8,
             rebroadcast_counts: serde_json::Map<String, serde_json::Value>,
             mdns_rx_self: u64,
             mdns_rx_other: u64,
@@ -6966,6 +6971,7 @@ pub mod introspect {
                 master_seq: snapshot.master_seq,
                 synced: snapshot.synced,
                 peer_count: snapshot.peer_count,
+                master_anchor: snapshot.master_anchor,
                 rebroadcast_counts: rebroadcast,
                 mdns_rx_self: intro.counters.mdns_rx_self(),
                 mdns_rx_other: intro.counters.mdns_rx_other(),
@@ -7345,12 +7351,14 @@ pub mod introspect {
                 master_seq: 7,
                 synced: true,
                 peer_count: 2,
+                master_anchor: 52,
             };
 
             let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
             let obj = json.as_object().expect("snapshot is a JSON object");
 
             assert_eq!(obj.get("current_channel").and_then(|v| v.as_u64()), Some(44));
+            assert_eq!(obj.get("master_anchor").and_then(|v| v.as_u64()), Some(52));
             assert_eq!(
                 obj.get("master_mac").and_then(|v| v.as_str()),
                 Some("02:aa:bb:cc:dd:ee")
@@ -7376,6 +7384,7 @@ pub mod introspect {
                 master_seq: 42,
                 synced: false,
                 peer_count: 1,
+                master_anchor: 0,
             };
             intro.set_status(snapshot.clone());
 
@@ -7395,6 +7404,7 @@ pub mod introspect {
                 master_seq: 3,
                 synced: true,
                 peer_count: 4,
+                master_anchor: 0,
             });
 
             assert_eq!(intro.counters.mdns_rx_other(), 1);
@@ -7624,6 +7634,7 @@ pub mod introspect {
                 master_seq: 9,
                 synced: true,
                 peer_count: 2,
+                master_anchor: 0,
             });
             intro.counters.inc_mdns_rx_self();
             intro.counters.inc_mdns_rx_self();
@@ -7823,6 +7834,7 @@ pub mod introspect {
                 master_seq: 5,
                 synced: true,
                 peer_count: 1,
+                master_anchor: 0,
             });
             intro.counters.inc_mdns_rx_other();
             intro.counters.inc_rebroadcast(44);
