@@ -571,3 +571,48 @@ pub mod election {
         }
     }
 }
+
+pub mod sync {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SyncState {
+        pub last_update_us: u64,
+        pub aw_counter: u16,
+        pub aw_period_tu: u16,
+        pub presence_mode: u16,
+    }
+
+    impl SyncState {
+        pub fn new(now_us: u64) -> Self {
+            Self {
+                last_update_us: now_us,
+                aw_counter: 0,
+                aw_period_tu: 16,
+                presence_mode: 4,
+            }
+        }
+
+        pub fn update_from_master(
+            &mut self,
+            _rx_hw_time_us: u64,
+            _time_to_next_aw_tu: u16,
+            _aw_counter: u16,
+        ) {
+            unimplemented!("RED: sync update not implemented yet")
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn updates_schedule_from_hardware_timestamped_master_sync() {
+            let mut sync = SyncState::new(1_000_000);
+
+            sync.update_from_master(2_000_000, 20, 18);
+
+            assert_eq!(sync.last_update_us, 2_000_000 - (64 - 20) * 1024);
+            assert_eq!(sync.aw_counter, 16);
+        }
+    }
+}
