@@ -1171,11 +1171,13 @@ pub mod rx {
         bridge: &mut TsftBridge,
     ) -> Result<ParsedActionFrame<'a>, ParseError> {
         let radiotap = radiotap::parse_header(frame).map_err(|_| ParseError::Radiotap)?;
-        let hw_tsft = radiotap.tsft.ok_or(ParseError::MissingTsft)?;
         let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(|_| ParseError::Ieee80211)?;
         let action = awdl::parse_action_frame(mac.body).map_err(|_| ParseError::Awdl)?;
         let tlvs = awdl::parse_tlvs(action.tlvs).map_err(|_| ParseError::Awdl)?;
-        let rx_time_us = bridge.timestamp_rx(hw_tsft, host_now_us);
+        let rx_time_us = radiotap
+            .tsft
+            .map(|hw_tsft| bridge.timestamp_rx(hw_tsft, host_now_us))
+            .unwrap_or(host_now_us);
 
         Ok(ParsedActionFrame {
             rx_time_us,
