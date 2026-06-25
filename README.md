@@ -127,6 +127,74 @@ Then, on an Apple device with the Sharing pane open, AirDrop a file to the Linux
 host. Watch `filin`'s `sync_error` log line settle to a low, stable value (that's
 the sign AWDL sync is usable) before expecting traffic on `awdl0`.
 
+## Concrete run sequence after a reboot (this box: ayourtch-x280)
+
+The exact commands to bring the live stack back up by hand. The carl9170 monitor
+interface is `wlxbc05430d50a1` (MAC `bc:05:43:0d:50:a1`). Run everything below as
+**root** (the filin/luftlift processes need raw sockets + TAP).
+
+```bash
+# 0. Verify the card enumerated and loaded firmware CLEANLY (no -110 errors).
+dmesg | grep -iE 'carl9170|firmware' | tail
+#   want a successful firmware load; if you see 'firmware upload failed (-110)' /
+#   'Failed to restart device (-110)', the card is wedged: try another USB port
+#   (a software re-auth `echo 0|1 > /sys/bus/usb/devices/<dev>/authorized` usually
+#   does NOT recover a -110; a fresh replug into a different port, or reboot, does).
+
+# 1. Put the card into plain monitor mode on channel 44.
+nmcli dev set wlxbc05430d50a1 managed no
+ip link set wlxbc05430d50a1 down
+iw dev wlxbc05430d50a1 set type monitor
+ip link set wlxbc05430d50a1 up
+iw dev wlxbc05430d50a1 set channel 44
+ip -br link show wlxbc05430d50a1          # expect: ... UP ...
+
+# 2. Repo + output dirs.
+cd /home/ayourtch/rust/opendrop
+mkdir -p /tmp/ldrop /tmp/ldrop_raw
+# (binaries are prebuilt in target/release; rebuild only if code changed:)
+# cargo build --release -p filin-rs -p luftlift-rs
+
+# 3. Kill any stragglers, then launch filin FIRST (it creates awdl0), then luftlift.
+pkill -9 -f target/release/filin; pkill -9 -f target/release/luftlift; sleep 2
+RUST_LOG=filin_rs=debug \
+  ./target/release/filin -i wlxbc05430d50a1 -c 44 -h awdl0 -N > /tmp/fF.log 2>&1 &
+sleep 4
+RUST_LOG=luftlift_rs=debug,luftlift=info LUFTLIFT_DUMP_UPLOAD=/tmp/ldrop_raw \
+  ./target/release/luftlift -i awdl0 receive -o /tmp/ldrop > /tmp/lrF.log 2>&1 &
+sleep 4
+pgrep -af 'target/release/(filin|luftlift)'   # both should be listed
+```
+
+Verify it's healthy (strip color codes with the `sed` below):
+
+```bash
+# filin is hopping and DOES visit ch149 (the AirDrop social channel):
+sed 's/\x1b\[[0-9;]*m//g' /tmp/fF.log | grep -oE 'channel=[0-9]+' | sort | uniq -c
+# the cached mDNS announce is re-broadcast ~1s on the social channels incl 149:
+sed 's/\x1b\[[0-9;]*m//g' /tmp/fF.log | grep 're-broadcast cached' \
+  | grep -oE 'channel=[0-9]+' | sort | uniq -c
+# luftlift announced + HTTPS listener bound + re-announcing every 10s:
+tail /tmp/lrF.log
+# announce is actually on-wire (run as root; needs CAP_NET_RAW):
+timeout 6 tcpdump -i awdl0 -nn -c4 udp port 5353
+```
+
+Now open the AirDrop sheet on the iPhone → `luftlift` should appear in the picker →
+send a **photo**. Watch the result:
+
+```bash
+# discovery + transfer progress:
+sed 's/\x1b\[[0-9;]*m//g' /tmp/lrF.log | grep -iE 'Discover|Ask|Upload|received|error'
+# the received file (should be non-empty) and the raw dvzip capture for offline diff:
+ls -l /tmp/ldrop/ /tmp/ldrop_raw/
+# cross-check a raw capture against the python reference decoder:
+python3 opendrop-patch/dvzip.py /tmp/ldrop_raw/upload-*.bin   # -> *.cpio
+```
+
+To restart just the stack later: `pkill -9 -f target/release/filin; pkill -9 -f
+target/release/luftlift`, then re-run step 3 (filin first, then luftlift).
+
 ## Hardware
 
 AWDL sync over USB monitor interfaces is the flaky part and is best done with the
