@@ -5148,6 +5148,58 @@ pub mod runtime {
             .collect()
     }
 
+    /// Classify an Ethernet frame as mDNS and report whether the source MAC is
+    /// `self_addr`. Returns `Some(true)` for our own mDNS, `Some(false)` for a
+    /// peer's mDNS, `None` for non-mDNS (not IP, not UDP, or port != 5353).
+    /// Handles IPv4 (with the IHL-driven header length) and IPv6. Used by the
+    /// hot loop to bump `mdns_rx_self` / `mdns_rx_other` on the introspection
+    /// counters — directly answers "are we hearing the iPhone at all?".
+    #[allow(dead_code)] // wired in the next integration commit
+    fn classify_mdns(frame: &[u8], self_addr: [u8; 6]) -> Option<bool> {
+        const MDNS_PORT: u16 = 5353;
+        const PROTO_UDP: u8 = 17;
+        if frame.len() < 14 {
+            return None;
+        }
+        let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        let dst_port = match ethertype {
+            0x0800 => {
+                // IPv4: protocol at offset 23, IHL-driven header length.
+                let ihl = usize::from(frame.get(14)? & 0x0f) * 4;
+                if ihl < 20 {
+                    return None;
+                }
+                let proto = *frame.get(23)?;
+                if proto != PROTO_UDP {
+                    return None;
+                }
+                let udp_start = 14 + ihl;
+                u16::from_be_bytes([
+                    *frame.get(udp_start + 2)?,
+                    *frame.get(udp_start + 3)?,
+                ])
+            }
+            0x86dd => {
+                // IPv6: next header at offset 20, fixed 40-byte header.
+                let next_header = *frame.get(20)?;
+                if next_header != PROTO_UDP {
+                    return None;
+                }
+                let udp_start = 14 + 40;
+                u16::from_be_bytes([
+                    *frame.get(udp_start + 2)?,
+                    *frame.get(udp_start + 3)?,
+                ])
+            }
+            _ => return None,
+        };
+        if dst_port != MDNS_PORT {
+            return None;
+        }
+        Some(src_mac == self_addr)
+    }
+
     /// owl `gethostname` for the ARPA TLV peer name (owl/daemon/core.c:362-364).
     fn hostname() -> String {
         let mut buf = [0u8; 256];
