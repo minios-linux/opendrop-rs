@@ -497,7 +497,7 @@ pub mod election {
         let mut selected = local.clone();
 
         for peer in peers {
-            if compare_master(peer, &selected).is_gt() {
+            if should_adopt(peer, &selected) {
                 selected = ElectionState {
                     self_addr: local.self_addr,
                     sync_addr: peer.self_addr,
@@ -511,6 +511,17 @@ pub mod election {
         }
 
         selected
+    }
+
+    fn should_adopt(peer: &ElectionState, current: &ElectionState) -> bool {
+        match compare_master(peer, current) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => {
+                peer.height < current.height
+                    || (peer.height == current.height && peer.self_addr > current.self_addr)
+            }
+        }
     }
 
     fn compare_master(a: &ElectionState, b: &ElectionState) -> std::cmp::Ordering {
