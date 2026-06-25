@@ -5354,6 +5354,105 @@ pub mod runtime {
             assert_eq!(v.decoded_chanseq[0], 44);
             assert_eq!(v.decoded_chanseq[1], 149);
         }
+
+        /// Build a minimal Ethernet/IPv4/UDP frame with the given src MAC and
+        /// UDP dst port. IPv4 header is the 20-byte fixed part (IHL=5).
+        fn ipv4_udp_frame(src_mac: [u8; 6], dst_port: u16) -> Vec<u8> {
+            let mut f = Vec::new();
+            f.extend_from_slice(&[0xff; 6]); // dst broadcast
+            f.extend_from_slice(&src_mac);
+            f.extend_from_slice(&0x0800u16.to_be_bytes()); // ethertype IPv4
+            // IPv4 header (20 bytes)
+            f.push(0x45); // ver=4, IHL=5
+            f.push(0x00); // DSCP/ECN
+            f.extend_from_slice(&0u16.to_be_bytes()); // total length
+            f.extend_from_slice(&0u16.to_be_bytes()); // id
+            f.extend_from_slice(&0u16.to_be_bytes()); // flags/frag
+            f.push(64); // TTL
+            f.push(17); // protocol = UDP (offset 23)
+            f.extend_from_slice(&0u16.to_be_bytes()); // checksum
+            f.extend_from_slice(&[224, 0, 0, 251]); // src IP
+            f.extend_from_slice(&[224, 0, 0, 251]); // dst IP
+            // UDP header
+            f.extend_from_slice(&5353u16.to_be_bytes()); // src port
+            f.extend_from_slice(&dst_port.to_be_bytes()); // dst port
+            f.extend_from_slice(&0u16.to_be_bytes()); // length
+            f.extend_from_slice(&0u16.to_be_bytes()); // checksum
+            f.extend_from_slice(b"payload");
+            f
+        }
+
+        /// Build a minimal Ethernet/IPv6/UDP frame with the given src MAC and
+        /// UDP dst port.
+        fn ipv6_udp_frame(src_mac: [u8; 6], dst_port: u16) -> Vec<u8> {
+            let mut f = Vec::new();
+            f.extend_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0xfb]); // IPv6 mcast dst
+            f.extend_from_slice(&src_mac);
+            f.extend_from_slice(&0x86ddu16.to_be_bytes()); // ethertype IPv6
+            // IPv6 header (40 bytes)
+            f.extend_from_slice(&0x60u32.to_be_bytes()); // version=6, TC=0, FL=0
+            f.extend_from_slice(&0u16.to_be_bytes()); // payload length
+            f.extend_from_slice(&[0]); // next header placeholder (set below at offset 20)
+            f.push(64); // hop limit
+            f.extend_from_slice(&[0xfe; 16]); // src IP
+            f.extend_from_slice(&[0xff; 16]); // dst IP (ff02::fb)
+            // fix next header at offset 20 (14+6) to UDP (17)
+            f[20] = 17;
+            // UDP header
+            f.extend_from_slice(&5353u16.to_be_bytes()); // src port
+            f.extend_from_slice(&dst_port.to_be_bytes()); // dst port
+            f.extend_from_slice(&0u16.to_be_bytes()); // length
+            f.extend_from_slice(&0u16.to_be_bytes()); // checksum
+            f.extend_from_slice(b"payload");
+            f
+        }
+
+        #[test]
+        fn classify_mdns_identifies_ipv4_5353_by_source_mac() {
+            let self_mac = [0x02, 0, 0, 0, 0, 1];
+            let other_mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+            assert_eq!(
+                classify_mdns(&ipv4_udp_frame(self_mac, 5353), self_mac),
+                Some(true)
+            );
+            assert_eq!(
+                classify_mdns(&ipv4_udp_frame(other_mac, 5353), self_mac),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn classify_mdns_handles_ipv6_and_non_mdns_ports() {
+            let self_mac = [0x02, 0, 0, 0, 0, 1];
+            let other_mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+            assert_eq!(
+                classify_mdns(&ipv6_udp_frame(other_mac, 5353), self_mac),
+                Some(false)
+            );
+            // Not mDNS port → None
+            assert_eq!(classify_mdns(&ipv4_udp_frame(other_mac, 1234), self_mac), None);
+            assert_eq!(classify_mdns(&ipv6_udp_frame(other_mac, 1234), self_mac), None);
+        }
+
+        #[test]
+        fn classify_mdns_ignores_non_ip_non_udp_and_short_frames() {
+            let self_mac = [0x02, 0, 0, 0, 0, 1];
+
+            // ARP (non-IP)
+            let mut arp = vec![
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0x02, 0, 0, 0, 0, 1,
+                0x08, 0x06, // ethertype ARP
+            ];
+            arp.extend_from_slice(&[0u8; 20]);
+            assert_eq!(classify_mdns(&arp, self_mac), None);
+
+            // Too short
+            assert_eq!(classify_mdns(&[0u8; 5], self_mac), None);
+            assert_eq!(classify_mdns(&[0u8; 30], self_mac), None);
+        }
     }
 }
 
