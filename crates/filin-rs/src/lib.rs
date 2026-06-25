@@ -605,16 +605,42 @@ pub mod sync {
 
         pub fn sync_error_tu(
             &self,
-            _now_us: u64,
-            _time_to_next_aw_tu: u16,
-            _aw_counter: u16,
+            now_us: u64,
+            time_to_next_aw_tu: u16,
+            aw_counter: u16,
         ) -> i64 {
-            unimplemented!("RED: sync error not implemented yet")
+            let master_delta = (u64::from(aw_counter) / u64::from(self.presence_mode)) as i64
+                - i64::from(self.current_eaw(now_us));
+            let aw_delta = i64::from(time_to_next_aw_tu) - i64::from(self.next_aw_tu(now_us));
+            master_delta * i64::from(self.presence_mode) * i64::from(self.aw_period_tu) - aw_delta
+        }
+
+        pub fn next_aw_tu(&self, now_us: u64) -> u16 {
+            let eaw_period_tu = u64::from(self.presence_mode) * u64::from(self.aw_period_tu);
+            let time_since_tu = us_to_tu(now_us - self.last_update_us);
+            (eaw_period_tu - (time_since_tu % eaw_period_tu)) as u16
+        }
+
+        pub fn current_aw(&self, now_us: u64) -> u16 {
+            let eaw_period_tu = u64::from(self.presence_mode) * u64::from(self.aw_period_tu);
+            let time_since_tu = us_to_tu(now_us - self.last_update_us);
+            let current_aw = u64::from(self.aw_counter)
+                + (time_since_tu % eaw_period_tu) / u64::from(self.aw_period_tu)
+                + u64::from(self.presence_mode) * (time_since_tu / eaw_period_tu);
+            current_aw as u16
+        }
+
+        pub fn current_eaw(&self, now_us: u64) -> u16 {
+            self.current_aw(now_us) / self.presence_mode
         }
     }
 
     fn tu_to_us(tu: u64) -> u64 {
         tu * 1024
+    }
+
+    fn us_to_tu(us: u64) -> u64 {
+        us / 1024
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
