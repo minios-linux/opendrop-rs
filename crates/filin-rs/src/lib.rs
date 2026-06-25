@@ -2649,7 +2649,7 @@ pub mod schedule {
             // Make some slots null so there's room to inject.
             seq[5] = [0, 0];
             seq[6] = [0, 0];
-            let injected = ensure_social_coverage(&mut seq);
+            let injected = ensure_social_coverage(&mut seq, 0);
             assert!(injected.contains(&6));
             assert!(injected.contains(&149));
             // 149 and 6 now appear in the sequence.
@@ -2666,7 +2666,7 @@ pub mod schedule {
             // ensure_social_coverage must overwrite DUPLICATE 44 slots to
             // inject 6 and 149 without removing 44 entirely.
             let mut seq = [[44u8, 0x80]; CHANSEQ_LEN];
-            ensure_social_coverage(&mut seq);
+            ensure_social_coverage(&mut seq, 0);
             assert!(seq.iter().any(|s| s[0] == 149));
             assert!(seq.iter().any(|s| s[0] == 6));
             assert!(seq.iter().any(|s| s[0] == 44), "44 must survive");
@@ -2679,7 +2679,7 @@ pub mod schedule {
             seq[0] = [6, 0x51];
             seq[1] = [44, 0x80];
             seq[2] = [149, 0x80];
-            let injected = ensure_social_coverage(&mut seq);
+            let injected = ensure_social_coverage(&mut seq, 0);
             assert!(injected.is_empty());
         }
 
@@ -2691,7 +2691,7 @@ pub mod schedule {
             let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
             seq[0] = [36, 0x80]; // non-social, single occurrence
             // 5 null slots for 6, 44, 149.
-            let injected = ensure_social_coverage(&mut seq);
+            let injected = ensure_social_coverage(&mut seq, 0);
             assert_eq!(injected.len(), 3);
             assert!(seq.iter().any(|s| s[0] == 36), "ch36 must survive");
         }
@@ -2708,7 +2708,7 @@ pub mod schedule {
             // 15 nulls. ensure_social_coverage injects the missing 6/149
             // (44 already present), then fills the remaining 13 nulls
             // round-robin 149/6/44 starting at 149.
-            ensure_social_coverage(&mut seq);
+            ensure_social_coverage(&mut seq, 0);
             let count_149 = seq.iter().filter(|s| s[0] == 149).count();
             assert!(
                 count_149 > 1,
@@ -2732,7 +2732,7 @@ pub mod schedule {
             seq[2] = [0, 0];
             // 44 already present (13 slots); 6 and 149 missing → 2 injected
             // into nulls; the 3rd null filled round-robin (starts at 149).
-            ensure_social_coverage(&mut seq);
+            ensure_social_coverage(&mut seq, 0);
             // No nulls remain.
             assert!(!seq.iter().any(|s| s[0] == 0));
             // 149 present at least twice (1 injected + 1 round-robin).
@@ -2747,9 +2747,78 @@ pub mod schedule {
             let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
             seq[0] = [36, 0x80]; // non-social master channel
             seq[5] = [149, 0x80]; // social, already present
-            ensure_social_coverage(&mut seq);
+            ensure_social_coverage(&mut seq, 0);
             assert_eq!(seq[0], [36, 0x80], "master ch36 slot untouched");
             assert_eq!(seq[5], [149, 0x80], "master ch149 slot untouched");
+        }
+
+        // --- FILIN_ANCHOR_REBROADCAST.md: anchor-biased dwell ---
+
+        #[test]
+        fn anchor_biased_fill_gives_anchor_materially_more_dwell() {
+            // The live iPhone cluster's decoded sequence:
+            // [52,0,44,0,0,0,0,0,6,0,44,0,...] — slot 0 = 52 (anchor).
+            // After ensure_social_coverage with anchor=52, the anchor must
+            // occupy materially more than ~6% of slots (the bare 1/16 it had
+            // from the master). Target: at least 25% (4/16).
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [52, 0x80]; // anchor at slot 0
+            seq[2] = [44, 0x80]; // some master channels
+            seq[8] = [6, 0x51];
+            seq[10] = [44, 0x80];
+            // 12 null slots. ensure_social_coverage injects 149 (missing
+            // social), then fills remaining nulls biased toward the anchor.
+            ensure_social_coverage(&mut seq, 52);
+
+            let anchor_count = seq.iter().filter(|s| s[0] == 52).count();
+            assert!(
+                anchor_count >= 4,
+                "anchor 52 must get >=4/16 slots (got {}), was ~1/16 before",
+                anchor_count
+            );
+            // All three social channels must still be present.
+            assert!(seq.iter().any(|s| s[0] == 149));
+            assert!(seq.iter().any(|s| s[0] == 6));
+            assert!(seq.iter().any(|s| s[0] == 44));
+            // No nulls remain.
+            assert!(!seq.iter().any(|s| s[0] == 0));
+        }
+
+        #[test]
+        fn anchor_biased_fill_prefers_anchor_over_social_for_nulls() {
+            // With many nulls, the anchor should dominate: more anchor slots
+            // than any individual social channel in the filled nulls.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [52, 0x80]; // anchor
+            // 15 nulls — no other master channels.
+            ensure_social_coverage(&mut seq, 52);
+
+            let anchor_count = seq.iter().filter(|s| s[0] == 52).count();
+            let ch149_count = seq.iter().filter(|s| s[0] == 149).count();
+            let ch6_count = seq.iter().filter(|s| s[0] == 6).count();
+            let ch44_count = seq.iter().filter(|s| s[0] == 44).count();
+            assert!(
+                anchor_count > ch149_count
+                    && anchor_count > ch6_count
+                    && anchor_count > ch44_count,
+                "anchor ({} slots) must dominate socials (149:{}, 6:{}, 44:{})",
+                anchor_count,
+                ch149_count,
+                ch6_count,
+                ch44_count
+            );
+        }
+
+        #[test]
+        fn anchor_zero_falls_back_to_dense_149_round_robin() {
+            // anchor=0 (no master) → preserve the old round-robin behavior:
+            // 149 gets the most slots. Backward-compatible.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [44, 0x80]; // one real master channel
+            ensure_social_coverage(&mut seq, 0);
+            let count_149 = seq.iter().filter(|s| s[0] == 149).count();
+            assert!(count_149 > 1, "149 must still get dense dwell");
+            assert!(!seq.iter().any(|s| s[0] == 0));
         }
 
         // --- Part A: AnnounceCache cached mDNS re-broadcast ---
