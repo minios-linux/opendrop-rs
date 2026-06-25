@@ -1377,8 +1377,14 @@ pub mod os {
             pub bytes: [u8; libc::IFNAMSIZ],
         }
 
-        pub fn plan_if_name(_name: &str) -> Result<IfName, Error> {
-            Err(Error::InvalidName)
+        pub fn plan_if_name(name: &str) -> Result<IfName, Error> {
+            let raw = name.as_bytes();
+            if raw.is_empty() || raw.len() >= libc::IFNAMSIZ {
+                return Err(Error::InvalidName);
+            }
+            let mut bytes = [0u8; libc::IFNAMSIZ];
+            bytes[..raw.len()].copy_from_slice(raw);
+            Ok(IfName { bytes })
         }
 
         pub fn up_flags(existing: libc::c_short) -> libc::c_short {
