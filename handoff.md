@@ -90,6 +90,27 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 12 (91 tests green; filin DONE; luftlift on its LAST milestone — send TLS+main).
+- filin: COMPLETE (27 tests, clippy clean, RUN.md done). Standing by. No more work.
+- luftlift: send client nearly done — CPIO/dvzip encoders, TLS client cfg, request
+  builders + send flow (w/ UTI type map) all green. LAST item in flight: RustlsTransport
+  (real TLS stream) + wire `send` into main.rs. 64 tests. Then it's a full peer
+  (send+receive+find).
+- Tree: 91 tests green (filin 27 + luftlift 64).
+- *** NEXT HEARTBEAT = likely ENDGAME ***: once luftlift's send+main lands (watch for
+  the green commit + idle), RUN THE INTEGRATION PASS:
+    1. cd /home/ayourtch/rust/opendrop
+    2. cargo build --release            (both bins compile in release)
+    3. cargo test --workspace           (all green)
+    4. cargo clippy --workspace --all-targets -- -D warnings
+    5. ./target/release/filin --help ; ./target/release/luftlift --help
+       (and `luftlift find -d 3` is safe/verified; do NOT run receive/awdl0 — no hw)
+  Then write the SUCCESS REPORT to the human (see WHEN TO SURFACE): what works +
+  tested (parsers/codecs/protocol/mDNS/TLS/HTTP, AWDL election/sync/TSFT bridge/
+  channel/TX, AirDrop send+receive+find), how to run each bin, and the ONE remaining
+  thing = live hardware interop pass (carl9170 monitor ch44 + awake iPhone; filin
+  RUN.md has the steps). Don't claim live-validated — it's compile+unit-tested.
+--- (prior cycle notes below) ---
 Last updated: cycle 11 (filin COMPLETE incl OS layer; luftlift building send client; 79 tests green).
 - filin (gpt-5.5): **DONE through all of PORT.md incl. the real OS layer** — TAP awdl0,
   AF_PACKET RX/TX, netdev ioctls (MAC/MTU1450/up), nl80211 channel set, binary poll
