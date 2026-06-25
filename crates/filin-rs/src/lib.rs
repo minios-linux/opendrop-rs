@@ -602,6 +602,15 @@ pub mod sync {
                 rx_hw_time_us - tu_to_us(eaw_period_tu - u64::from(time_to_next_aw_tu));
             self.aw_counter = aw_counter & 0xfffc;
         }
+
+        pub fn sync_error_tu(
+            &self,
+            _now_us: u64,
+            _time_to_next_aw_tu: u16,
+            _aw_counter: u16,
+        ) -> i64 {
+            unimplemented!("RED: sync error not implemented yet")
+        }
     }
 
     fn tu_to_us(tu: u64) -> u64 {
@@ -663,6 +672,14 @@ pub mod sync {
 
             assert_eq!(bridge.timestamp_rx(1_000, 101_000), 101_000);
             assert_eq!(bridge.timestamp_rx(2_000, 104_000), 102_125);
+        }
+
+        #[test]
+        fn computes_zero_sync_error_for_matching_master_schedule() {
+            let mut sync = SyncState::new(0);
+            sync.update_from_master(2_000_000, 20, 18);
+
+            assert_eq!(sync.sync_error_tu(2_000_000, 20, 18), 0);
         }
     }
 }
