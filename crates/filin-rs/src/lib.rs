@@ -220,6 +220,12 @@ pub mod awdl {
         pub value: &'a [u8],
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct SyncParameters {
+        pub time_to_next_aw_tu: u16,
+        pub aw_counter: u16,
+    }
+
     pub fn parse_action_frame(body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
         if body.len() < 16 {
             return Err(ParseError::TooShort);
@@ -264,6 +270,10 @@ pub mod awdl {
         }
 
         Ok(tlvs)
+    }
+
+    pub fn parse_sync_parameters(_value: &[u8]) -> Result<SyncParameters, ParseError> {
+        Err(ParseError::TooShort)
     }
 
     #[cfg(test)]
@@ -313,6 +323,23 @@ pub mod awdl {
                         value: &[0x01, 0x02, 0x03, 0x04]
                     }
                 ]
+            );
+        }
+
+        #[test]
+        fn parses_sync_parameters_tlv_timing_fields() {
+            let mut value = [0u8; 31];
+            value[1..3].copy_from_slice(&0x1234u16.to_le_bytes());
+            value[29..31].copy_from_slice(&0x5678u16.to_le_bytes());
+
+            let parsed = parse_sync_parameters(&value).expect("valid sync parameters TLV");
+
+            assert_eq!(
+                parsed,
+                SyncParameters {
+                    time_to_next_aw_tu: 0x1234,
+                    aw_counter: 0x5678
+                }
             );
         }
     }
