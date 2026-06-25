@@ -123,6 +123,22 @@ pub fn format_response(resp: &HttpResponse) -> Vec<u8> {
     out
 }
 
+/// Format an [`HttpRequest`] as wire bytes (request line + headers + body).
+/// Auto-adds a `Content-Length` header unless a `Transfer-Encoding` is set.
+/// Used by the AirDrop *sender* to serialise POST requests onto the TLS stream.
+pub fn format_request(req: &HttpRequest) -> Vec<u8> {
+    let _ = req;
+    Vec::new()
+}
+
+/// Parse an HTTP/1.1 response from raw bytes (status line + headers + body).
+/// Only reads a `Content-Length`-delimited body (AirDrop responses are small
+/// binary plists sent with Content-Length). Returns the status, headers, body.
+pub fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
+    let _ = raw;
+    Err(HttpError::BadRequestLine)
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
@@ -203,5 +219,71 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.starts_with("HTTP/1.1 404 "));
         assert!(text.contains("Content-Length: 0\r\n"));
+    }
+
+    // ---- format_request (sender side) ----
+
+    fn req(method: &str, path: &str, headers: Vec<(&str, &str)>, body: Vec<u8>) -> HttpRequest {
+        let mut h = HashMap::new();
+        for (k, v) in headers {
+            h.insert(k.to_ascii_lowercase(), v.to_string());
+        }
+        HttpRequest { method: method.into(), path: path.into(), headers: h, body }
+    }
+
+    #[test]
+    fn format_request_post_with_body_adds_content_length() {
+        let r = req(
+            "POST",
+            "/Discover",
+            vec![("Host", "[fe80::1]:8771"), ("Content-Type", "application/x-apple-plist")],
+            b"hello".to_vec(),
+        );
+        let bytes = format_request(&r);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.starts_with("POST /Discover HTTP/1.1\r\n"));
+        assert!(text.contains("Host: [fe80::1]:8771\r\n"));
+        assert!(text.contains("Content-Type: application/x-apple-plist\r\n"));
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert!(text.ends_with("\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn format_request_skips_content_length_when_chunked() {
+        // iOS-18 Discover/Ask: chunked body, NO Content-Length. The caller
+        // sets Transfer-Encoding: chunked and is expected to have already
+        // chunk-framed the body.
+        let r = req(
+            "POST",
+            "/Ask",
+            vec![("Transfer-Encoding", "chunked")],
+            b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
+        );
+        let bytes = format_request(&r);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!text.contains("content-length"));
+    }
+
+    // ---- parse_response (sender side) ----
+
+    #[test]
+    fn parse_response_extracts_status_headers_body() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Content-Type: application/x-apple-plist\r\n\
+                    Content-Length: 5\r\n\
+                    \r\n\
+                    hello";
+        let resp = parse_response(raw).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[test]
+    fn parse_response_handles_error_status() {
+        let raw = b"HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\n\r\n";
+        let resp = parse_response(raw).unwrap();
+        assert_eq!(resp.status, 406);
+        assert!(resp.body.is_empty());
     }
 }
