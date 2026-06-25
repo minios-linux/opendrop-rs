@@ -4774,19 +4774,17 @@ pub mod state {
             assert_eq!(state.current_channel, 44);
         }
 
-        // --- FILIN_SYNC_QUALITY.md Part B: re-parent hysteresis keyed on
-        //     master_addr stability — do NOT re-adopt the channel sequence
-        //     when re-parenting among peers sharing the same top master. ---
+        // --- FILIN_SYNC_QUALITY.md regression: peers retained + channel
+        //     sequence re-adopted through normal cluster churn. ---
 
         fn peer_with_cluster(addr: [u8; 6], top: [u8; 6], counter: u32) -> awdl::Tlv<'static> {
-            // election v2 TLV: master_addr=top, sync_addr=addr(self), counter.
             let mut v = vec![0u8; 40];
             v[0..6].copy_from_slice(&top);
             v[6..12].copy_from_slice(&addr);
             v[12..16].copy_from_slice(&counter.to_le_bytes());
-            v[16..20].copy_from_slice(&0u32.to_le_bytes()); // distance
-            v[20..24].copy_from_slice(&200u32.to_le_bytes()); // master_metric
-            v[24..28].copy_from_slice(&200u32.to_le_bytes()); // self_metric
+            v[16..20].copy_from_slice(&0u32.to_le_bytes());
+            v[20..24].copy_from_slice(&200u32.to_le_bytes());
+            v[24..28].copy_from_slice(&200u32.to_le_bytes());
             v[36..40].copy_from_slice(&0u32.to_le_bytes());
             awdl::Tlv { kind: 24, value: v.leak() }
         }
@@ -4801,18 +4799,19 @@ pub mod state {
         }
 
         #[test]
-        fn reparent_within_same_cluster_does_not_readopt_channel_sequence() {
-            // Peer A and Peer B both report the SAME cluster top master M.
-            // Adopt A's sequence (slot0 = 149). Then election re-parents to B
-            // (same master_addr M, B's slot0 = 6). filin must NOT re-copy B's
-            // sequence — the schedule stays stable at 149 to avoid channel
-            // thrash. Only a real master_addr change re-adopts.
+        fn normal_churn_retains_peers_and_readopts_channel_sequence() {
+            // Regression: multiple peers from the same cluster arrive in
+            // sequence. ALL must be retained in the peer table, and the
+            // channel sequence must be re-adopted from each new peer so filin
+            // stays co-channel ("channel surfing"). This is what keeps
+            // peer_count > 0 through master churn in hopping mode. The old
+            // re-parent hysteresis froze the sequence after the first peer,
+            // breaking the surfing — peers went stale → evicted → peer_count=0.
             let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
             let top = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
             let peer_a = [0x02, 0xc1, 0, 0, 0, 1];
             let peer_b = [0x02, 0xc2, 0, 0, 0, 2];
 
-            // Adopt peer A (cluster top M, slot0 = 149).
             state.apply_action(
                 peer_a,
                 mif(),
@@ -4823,12 +4822,12 @@ pub mod state {
                 ],
                 1_000,
             );
+            assert_eq!(state.peers.len(), 1, "peer A added");
             assert!(state.channel_sequence.iter().any(|s| s[0] == 149));
-            let seq_after_a = state.channel_sequence;
 
-            // Re-parent to peer B (SAME top M, higher counter so it wins,
-            // but slot0 = 6). filin must NOT re-parent within the same cluster
-            // (same master_addr) — keep syncing to A, keep A's sequence.
+            // Peer B arrives (same cluster top, higher counter, slot0 = 6).
+            // filin MUST re-adopt B's channel sequence (channel surfing) and
+            // B MUST be in the peer table.
             state.apply_action(
                 peer_b,
                 mif(),
@@ -4839,29 +4838,22 @@ pub mod state {
                 ],
                 2_000,
             );
-            // Push B PAST the existing Bug B debounce window so the OLD logic
-            // would flip to B. The new master_addr-keyed hysteresis must still
-            // hold: same cluster → no re-parent.
-            let after_debounce = 2_000 + crate::schedule::MASTER_DEBOUNCE_US + 1;
-            state.apply_action(
-                peer_b,
-                mif(),
-                &[
-                    peer_with_cluster(peer_b, top, 60),
-                    version_tlv(0x34, 1),
-                    chanseq_tlv(6),
-                ],
-                after_debounce,
+            assert_eq!(state.peers.len(), 2, "both peers A and B retained");
+            // Channel sequence re-adopted from B: 6 must DOMINATE (>=14 slots
+            // after social coverage), not 149. If the hysteresis froze A's
+            // sequence, 149 would dominate instead — that's the regression.
+            let count_6 = state.channel_sequence.iter().filter(|s| s[0] == 6).count();
+            let count_149 = state.channel_sequence.iter().filter(|s| s[0] == 149).count();
+            assert!(
+                count_6 > count_149,
+                "6 must dominate after re-adopting B (6:{} vs 149:{}), \
+                 not frozen at A's 149-dominant sequence",
+                count_6,
+                count_149
             );
-            // committed parent STAYS A (same cluster → no re-parent), and the
-            // adopted channel sequence is unchanged (no thrash).
-            assert_eq!(
-                state.committed_master, peer_a,
-                "must not re-parent within the same cluster (same master_addr) even past the debounce window"
-            );
-            assert_eq!(
-                state.channel_sequence, seq_after_a,
-                "channel sequence must stay stable across same-cluster re-parent attempt"
+            assert_ne!(
+                state.election.sync_addr, state.self_addr,
+                "synced to an external parent"
             );
         }
 
