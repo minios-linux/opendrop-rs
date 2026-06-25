@@ -105,12 +105,20 @@ Last updated: cycle 15 (LIVE HARDWARE PASS in progress with human — carl9170 +
     headers (bits 1,2,3,5,11,14, no TSFT). gpt-5.5 fixed: skip-table + TSFT host-clock
     fallback (commits red/green parse carl9170 radiotap + tsft fallback + tolerate
     unknown fields). 1129->0 radiotap errors live.
-  - BUG2 IN PROGRESS: real frames now fail at 802.11 (err=Ieee x207) and AWDL
-    (err=Awdl x161) layers; no sync_error yet. gpt-5.5 adding detailed RX error logging
-    (specific variant + payload hex) so we fix precisely, then harden ieee80211+awdl
-    parsers for real frames. LOOP: gpt-5.5 fixes -> I rebuild+relaunch filin on pty-7
-    (RUST_LOG=filin_rs=trace) -> capture trace -> feed back.
+  - BUG2 IN PROGRESS: real AWDL action frames (d0, Apple OUI 00:17:f2, ~5000 of them)
+    ALL rejected as Awdl(TooShort). RX buf is 4096 (lib.rs:1388) so NOT truncation —
+    real frames reach awdl::parse_action_frame (lib.rs:400, needs body>=16) but the
+    body slice arrives <16, so the 802.11/AWDL body OFFSET is wrong. Root cause is in
+    the runtime RX slicing (radiotap->802.11->action body), diverging from owl/src/rx.c.
+  - DELEGATION (human-approved): GLM in pty-5 (fresh OpenCode) owns this fix now —
+    comparing owl/src/rx.c + frame.h vs filin, writing diagnosis to repo-root
+    FILIN_RX_DIAGNOSIS.md, then implementing the fix (TDD) + cargo build --release.
+    Read the FILE (not terminal) for its report. gpt-5.5 (pty-2) STAYS OFF filin to
+    avoid edit conflicts. gpt-5.5 already did radiotap fixes (commits up to 0b28a43).
   - NOTE: gpt-5.5 hit usage limit once (~02:18), human reset it. Watch for re-limit.
+  - owl reference for AWDL action parse: rx.c awdl_parse_action_hdr (~L234):
+    category=0x7f, oui=00:17:f2, version=AWDL_VERSION_COMPAT(=0x10), subtype PSF=0/MIF=3;
+    struct awdl_action = category(1)+oui(3)+type(1)+version(1)+subtype(1).
 - Live test recipe: kill owl/luftlift/filin; filin -i wlxbc05430d50a1 -c 44 -h awdl0 -N;
   then luftlift -i awdl0 receive -o /tmp/ldrop; human AirDrops a file; watch
   /tmp/ldrop + luftlift log for Discover/Ask/Upload, filin trace for sync_error.
