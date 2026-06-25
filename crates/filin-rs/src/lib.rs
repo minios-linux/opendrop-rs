@@ -121,3 +121,53 @@ pub mod radiotap {
         }
     }
 }
+
+pub mod ieee80211 {
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct MacHeader<'a> {
+        pub frame_control: u16,
+        pub duration_id: u16,
+        pub destination: [u8; 6],
+        pub source: [u8; 6],
+        pub bssid: [u8; 6],
+        pub sequence_control: u16,
+        pub body: &'a [u8],
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ParseError {
+        Unsupported,
+    }
+
+    pub fn parse_mac_header(_frame: &[u8]) -> Result<MacHeader<'_>, ParseError> {
+        Err(ParseError::Unsupported)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_three_address_management_action_header() {
+            let frame = [
+                0xd0, 0x00, // management action
+                0x00, 0x00, // duration
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // destination
+                0x02, 0x11, 0x22, 0x33, 0x44, 0x55, // source
+                0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, // bssid
+                0x10, 0x00, // sequence control
+                0x7f, 0x50, // body
+            ];
+
+            let parsed = parse_mac_header(&frame).expect("valid 802.11 header");
+
+            assert_eq!(parsed.frame_control, 0x00d0);
+            assert_eq!(parsed.duration_id, 0);
+            assert_eq!(parsed.destination, [0xff; 6]);
+            assert_eq!(parsed.source, [0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+            assert_eq!(parsed.bssid, [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
+            assert_eq!(parsed.sequence_control, 0x0010);
+            assert_eq!(parsed.body, &[0x7f, 0x50]);
+        }
+    }
+}
