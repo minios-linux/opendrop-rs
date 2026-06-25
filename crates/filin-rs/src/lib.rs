@@ -6108,5 +6108,111 @@ pub mod introspect {
             assert_eq!(intro.counters.rebroadcast_for(6), 1);
             assert_eq!(intro.status().peer_count, 4);
         }
+
+        fn ev(ts: u64) -> TraceEvent {
+            TraceEvent {
+                ts,
+                level: "INFO".into(),
+                target: "filin".into(),
+                msg: format!("event {ts}"),
+                fields: serde_json::Map::new(),
+            }
+        }
+
+        #[test]
+        fn trace_ring_caps_at_capacity_dropping_oldest() {
+            let ring = TraceRing::new(3);
+            ring.push(ev(1));
+            ring.push(ev(2));
+            ring.push(ev(3));
+            ring.push(ev(4)); // evicts ev(1)
+
+            assert_eq!(ring.len(), 3);
+            let ts: Vec<u64> = ring.last_n(10).into_iter().map(|e| e.ts).collect();
+            assert_eq!(ts, vec![2, 3, 4]);
+        }
+
+        #[test]
+        fn trace_ring_last_n_returns_tail_in_insertion_order() {
+            let ring = TraceRing::new(super::TRACE_RING_CAP);
+            for i in 0..10 {
+                ring.push(ev(i));
+            }
+
+            let ts: Vec<u64> = ring.last_n(3).into_iter().map(|e| e.ts).collect();
+            assert_eq!(ts, vec![7, 8, 9]);
+        }
+
+        #[test]
+        fn trace_ring_last_n_handles_zero_and_overflow() {
+            let ring = TraceRing::new(super::TRACE_RING_CAP);
+            ring.push(ev(5));
+
+            assert!(ring.last_n(0).is_empty());
+            assert_eq!(ring.last_n(99).len(), 1);
+        }
+
+        #[test]
+        fn trace_ring_serializes_events_with_required_shape() {
+            let ring = TraceRing::new(super::TRACE_RING_CAP);
+            let mut fields = serde_json::Map::new();
+            fields.insert("sent".into(), serde_json::json!(1));
+            ring.push(TraceEvent {
+                ts: 1_700_000_000_000,
+                level: "DEBUG".into(),
+                target: "filin_rs::runtime".into(),
+                msg: "injected awdl announce frame".into(),
+                fields,
+            });
+
+            let json = serde_json::to_value(&ring.last_n(1)[0]).expect("event serializes");
+            let obj = json.as_object().expect("event is object");
+            assert_eq!(
+                obj.get("ts").and_then(|v| v.as_u64()),
+                Some(1_700_000_000_000)
+            );
+            assert_eq!(obj.get("level").and_then(|v| v.as_str()), Some("DEBUG"));
+            assert_eq!(
+                obj.get("target").and_then(|v| v.as_str()),
+                Some("filin_rs::runtime")
+            );
+            assert_eq!(
+                obj.get("msg").and_then(|v| v.as_str()),
+                Some("injected awdl announce frame")
+            );
+            assert_eq!(
+                obj.get("fields").and_then(|v| v.get("sent")).and_then(|v| v.as_u64()),
+                Some(1)
+            );
+        }
+
+        #[test]
+        fn trace_gate_defaults_to_off_and_gates_by_tracing_level_num() {
+            // tracing Level num: ERROR=1, WARN=2, INFO=3, DEBUG=4, TRACE=5.
+            let gate = TraceGate::new();
+            assert_eq!(gate.level_u8(), 0);
+            assert!(!gate.allows(1)); // off gates even ERROR
+
+            gate.set(GateLevel::Debug);
+            assert!(gate.allows(1)); // ERROR
+            assert!(gate.allows(3)); // INFO
+            assert!(gate.allows(4)); // DEBUG
+            assert!(!gate.allows(5)); // DEBUG does not capture TRACE
+
+            gate.set(GateLevel::Trace);
+            assert!(gate.allows(5)); // TRACE captures everything
+
+            gate.set(GateLevel::Off);
+            assert!(!gate.allows(1));
+        }
+
+        #[test]
+        fn gate_level_parses_post_body_strings() {
+            assert_eq!(GateLevel::from_request_str("off"), Some(GateLevel::Off));
+            assert_eq!(GateLevel::from_request_str("debug"), Some(GateLevel::Debug));
+            assert_eq!(GateLevel::from_request_str("trace"), Some(GateLevel::Trace));
+            assert_eq!(GateLevel::from_request_str("bogus"), None);
+            assert_eq!(GateLevel::from_request_str("INFO"), None); // case-sensitive per spec
+        }
     }
 }
