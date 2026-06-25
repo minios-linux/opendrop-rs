@@ -7,9 +7,10 @@
 //! `get_properties`).
 
 use anyhow::Result;
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Configuration for the mDNS announcement.
@@ -48,6 +49,40 @@ pub fn announce(cfg: &MdnsConfig, addr: IpAddr) -> Result<(ServiceDaemon, Servic
     daemon.register(info.clone())?;
     info!(name = %cfg.computer_name, addr = %addr, port = cfg.port, "mDNS _airdrop._tcp announced");
     Ok((daemon, info))
+}
+
+/// A discovered AirDrop peer (from mDNS browse).
+#[derive(Debug, Clone)]
+pub struct DiscoveredPeer {
+    pub name: String,
+    pub addresses: Vec<IpAddr>,
+    pub port: u16,
+}
+
+/// Browse for `_airdrop._tcp` services for `duration`. Returns discovered peers.
+/// Apple devices appear only while their sharing pane is open.
+pub fn browse(duration: Duration) -> Result<Vec<DiscoveredPeer>> {
+    let daemon = ServiceDaemon::new()?;
+    let receiver = daemon.browse("_airdrop._tcp.local.")?;
+    let deadline = Instant::now() + duration;
+    let mut peers = Vec::new();
+
+    while let Ok(timeout) = deadline.checked_duration_since(Instant::now()).ok_or(()) {
+        match receiver.recv_timeout(timeout) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                info!(name = %info.get_fullname(), addresses = ?info.get_addresses(), "discovered AirDrop peer");
+                peers.push(DiscoveredPeer {
+                    name: info.get_fullname().to_string(),
+                    addresses: info.get_addresses().iter().copied().collect(),
+                    port: info.get_port(),
+                });
+            }
+            Ok(_) => {}
+            Err(_) => break, // timeout
+        }
+    }
+    let _ = daemon.shutdown();
+    Ok(peers)
 }
 
 #[cfg(test)]

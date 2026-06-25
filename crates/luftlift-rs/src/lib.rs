@@ -12,6 +12,7 @@ pub mod dvzip;
 pub mod handlers;
 pub mod http;
 pub mod mdns;
+pub mod netutil;
 pub mod plist_impl;
 pub mod server;
 pub mod tls;

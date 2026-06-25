@@ -11,6 +11,7 @@ use anyhow::Result;
 use rustls::ServerConfig;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use tracing::{error, info, warn};
@@ -68,16 +69,23 @@ pub fn read_full_request(reader: &mut impl BufRead) -> Result<Vec<u8>> {
 }
 
 /// Serve forever on the given listener. Each connection is handled in a
-/// thread (matching the Python server's blocking model).
-pub fn serve_forever(listener: TcpListener, tls_config: Arc<ServerConfig>, cfg: ReceiverConfig) {
+/// thread. If `output_dir` is set, received files are saved there.
+pub fn serve_forever(
+    listener: TcpListener,
+    tls_config: Arc<ServerConfig>,
+    cfg: ReceiverConfig,
+    output_dir: Option<PathBuf>,
+) {
     let cfg = Arc::new(cfg);
+    let output_dir = Arc::new(output_dir);
     for stream in listener.incoming() {
         match stream {
             Ok(tcp_stream) => {
                 let tls_config = tls_config.clone();
                 let cfg = cfg.clone();
+                let output_dir = output_dir.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_tls_connection(tcp_stream, tls_config, cfg) {
+                    if let Err(e) = handle_tls_connection(tcp_stream, tls_config, cfg, output_dir) {
                         warn!(error = %e, "connection error");
                     }
                 });
@@ -91,6 +99,7 @@ fn handle_tls_connection(
     tcp_stream: TcpStream,
     tls_config: Arc<ServerConfig>,
     cfg: Arc<ReceiverConfig>,
+    output_dir: Arc<Option<PathBuf>>,
 ) -> Result<()> {
     let conn = rustls::ServerConnection::new(tls_config)?;
     let mut tls = rustls::StreamOwned::new(conn, tcp_stream);
@@ -103,6 +112,13 @@ fn handle_tls_connection(
     tls.write_all(&response_bytes)?;
     for f in &result.received_files {
         info!(file = %f.name, bytes = f.bytes.len(), "received file");
+        if let Some(dir) = output_dir.as_ref() {
+            let path = dir.join(&f.name);
+            match std::fs::write(&path, &f.bytes) {
+                Ok(_) => info!(file = %f.name, path = %path.display(), "saved file"),
+                Err(e) => warn!(file = %f.name, error = %e, "failed to save file"),
+            }
+        }
     }
     Ok(())
 }
