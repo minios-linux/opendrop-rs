@@ -3042,9 +3042,18 @@ pub mod iface {
             return Err(ConfigError::MissingMonitorInterface);
         }
         match config.anchor_channel {
-            6 | 44 | 149 => Ok(config),
-            other => Err(ConfigError::UnsupportedAnchorChannel(other)),
+            6 | 44 | 149 => {}
+            other => return Err(ConfigError::UnsupportedAnchorChannel(other)),
         }
+        // The introspection server must never bind off-box. Reject any non-
+        // loopback address from --http-addr at config time (defense-in-depth
+        // alongside the per-connection peer check in introspect::spawn).
+        if let Some(addr) = config.http_addr {
+            if !addr.ip().is_loopback() {
+                return Err(ConfigError::NonLoopbackHttpAddr(addr));
+            }
+        }
+        Ok(config)
     }
 
     #[cfg(test)]
@@ -3361,6 +3370,16 @@ pub mod cli {
         assume_monitor: bool,
         #[arg(long = "pcap")]
         pcap_path: Option<String>,
+        /// Localhost HTTP/JSON introspection bind address (default 127.0.0.1:9930).
+        #[arg(
+            long = "http-addr",
+            default_value = "127.0.0.1:9930",
+            help = "Localhost HTTP introspection address (loopback only)"
+        )]
+        http_addr: std::net::SocketAddr,
+        /// Disable the introspection HTTP server entirely.
+        #[arg(long = "no-http")]
+        no_http: bool,
     }
 
     pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
@@ -3378,14 +3397,14 @@ pub mod cli {
     }
 
     fn config_from_args(args: Args) -> Result<iface::Config, CliError> {
+        let http_addr = if args.no_http { None } else { Some(args.http_addr) };
         iface::validate_config(iface::Config {
             monitor_iface: args.monitor_iface,
             host_iface: args.host_iface,
             anchor_channel: args.anchor_channel,
             assume_monitor: args.assume_monitor,
             pcap_path: args.pcap_path.or_else(|| std::env::var("FILIN_PCAP").ok()),
-            // STUB (RED): hardcode the default; --http-addr / --no-http not yet wired.
-            http_addr: Some(iface::default_http_addr()),
+            http_addr,
         })
         .map_err(|_| CliError::Invalid)
     }
