@@ -7,6 +7,7 @@
 //! Reference: ../../opendrop-patch/ (patched Python opendrop + dvzip.py decoder).
 
 pub mod chunked;
+pub mod client;
 pub mod cpio;
 pub mod dvzip;
 pub mod handlers;
