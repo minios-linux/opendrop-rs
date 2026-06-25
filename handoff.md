@@ -90,6 +90,33 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 16 (LIVE: filin SYNCS! data-path TX self-announce is the last gap).
+*** LIVE VALIDATION milestones so far ***
+- ✅ luftlift received a real photo over a C-owl link (Stage 1). Bug fixed: /Ask
+  TransferID optional (3539f53).
+- ✅ filin radiotap RX fixed (carl9170 fields/TSFT fallback).
+- ✅ filin FCS fix (gpt-5.5, commits fc710ae/a75412d): strip trailing 4B 802.11 FCS
+  when radiotap flags&0x10 (carl9170 sets it). THIS made filin SYNC: sync_error ±3 TU,
+  0 AWDL errors (was ~5000). Diagnosis race: gpt-5.5 found it (FILIN_RX_DIAGNOSIS_GPT.md);
+  GLM/pty-5 stood down. owl ref: rx.c:456-463 strips FCS.
+- ✅ mDNS discovery works THROUGH filin: the Mac sees "luftlift" in its picker.
+- ❌ LAST GAP — unicast data path: Mac shows "Waiting", awdl0 RX=0 (no data frames
+  decapsulated). ROOT CAUSE (confirmed reading runtime::run() lib.rs:1459): the loop
+  ONLY receives — it NEVER transmits filin's own PSF/MIF action frames, so the Apple
+  peer never registers filin in its AWDL peer table and won't send us unicast data.
+  owl announces via timers: owl/daemon/core.c awdl_send_psf/mif/action, owl/src/tx.c
+  builds PSF/MIF TLVs.
+- IN PROGRESS (gpt-5.5, pty-2): TASK1 add --pcap/FILIN_PCAP dump of dropped RX frames
+  (DLT 127 radiotap) for offline analysis [human's idea]; TASK2 add periodic PSF/MIF
+  self-announce TX to runtime::run() (poll finite timeout + PSF ~110TU/MIF timers,
+  build_action_body + election/sync TLVs, broadcast, inject). Goal: awdl0 RX > 0.
+- ALSO KNOWN: MIF action frames now hit AwdlTlv(TooShort) (TLV parser) — lower priority;
+  PSF sync already works. Captured MIF frame (64B preview), e.g. from peer d2:ef:39:7f:1d:6d:
+  d0 00 00 00 ffffffffffff d2ef397f1d6d 002500ff9473 b02b 7f0017f2 08 10 03 00 ...
+- ENV: pty-7 root@ayourtch-x280 runs filin+luftlift; pty-9 = Mac (osascript opens its
+  AirDrop send-sheet for ~90-120s to put AWDL on air); monitor iface wlxbc05430d50a1
+  (carl9170 ch44). filin binary: target/release/filin. Live test recipe unchanged.
+--- PRIOR cycle-15 detail below ---
 Last updated: cycle 15 (LIVE HARDWARE PASS in progress with human — carl9170 + real Apple peer).
 *** LIVE VALIDATION (human present, driving pty-7 root shell on ayourtch-x280) ***
 - HARDWARE: monitor iface = wlxbc05430d50a1 (carl9170, monitor mode ch44). awdl0
