@@ -419,14 +419,120 @@ impl IntrospectServer {
 
 /// Spawn the loopback introspection HTTP server. Binds `addr` (use
 /// `DEFAULT_HTTP_ADDR` = `127.0.0.1:9931` for the production default, or
-/// `127.0.0.1:0` for an ephemeral port in tests). Refuses to bind anything
-/// that isn't loopback (defence in depth: even if a caller passes a public
+/// `127.0.0.1:0` for an ephemeral port in tests). Refuses anything that
+/// isn't loopback (defence in depth: even if a caller passes a public
 /// address we never expose the introspect API off-box).
 pub fn spawn_http_server(
-    _addr: &str,
-    _state: Arc<IntrospectState>,
+    addr: &str,
+    state: Arc<IntrospectState>,
 ) -> std::io::Result<IntrospectServer> {
-    todo!()
+    let socket_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad addr {addr}")))?;
+    if !socket_addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing non-loopback introspect bind {addr} — loopback only"),
+        ));
+    }
+    let listener = std::net::TcpListener::bind(socket_addr)?;
+    let local_addr = listener.local_addr()?;
+    // Explicit insurance against a logic regression in the parse path: even
+    // if `addr` somehow passed the loopback check, the OS-chosen bind must
+    // still be loopback or we abort before accepting a single connection.
+    if !local_addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("OS bound non-loopback addr {local_addr} — aborting"),
+        ));
+    }
+    tracing::info!(addr = %local_addr, "introspect HTTP server listening (loopback)");
+    let handle = std::thread::Builder::new()
+        .name("luftlift-introspect".into())
+        .spawn(move || serve_loop(&listener, state))?;
+    Ok(IntrospectServer { local_addr, handle: Some(handle) })
+}
+
+fn serve_loop(listener: &std::net::TcpListener, state: Arc<IntrospectState>) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                if let Err(e) = handle_introspect_connection(s, &state) {
+                    tracing::warn!(error = %e, "introspect connection error");
+                }
+            }
+            Err(e) => {
+                // EBADF after listener close is expected during shutdown.
+                if e.kind() != std::io::ErrorKind::Other {
+                    tracing::warn!(error = %e, "introspect accept error");
+                }
+            }
+        }
+    }
+}
+
+/// Handle one HTTP/1.x connection: parse request line + headers, read body
+/// by Content-Length, dispatch via [`route_introspect`], write the JSON
+/// response. Returns the parse/dispatch result; the connection is closed
+/// after a single request (no keep-alive — the introspect client is `curl`).
+fn handle_introspect_connection(
+    stream: std::net::TcpStream,
+    state: &IntrospectState,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let mut reader = BufReader::new(stream);
+    let mut req_line = String::new();
+    if reader.read_line(&mut req_line)? == 0 {
+        return Ok(()); // empty connection — drop quietly
+    }
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+
+    // Read headers up to the blank line.
+    let mut content_length: usize = 0;
+    loop {
+        let mut h = String::new();
+        let n = reader.read_line(&mut h)?;
+        if n == 0 || h.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+
+    // Read body.
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+
+    let resp = route_introspect(state, method, target, &body);
+    let reason = match resp.status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "OK",
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {cl}\r\n\
+         Connection: close\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         \r\n",
+        status = resp.status,
+        cl = resp.body.len(),
+    );
+    let stream = reader.get_mut();
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&resp.body)?;
+    stream.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
