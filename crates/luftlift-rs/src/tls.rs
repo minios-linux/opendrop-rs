@@ -5,8 +5,8 @@
 //! Reference: `opendrop-patch/server.py.patched` (`get_ssl_context`).
 
 use anyhow::Result;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::ServerConfig;
 
 /// A self-signed certificate + private key for the AirDrop HTTPS server.
 pub struct AirDropTlsCert {
@@ -16,13 +16,26 @@ pub struct AirDropTlsCert {
 
 /// Generate an ephemeral self-signed certificate suitable for AirDrop.
 pub fn generate_self_signed_cert() -> Result<AirDropTlsCert> {
-    anyhow::bail!("unimplemented")
+    // Install the ring crypto provider as the rustls default (idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let key_pair = rcgen::KeyPair::generate()?;
+    let params = rcgen::CertificateParams::new(vec!["luftlift".into()])?;
+    let cert = params.self_signed(&key_pair)?;
+    Ok(AirDropTlsCert {
+        cert_der: cert.der().clone(),
+        key_der: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+    })
 }
 
 /// Build a `rustls::ServerConfig` from a self-signed cert. No client-cert
 /// verification (Apple doesn't send one for AirDrop receive).
-pub fn build_server_config(_cert: &AirDropTlsCert) -> Result<ServerConfig> {
-    anyhow::bail!("unimplemented")
+pub fn build_server_config(cert: &AirDropTlsCert) -> Result<ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert_der.clone()], cert.key_der.clone_key())?;
+    Ok(config)
 }
 
 #[cfg(test)]
