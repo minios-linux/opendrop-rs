@@ -5,8 +5,12 @@
 //! Reference: `opendrop-patch/server.py.patched` (`get_ssl_context`).
 
 use anyhow::Result;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::client::ClientConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::ServerConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::DigitallySignedStruct;
+use std::sync::Arc;
 
 /// A self-signed certificate + private key for the AirDrop HTTPS server.
 pub struct AirDropTlsCert {
@@ -38,6 +42,71 @@ pub fn build_server_config(cert: &AirDropTlsCert) -> Result<ServerConfig> {
     Ok(config)
 }
 
+// ---- Client side (sender) ----
+
+/// A certificate verifier that accepts any server certificate, mirroring
+/// Apple's lenient AirDrop TLS (self-signed certs are accepted). AirDrop runs
+/// over a trusted AWDL link and uses cert pinning-like behaviour informally,
+/// not a WebPKI CA chain. **Only safe for AirDrop.**
+#[derive(Debug)]
+struct AcceptAnyCert;
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        use rustls::SignatureScheme::*;
+        vec![
+            RSA_PKCS1_SHA1,
+            ECDSA_SHA1_Legacy,
+            RSA_PKCS1_SHA256,
+            ECDSA_NISTP256_SHA256,
+            RSA_PSS_SHA256,
+            ED25519,
+            RSA_PKCS1_SHA384,
+            ECDSA_NISTP384_SHA384,
+            RSA_PSS_SHA384,
+            RSA_PKCS1_SHA512,
+            ECDSA_NISTP521_SHA512,
+            RSA_PSS_SHA512,
+        ]
+    }
+}
+
+/// Build a `rustls::ClientConfig` for talking to an AirDrop receiver.
+/// Accepts self-signed certs (no WebPKI validation) and sends no client cert,
+/// matching the AirDrop protocol's lenient TLS.
+pub fn build_client_config() -> Result<ClientConfig> {
+    anyhow::bail!("unimplemented")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +123,14 @@ mod tests {
         let cert = generate_self_signed_cert().unwrap();
         // Just verify it builds without panicking.
         let _config = build_server_config(&cert).unwrap();
+    }
+
+    // ---- client side (sender) ----
+
+    #[test]
+    fn build_client_config_succeeds_and_accepts_self_signed() {
+        let config = build_client_config().unwrap();
+        // A client config that can be used to connect to an AirDrop receiver.
+        let _ = config;
     }
 }
