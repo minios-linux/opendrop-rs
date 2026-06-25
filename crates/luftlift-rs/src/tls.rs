@@ -104,7 +104,12 @@ impl ServerCertVerifier for AcceptAnyCert {
 /// Accepts self-signed certs (no WebPKI validation) and sends no client cert,
 /// matching the AirDrop protocol's lenient TLS.
 pub fn build_client_config() -> Result<ClientConfig> {
-    anyhow::bail!("unimplemented")
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+        .with_no_client_auth();
+    Ok(config)
 }
 
 #[cfg(test)]
