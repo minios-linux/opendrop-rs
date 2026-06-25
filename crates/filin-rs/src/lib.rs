@@ -5109,6 +5109,45 @@ pub mod runtime {
         (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
     }
 
+    /// Build an introspection [`crate::introspect::StatusSnapshot`] from the
+    /// live AWDL state + the most-recently-injected frame's sequence control.
+    /// The runtime calls this on a throttled cadence and feeds it to
+    /// [`crate::introspect::Introspection::set_status`].
+    #[allow(dead_code)] // wired in the next integration commit
+    fn build_status_snapshot(
+        state: &crate::state::AwdlState,
+        last_injected_seq: u16,
+    ) -> crate::introspect::StatusSnapshot {
+        crate::introspect::StatusSnapshot {
+            current_channel: state.current_channel,
+            master_mac: crate::introspect::mac_string(state.election.master_addr),
+            master_seq: last_injected_seq,
+            synced: state.election.sync_addr != state.self_addr,
+            peer_count: state.peers.len(),
+        }
+    }
+
+    /// Build per-peer introspection views for `GET /peers` from the live
+    /// `AwdlState`. `decoded_chanseq` is each slot's channel number; the
+    /// per-peer `current_channel` is filin's own (we hop co-channel with the
+    /// peers we can hear).
+    #[allow(dead_code)] // wired in the next integration commit
+    fn build_peer_views(
+        state: &crate::state::AwdlState,
+        now_us: u64,
+    ) -> Vec<crate::introspect::PeerView> {
+        state
+            .peers
+            .iter()
+            .map(|peer| crate::introspect::PeerView {
+                mac: crate::introspect::mac_string(peer.addr),
+                last_seen_ms_ago: now_us.saturating_sub(peer.last_update_us) / 1_000,
+                decoded_chanseq: peer.sequence.iter().map(|slot| slot[0]).collect(),
+                current_channel: state.current_channel,
+            })
+            .collect()
+    }
+
     /// owl `gethostname` for the ARPA TLV peer name (owl/daemon/core.c:362-364).
     fn hostname() -> String {
         let mut buf = [0u8; 256];
