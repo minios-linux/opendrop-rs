@@ -6476,17 +6476,17 @@ pub mod introspect {
         )
     }
 
-    /// Hot-path counters for the introspection API. Every field is a plain
-    /// `AtomicU64` so the AF_PACKET loop can bump them without taking a lock.
-    /// Reads happen only from the HTTP thread.
+    /// Hot-path counters for the introspection API. `mdns_rx_*` are plain
+    /// `AtomicU64` (bumped per-packet on the AF_PACKET loop). `rebroadcast`
+    /// is a `Mutex<BTreeMap>` — only bumped a few times per second on actual
+    /// re-broadcasts (rate-limited), so the lock is uncontended. Using a map
+    /// makes it adaptive: any channel (including a non-social master anchor
+    /// like 52) is tracked without hardcoding.
     #[derive(Debug)]
     pub struct Counters {
         mdns_rx_self: AtomicU64,
         mdns_rx_other: AtomicU64,
-        /// Per-channel rebroadcast counts for the AWDL social channels
-        /// (6 / 44 / 149). Stored as `(channel, count)` pairs so the JSON
-        /// serializer can emit them as a `{"6": N, "44": N, "149": N}` map.
-        rebroadcast: [(u8, AtomicU64); 3],
+        rebroadcast: std::sync::Mutex<std::collections::BTreeMap<u8, u64>>,
     }
 
     impl Default for Counters {
@@ -7121,15 +7121,11 @@ pub mod introspect {
     }
 
     impl Counters {
-        pub const fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 mdns_rx_self: AtomicU64::new(0),
                 mdns_rx_other: AtomicU64::new(0),
-                rebroadcast: [
-                    (6, AtomicU64::new(0)),
-                    (44, AtomicU64::new(0)),
-                    (149, AtomicU64::new(0)),
-                ],
+                rebroadcast: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             }
         }
 
@@ -7142,8 +7138,8 @@ pub mod introspect {
         }
 
         pub fn inc_rebroadcast(&self, channel: u8) {
-            if let Some((_, c)) = self.rebroadcast.iter().find(|(ch, _)| *ch == channel) {
-                c.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut map) = self.rebroadcast.lock() {
+                *map.entry(channel).or_insert(0) += 1;
             }
         }
 
@@ -7157,17 +7153,17 @@ pub mod introspect {
 
         pub fn rebroadcast_for(&self, channel: u8) -> u64 {
             self.rebroadcast
-                .iter()
-                .find(|(ch, _)| *ch == channel)
-                .map(|(_, c)| c.load(Ordering::Relaxed))
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&channel).copied())
                 .unwrap_or(0)
         }
 
         pub fn rebroadcast_pairs(&self) -> Vec<(u8, u64)> {
             self.rebroadcast
-                .iter()
-                .map(|(ch, c)| (*ch, c.load(Ordering::Relaxed)))
-                .collect()
+                .lock()
+                .map(|map| map.iter().map(|(&ch, &count)| (ch, count)).collect())
+                .unwrap_or_default()
         }
     }
 
@@ -7195,14 +7191,12 @@ pub mod introspect {
             c.inc_rebroadcast(44);
             c.inc_rebroadcast(44);
             c.inc_rebroadcast(149);
-            c.inc_rebroadcast(99); // ignored — not a social channel
 
             assert_eq!(c.mdns_rx_self(), 2);
             assert_eq!(c.mdns_rx_other(), 1);
             assert_eq!(c.rebroadcast_for(44), 3);
             assert_eq!(c.rebroadcast_for(149), 1);
             assert_eq!(c.rebroadcast_for(6), 0);
-            assert_eq!(c.rebroadcast_for(99), 0);
         }
 
         #[test]
@@ -7212,7 +7206,8 @@ pub mod introspect {
             c.inc_rebroadcast(149);
             c.inc_rebroadcast(149);
 
-            assert_eq!(c.rebroadcast_pairs(), vec![(6, 1), (44, 0), (149, 2)]);
+            // Adaptive map: only channels that were bumped appear.
+            assert_eq!(c.rebroadcast_pairs(), vec![(6, 1), (149, 2)]);
         }
 
         #[test]
@@ -7538,7 +7533,8 @@ pub mod introspect {
             assert_eq!(obj.get("mdns_rx_self").and_then(|v| v.as_u64()), Some(2));
             assert_eq!(obj.get("mdns_rx_other").and_then(|v| v.as_u64()), Some(1));
             let rbc = obj.get("rebroadcast_counts").unwrap().as_object().unwrap();
-            assert_eq!(rbc.get("6").and_then(|v| v.as_u64()), Some(0));
+            // Adaptive map: only channels that were bumped appear.
+            assert!(!rbc.contains_key("6"), "ch6 never bumped");
             assert_eq!(rbc.get("44").and_then(|v| v.as_u64()), Some(2));
             assert_eq!(rbc.get("149").and_then(|v| v.as_u64()), Some(1));
         }
