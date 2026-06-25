@@ -119,6 +119,29 @@ pub mod radiotap {
             assert_eq!(parsed.flags, Some(0x10));
             assert_eq!(parsed.antenna_signal_dbm, Some(-42));
         }
+
+        #[test]
+        fn parses_carl9170_header_with_extra_fields_and_no_tsft() {
+            let frame = [
+                0x00, 0x00, 0x12, 0x00, // version, pad, length
+                0x2e, 0x48, 0x00, 0x00, // present: flags, rate, channel, signal, antenna, rx flags
+                0x10, // flags: frame includes FCS
+                0x0c, // rate
+                0x64, 0x14, 0x40, 0x01, // channel frequency 5220 + flags
+                0xc3, // antenna signal: -61 dBm
+                0x05, // antenna
+                0x00, 0x00, // RX flags
+                0xde, 0xad, // payload begins after radiotap header
+            ];
+
+            let parsed = parse_header(&frame).expect("valid carl9170 radiotap header");
+
+            assert_eq!(parsed.header_len, 18);
+            assert_eq!(parsed.payload, &[0xde, 0xad]);
+            assert_eq!(parsed.tsft, None);
+            assert_eq!(parsed.flags, Some(0x10));
+            assert_eq!(parsed.antenna_signal_dbm, Some(-61));
+        }
     }
 }
 
