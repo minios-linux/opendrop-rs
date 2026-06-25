@@ -1780,6 +1780,96 @@ pub mod schedule {
         }
     }
 
+    // --- Bug C: sticky transfer channel -------------------------------------
+
+    /// Idle window after the last received unicast data frame from a peer
+    /// during which filin keeps the radio PINNED to that peer's channel and
+    /// suppresses channel hopping + master re-adoption. A bulk AirDrop
+    /// /Upload is a sustained TCP/TLS stream: it cannot survive filin
+    /// leaving the channel mid-body. Two EAWs (~128 ms) of silence is long
+    /// enough to ride gaps between TCP segments while releasing quickly once
+    /// the transfer truly ends.
+    pub const TRANSFER_IDLE_TIMEOUT_US: u64 = 2 * 64 * TU_US;
+
+    /// Record of the most recent unicast data RX used to pin the radio to
+    /// the active-transfer peer's channel (Bug C).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TransferPin {
+        pub peer: [u8; 6],
+        pub channel: u8,
+        pub last_rx_us: u64,
+    }
+
+    /// Pure decision for the sticky-transfer pin (Bug C): returns the
+    /// `(peer, channel)` filin must hold while a unicast data flow is
+    /// active, or `None` once the idle timeout has elapsed (transfer
+    /// complete / peer went quiet). A pin whose recorded channel is 0 is
+    /// treated as inactive. Used both to override [`desired_channel`] and to
+    /// suppress master re-adoption ([`master_adoption_decision`]).
+    pub fn transfer_active(
+        pin: Option<&TransferPin>,
+        now_us: u64,
+        idle_timeout_us: u64,
+    ) -> Option<([u8; 6], u8)> {
+        let pin = pin?;
+        if pin.channel == 0 {
+            return None;
+        }
+        if now_us.saturating_sub(pin.last_rx_us) > idle_timeout_us {
+            return None;
+        }
+        Some((pin.peer, pin.channel))
+    }
+
+    // --- Bug B: master-adoption hysteresis ----------------------------------
+
+    /// How long a challenger must persistently win the election before filin
+    /// commits to adopting its channel sequence. Stops the master thrash
+    /// seen on a contended link (re-adopting ~44×/min flip-flopping between
+    /// Apple devices). Two EAWs mirrors the transfer pin window so a single
+    /// stray challenger frame cannot deschedule an in-flight transfer.
+    pub const MASTER_DEBOUNCE_US: u64 = 2 * 64 * TU_US;
+
+    /// Result of [`master_adoption_decision`]: which master to commit to now.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MasterAdoption {
+        /// Keep the currently-committed master (challenger has not yet won
+        /// the debounce window).
+        Keep,
+        /// Commit to the new election winner.
+        Adopt,
+    }
+
+    /// Pure master-adoption hysteresis decision (Bug B). Given the
+    /// currently-committed master, the latest election `winner`, the
+    /// pending challenger and how long it has been winning, returns whether
+    /// to commit to the winner now (`Adopt`) or hold the current master
+    /// (`Keep`).
+    ///
+    /// - If the winner is already the committed master, returns `Adopt`
+    ///   (no-op refresh; clears the pending challenger).
+    /// - If the winner is the pending challenger AND it has been winning
+    ///   for at least `debounce_us`, returns `Adopt`.
+    /// - Otherwise returns `Keep` — the challenger must persist.
+    pub fn master_adoption_decision(
+        committed_master: [u8; 6],
+        winner: [u8; 6],
+        pending_master: [u8; 6],
+        pending_since_us: u64,
+        now_us: u64,
+        debounce_us: u64,
+    ) -> MasterAdoption {
+        if winner == committed_master {
+            return MasterAdoption::Adopt;
+        }
+        if winner == pending_master
+            && now_us.saturating_sub(pending_since_us) >= debounce_us
+        {
+            return MasterAdoption::Adopt;
+        }
+        MasterAdoption::Keep
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2127,6 +2217,128 @@ pub mod schedule {
             let seq = [[0u8, 0u8]; CHANSEQ_LEN];
             assert!(!spread.enqueue(vec![0xEE], &seq, 0, 1_000_000));
             assert!(spread.is_empty());
+        }
+
+        // --- Bug C: transfer pin ---
+
+        #[test]
+        fn transfer_active_within_idle_timeout() {
+            // Recent unicast RX from peer P on ch44 → pin to (P, 44).
+            let pin = TransferPin {
+                peer: [0x02, 1, 2, 3, 4, 5],
+                channel: 44,
+                last_rx_us: 1_000_000,
+            };
+            assert_eq!(
+                transfer_active(Some(&pin), 1_000_000, TRANSFER_IDLE_TIMEOUT_US),
+                Some(([0x02, 1, 2, 3, 4, 5], 44))
+            );
+        }
+
+        #[test]
+        fn transfer_releases_after_idle_timeout() {
+            // Once the idle timeout elapses with no further RX, the pin
+            // releases so filin can resume hopping and re-adopting.
+            let pin = TransferPin {
+                peer: [0x02, 1, 2, 3, 4, 5],
+                channel: 44,
+                last_rx_us: 1_000_000,
+            };
+            let after = 1_000_000 + TRANSFER_IDLE_TIMEOUT_US + 1;
+            assert_eq!(
+                transfer_active(Some(&pin), after, TRANSFER_IDLE_TIMEOUT_US),
+                None
+            );
+        }
+
+        #[test]
+        fn transfer_inactive_when_no_pin_or_null_channel() {
+            // No pin → not active.
+            assert_eq!(transfer_active(None, 1_000_000, TRANSFER_IDLE_TIMEOUT_US), None);
+            // A pin on channel 0 (null) → not active.
+            let pin = TransferPin {
+                peer: [0x02, 1, 2, 3, 4, 5],
+                channel: 0,
+                last_rx_us: 1_000_000,
+            };
+            assert_eq!(transfer_active(Some(&pin), 1_000_000, TRANSFER_IDLE_TIMEOUT_US), None);
+        }
+
+        // --- Bug B: master-adoption hysteresis ---
+
+        const COMMITTED: [u8; 6] = [0x02, 0xaa, 0, 0, 0, 1];
+        const CHALLENGER: [u8; 6] = [0x02, 0xbb, 0, 0, 0, 2];
+
+        #[test]
+        fn hysteresis_single_challenger_frame_does_not_flip_master() {
+            // A single challenger win must NOT flip the committed master.
+            let since = 1_000_000;
+            let now = since + 1; // far less than the debounce window
+            assert_eq!(
+                master_adoption_decision(
+                    COMMITTED,
+                    CHALLENGER,
+                    CHALLENGER,
+                    since,
+                    now,
+                    MASTER_DEBOUNCE_US
+                ),
+                MasterAdoption::Keep
+            );
+        }
+
+        #[test]
+        fn hysteresis_sustained_challenger_wins_flip_master() {
+            // A challenger that has won for the whole debounce window does
+            // flip the committed master.
+            let since = 1_000_000;
+            let now = since + MASTER_DEBOUNCE_US;
+            assert_eq!(
+                master_adoption_decision(
+                    COMMITTED,
+                    CHALLENGER,
+                    CHALLENGER,
+                    since,
+                    now,
+                    MASTER_DEBOUNCE_US
+                ),
+                MasterAdoption::Adopt
+            );
+        }
+
+        #[test]
+        fn hysteresis_re_adopting_committed_master_is_noop_adopt() {
+            // The winner being the already-committed master is an immediate
+            // Adopt (refresh, clears the pending challenger).
+            assert_eq!(
+                master_adoption_decision(
+                    COMMITTED,
+                    COMMITTED,
+                    CHALLENGER,
+                    1_000_000,
+                    1_000_000,
+                    MASTER_DEBOUNCE_US
+                ),
+                MasterAdoption::Adopt
+            );
+        }
+
+        #[test]
+        fn hysteresis_unknown_challenger_does_not_adopt_immediately() {
+            // A brand-new winner that is neither committed nor the tracked
+            // pending challenger must Keep (start its debounce clock, not
+            // adopt on the first frame).
+            assert_eq!(
+                master_adoption_decision(
+                    COMMITTED,
+                    CHALLENGER,
+                    [0x02, 0xcc, 0, 0, 0, 3], // a different pending
+                    1_000_000,
+                    1_000_000 + MASTER_DEBOUNCE_US,
+                    MASTER_DEBOUNCE_US
+                ),
+                MasterAdoption::Keep
+            );
         }
     }
 }
@@ -2881,6 +3093,20 @@ pub mod state {
         /// tuned to (0 = not yet set / null slot).
         pub current_channel: u8,
         pub tx_seq: u16,
+        /// The master whose channel sequence filin has committed to (Bug B
+        /// hysteresis). Re-adoption only happens when a challenger wins the
+        /// election for [`crate::schedule::MASTER_DEBOUNCE_US`].
+        pub committed_master: [u8; 6],
+        /// Challenger that won the most recent election but has not yet
+        /// passed the debounce window (Bug B).
+        pub pending_master: [u8; 6],
+        /// When [`pending_master`] first won the election (Bug B).
+        pub pending_since_us: u64,
+        /// Sticky transfer pin: the peer/channel of the most recent unicast
+        /// data RX (Bug C). While active, filin holds that channel and
+        /// suppresses hopping + master re-adoption so a bulk AirDrop upload
+        /// is not cut off mid-stream.
+        pub transfer: Option<crate::schedule::TransferPin>,
     }
 
     impl AwdlState {
@@ -2904,6 +3130,10 @@ pub mod state {
                 channel_sequence: [[anchor_channel as u8, opclass]; CHANSEQ_LEN],
                 current_channel: 0,
                 tx_seq: 0,
+                committed_master: self_addr,
+                pending_master: self_addr,
+                pending_since_us: now_us,
+                transfer: None,
             }
         }
 
@@ -2963,16 +3193,70 @@ pub mod state {
             self.election.run(&self.peers.election_views());
             // Adopt the elected master's channel sequence so filin hops to the
             // same channels as the peer. When filin is self-master, keep the
-            // default static anchor sequence.
-            self.sync_channel_sequence();
+            // default static anchor sequence. Hysteresis (Bug B) and the
+            // active-transfer pin (Bug C) gate re-adoption.
+            self.sync_channel_sequence(rx_time_us);
         }
 
         /// If we have an elected master with a non-trivial channel sequence,
         /// adopt it as our own. When we lose the master, revert to the static
         /// anchor sequence. This ensures filin is on the same channel as the
         /// peer during each EAW slot.
-        fn sync_channel_sequence(&mut self) {
-            let master = self.election.sync_addr;
+        ///
+        /// Bug B (hysteresis): a challenger must win the election for
+        /// [`crate::schedule::MASTER_DEBOUNCE_US`] before filin commits to its
+        /// channel sequence — stops the master thrash on a contended link.
+        ///
+        /// Bug C (transfer pin): while a unicast transfer is active, skip
+        /// re-adoption entirely so an in-flight bulk upload is not
+        /// descheduled.
+        fn sync_channel_sequence(&mut self, now_us: u64) {
+            // Bug C: an active unicast transfer freezes the committed master
+            // (and thus the channel schedule) until the peer goes quiet.
+            if crate::schedule::transfer_active(
+                self.transfer.as_ref(),
+                now_us,
+                crate::schedule::TRANSFER_IDLE_TIMEOUT_US,
+            )
+            .is_some()
+            {
+                return;
+            }
+            let winner = self.election.sync_addr;
+            // Bug B: debounce a challenger before committing — but only when
+            // SWITCHING between two real external masters. The first adoption
+            // (self → real master) and master loss (real master → self) are
+            // immediate: neither is a flip-flop, so neither is debounced.
+            let decision = if self.committed_master == self.self_addr
+                || winner == self.self_addr
+            {
+                crate::schedule::MasterAdoption::Adopt
+            } else {
+                crate::schedule::master_adoption_decision(
+                    self.committed_master,
+                    winner,
+                    self.pending_master,
+                    self.pending_since_us,
+                    now_us,
+                    crate::schedule::MASTER_DEBOUNCE_US,
+                )
+            };
+            match decision {
+                crate::schedule::MasterAdoption::Adopt => {
+                    self.committed_master = winner;
+                    self.pending_master = winner;
+                    self.pending_since_us = now_us;
+                }
+                crate::schedule::MasterAdoption::Keep => {
+                    // Start/refresh the challenger's debounce clock.
+                    if winner != self.pending_master {
+                        self.pending_master = winner;
+                        self.pending_since_us = now_us;
+                    }
+                    return; // hold the currently-committed master
+                }
+            }
+            let master = self.committed_master;
             if master == self.self_addr {
                 // self-master: use static anchor sequence
                 let opclass = chan_opclass(self.anchor_channel);
@@ -2997,9 +3281,31 @@ pub mod state {
 
         /// owl `awdl_chan_num(state->channel.sequence[slot], enc)` — the channel
         /// number for the current EAW slot from our own sequence.
+        ///
+        /// Bug C: while a unicast transfer is active, returns the PINNED peer
+        /// channel instead of the slot channel, so [`update_channel`] does not
+        /// hop the radio away mid-upload.
         pub fn desired_channel(&self, now_us: u64) -> u8 {
+            if let Some((_, channel)) = crate::schedule::transfer_active(
+                self.transfer.as_ref(),
+                now_us,
+                crate::schedule::TRANSFER_IDLE_TIMEOUT_US,
+            ) {
+                return channel;
+            }
             let slot = usize::from(self.sync.current_eaw(now_us) % CHANSEQ_LEN as u16);
             self.channel_sequence[slot][0]
+        }
+
+        /// Bug C: record a received unicast data frame from `peer` on
+        /// `channel`, (re)arming the sticky transfer pin so filin holds this
+        /// channel until the idle timeout elapses.
+        pub fn note_unicast_rx(&mut self, peer: [u8; 6], channel: u8, now_us: u64) {
+            self.transfer = Some(crate::schedule::TransferPin {
+                peer,
+                channel,
+                last_rx_us: now_us,
+            });
         }
 
         /// owl `awdl_switch_channel` decision (owl/daemon/core.c:279-308):
@@ -3024,7 +3330,7 @@ pub mod state {
             let cutoff = now_us.saturating_sub(peers::PEER_TIMEOUT_US);
             let removed = self.peers.remove_stale(cutoff);
             self.election.run(&self.peers.election_views());
-            self.sync_channel_sequence();
+            self.sync_channel_sequence(now_us);
             removed
         }
 
@@ -3124,6 +3430,34 @@ pub mod state {
             value[24..28].copy_from_slice(&metric.to_le_bytes());
             value[36..40].copy_from_slice(&0u32.to_le_bytes());
             awdl::Tlv { kind: 24, value: value.leak() }
+        }
+
+        /// Like [`election_v2_tlv`] but with a configurable peer address, so
+        /// two distinct masters can be made to compete in one state.
+        fn election_v2_tlv_for(
+            addr: [u8; 6],
+            master_counter: u32,
+            metric: u32,
+        ) -> awdl::Tlv<'static> {
+            let mut value = vec![0u8; 40];
+            value[0..6].copy_from_slice(&addr); // master
+            value[6..12].copy_from_slice(&addr); // sync (self)
+            value[12..16].copy_from_slice(&master_counter.to_le_bytes());
+            value[16..20].copy_from_slice(&0u32.to_le_bytes()); // distance
+            value[20..24].copy_from_slice(&metric.to_le_bytes());
+            value[24..28].copy_from_slice(&metric.to_le_bytes());
+            value[36..40].copy_from_slice(&0u32.to_le_bytes());
+            awdl::Tlv { kind: 24, value: value.leak() }
+        }
+
+        /// Build a chanseq TLV value (OPCLASS encoding) filled with `chan`.
+        fn chanseq_value_all(chan: u8) -> Vec<u8> {
+            let mut v = vec![15, awdl::CHAN_ENC_OPCLASS, 0, 3];
+            v.extend_from_slice(&0xffffu16.to_le_bytes());
+            for _ in 0..16 {
+                v.extend_from_slice(&[chan, 0x80]);
+            }
+            v
         }
 
         #[test]
@@ -3286,6 +3620,116 @@ pub mod state {
             // desired_channel feeds the radio retune, so it must be a real
             // channel too (slot 0 → 44 here).
             assert_eq!(state.desired_channel(1_000), 44);
+        }
+
+        #[test]
+        fn master_hysteresis_debounces_challenger_switch() {
+            // Bug B: on a contended link two Apple devices compete; filin
+            // must NOT re-adopt on every frame. A single challenger frame
+            // holds; a sustained win over the debounce window commits.
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let peer_a = [0x02, 0xaa, 0, 0, 0, 1];
+            let peer_b = [0x02, 0xbb, 0, 0, 0, 2];
+
+            // Adopt master A (counter 50, chan 149) — first adoption is
+            // immediate (self → real master is not a flip-flop).
+            let chan_a = chanseq_value_all(149);
+            state.apply_action(
+                peer_a,
+                mif(),
+                &[
+                    election_v2_tlv_for(peer_a, 50, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv { kind: 18, value: &chan_a },
+                ],
+                1_000,
+            );
+            assert_eq!(state.committed_master, peer_a);
+            assert_eq!(state.channel_sequence[0][0], 149);
+
+            // Master B (higher counter 60, chan 6) wins one frame — but it
+            // is a challenger, so filin holds A.
+            let chan_b = chanseq_value_all(6);
+            state.apply_action(
+                peer_b,
+                mif(),
+                &[
+                    election_v2_tlv_for(peer_b, 60, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv { kind: 18, value: &chan_b },
+                ],
+                2_000,
+            );
+            assert_eq!(state.committed_master, peer_a, "single frame must not flip");
+            assert_eq!(state.channel_sequence[0][0], 149, "chanseq must stay A's");
+
+            // B wins again after the debounce window → commit to B.
+            let now = 2_000 + crate::schedule::MASTER_DEBOUNCE_US;
+            state.apply_action(
+                peer_b,
+                mif(),
+                &[
+                    election_v2_tlv_for(peer_b, 60, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv { kind: 18, value: &chan_b },
+                ],
+                now,
+            );
+            assert_eq!(state.committed_master, peer_b, "sustained win must commit");
+            assert_eq!(state.channel_sequence[0][0], 6);
+        }
+
+        #[test]
+        fn transfer_pin_holds_channel_and_suppresses_readoption() {
+            // Bug C: while a unicast transfer is active, filin PINs the radio
+            // to the peer's RX channel and suppresses hopping + master
+            // re-adoption so the bulk upload is not cut off mid-stream.
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let peer_a = [0x02, 0xaa, 0, 0, 0, 1];
+            let peer_b = [0x02, 0xbb, 0, 0, 0, 2];
+
+            // Adopt master A (chanseq all 149).
+            let chan_a = chanseq_value_all(149);
+            state.apply_action(
+                peer_a,
+                mif(),
+                &[
+                    election_v2_tlv_for(peer_a, 50, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv { kind: 18, value: &chan_a },
+                ],
+                1_000,
+            );
+            assert_eq!(state.desired_channel(1_000), 149); // slot-channel
+
+            // Arm the sticky pin: we just RX'd unicast from A on ch44.
+            state.note_unicast_rx(peer_a, 44, 1_000);
+            // desired_channel now returns the PINNED 44, not the slot's 149,
+            // so the runtime does not hop the radio away mid-upload.
+            assert_eq!(state.desired_channel(1_000), 44);
+
+            // Master B (higher counter, chan 6) tries to take over — the pin
+            // suppresses re-adoption, so chanseq + committed stay at A.
+            let chan_b = chanseq_value_all(6);
+            state.apply_action(
+                peer_b,
+                mif(),
+                &[
+                    election_v2_tlv_for(peer_b, 60, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv { kind: 18, value: &chan_b },
+                ],
+                1_100,
+            );
+            assert_eq!(state.committed_master, peer_a, "pin suppresses readoption");
+            assert_eq!(state.channel_sequence[0][0], 149);
+
+            // After the idle timeout the pin releases; desired_channel
+            // reverts to the slot channel and re-adoption can proceed.
+            let after = 1_100 + crate::schedule::TRANSFER_IDLE_TIMEOUT_US + 1;
+            // B must still be valid and win the debounce to actually commit;
+            // at minimum the pin no longer pins the channel.
+            assert_eq!(state.desired_channel(after), 149); // back to slot-channel
         }
 
         #[test]
@@ -3527,8 +3971,18 @@ pub mod runtime {
                                                 .write_all(&frame.bytes)
                                                 .map_err(|_| Error::Io)?;
                                         }
+                                        // Bug C: arm the sticky transfer pin so
+                                        // filin holds this peer's channel and
+                                        // suppresses hopping/re-adoption for
+                                        // the duration of the bulk upload.
+                                        awdl_state.note_unicast_rx(
+                                            source,
+                                            awdl_state.current_channel,
+                                            now_us,
+                                        );
                                         tracing::trace!(
                                             count = frames.len(),
+                                            channel = awdl_state.current_channel,
                                             "wrote ethernet frame(s) to tap"
                                         );
                                     }
