@@ -90,6 +90,22 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 36 (filin VISITS 149 but iPhone STILL not in picker = wasted hops; dispatched pty-5 announce re-broadcast + denser 149).
+- iPhone opened AirDrop sheet, luftlift STILL not visible despite filin covering 149. DIAGNOSIS (human's insight,
+  confirmed): the mDNS announce and the 149 hops don't coincide -> wasted hops. Evidence:
+  - 149 in only 1/16 slots: final=[6,149,44,0,0,0,0,0,6,0,44,0,0,0,0,0] (~6% dwell on 149).
+  - announce cadence 10s >> hop rate; multicast-spread sends each announce ONCE per channel then drops it, so
+    between luftlift's 10s announces every 149 hop carries NO announce.
+  - tcpdump awdl0: ZERO inbound mDNS queries from iPhone in 15s (can't rely on query-response either).
+  - biggest "peer" [188,5,67,13,80,161] = filin's OWN MAC (loopback). Real external master [146,197,245,67,95,175].
+- DISPATCHED pty-5 (idle, ctx ~153K — watch for degradation) FILIN_ANNOUNCE_CADENCE.md:
+  A) cache latest multicast mDNS frame, RE-BROADCAST it on every social-channel (6/44/149) visit, rate-limit
+     ~1s/channel, expire if stale (decouple discovery from luftlift 10s cadence); transfer-pin still wins.
+  B) fill null chanseq slots round-robin 6/44/149 so 149 gets several slots not 1.
+- STACK UP (no re-broadcast yet): filin 1806251 (RUST_LOG=filin_rs=debug) + luftlift 1806390 on pty-7.
+- NOTE: this is RF/timing optimization over the carl9170 ~0.4%-sync link (the chronic ceiling). If this still
+  doesn't land discovery, it may be the hardware ceiling needing the human's hands-on/better-radio pass.
+--- PRIOR cycle-35 below ---
 Last updated: cycle 35 (CH149 COVERAGE FIX LIVE — filin now tunes to 149; stack restarted; AWAITING human discovery retry).
 - COMMITS: 3a83f2f debug(filin) raw chanseq hex+decoded log; e979ae5 fix(filin) cover AWDL social channels
   6/44/149 even when master omits them. filin 103 tests green, clippy clean, release built.
