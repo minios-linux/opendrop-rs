@@ -39,4 +39,8 @@ rustls-pemfile = "2"
 mdns-sd = "0.11"
 # SIGINT/SIGTERM handler for graceful mDNS goodbye (TTL=0) on `receive` exit.
 ctrlc = "3"
+# JSON serialisation for the loopback introspection API (/status, /trace).
+# Plain serde_json keeps the introspect surface tiny — no full async runtime.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Add as needed: hyper/axum, cpio, etc.
