@@ -3005,6 +3005,19 @@ pub mod tx {
 }
 
 pub mod iface {
+    /// Default introspection bind address (loopback only). See
+    /// FILIN_HTTP_INTROSPECT.md.
+    pub const DEFAULT_HTTP_PORT: u16 = 9930;
+
+    /// The default introspection HTTP address: `127.0.0.1:9930`. Const so it
+    /// can be used in static test literals without `"parse().unwrap()"`.
+    pub const fn default_http_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            DEFAULT_HTTP_PORT,
+        )
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Config {
         pub monitor_iface: String,
@@ -3012,12 +3025,16 @@ pub mod iface {
         pub anchor_channel: u16,
         pub assume_monitor: bool,
         pub pcap_path: Option<String>,
+        /// Localhost introspection HTTP bind address. `None` disables the
+        /// server entirely (`--no-http`).
+        pub http_addr: Option<std::net::SocketAddr>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum ConfigError {
         MissingMonitorInterface,
         UnsupportedAnchorChannel(u16),
+        NonLoopbackHttpAddr(std::net::SocketAddr),
     }
 
     pub fn validate_config(config: Config) -> Result<Config, ConfigError> {
@@ -3042,6 +3059,7 @@ pub mod iface {
                 anchor_channel: 44,
                 assume_monitor: true,
                 pcap_path: None,
+                http_addr: Some(default_http_addr()),
             };
 
             assert_eq!(validate_config(config.clone()), Ok(config));
@@ -3366,6 +3384,8 @@ pub mod cli {
             anchor_channel: args.anchor_channel,
             assume_monitor: args.assume_monitor,
             pcap_path: args.pcap_path.or_else(|| std::env::var("FILIN_PCAP").ok()),
+            // STUB (RED): hardcode the default; --http-addr / --no-http not yet wired.
+            http_addr: Some(iface::default_http_addr()),
         })
         .map_err(|_| CliError::Invalid)
     }
@@ -3388,6 +3408,7 @@ pub mod cli {
                     anchor_channel: 44,
                     assume_monitor: true,
                     pcap_path: None,
+                    http_addr: Some(iface::default_http_addr()),
                 }
             );
         }
@@ -3418,6 +3439,55 @@ pub mod cli {
             let config = parse_config_from(["filin", "-i", "wlan0mon", "-h", "awdl-test"])
                 .expect("short -h remains host iface");
             assert_eq!(config.host_iface, "awdl-test");
+        }
+
+        #[test]
+        fn http_addr_defaults_to_loopback_9930() {
+            let config = parse_config_from(["filin", "-i", "wlan0mon"])
+                .expect("valid CLI args");
+            assert_eq!(config.http_addr, Some(iface::default_http_addr()));
+            let addr = config.http_addr.expect("some");
+            assert!(addr.ip().is_loopback());
+            assert_eq!(addr.port(), iface::DEFAULT_HTTP_PORT);
+        }
+
+        #[test]
+        fn http_addr_flag_overrides_the_default() {
+            let config = parse_config_from([
+                "filin",
+                "-i",
+                "wlan0mon",
+                "--http-addr",
+                "127.0.0.1:9999",
+            ])
+            .expect("valid CLI args");
+            let addr = config.http_addr.expect("some");
+            assert!(addr.ip().is_loopback());
+            assert_eq!(addr.port(), 9999);
+        }
+
+        #[test]
+        fn no_http_flag_disables_introspection_server() {
+            let config = parse_config_from(["filin", "-i", "wlan0mon", "--no-http"])
+                .expect("valid CLI args");
+            assert_eq!(config.http_addr, None);
+        }
+
+        #[test]
+        fn validate_rejects_non_loopback_http_addr() {
+            let non_loopback: std::net::SocketAddr = "10.0.0.5:9930".parse().unwrap();
+            let bad = iface::Config {
+                monitor_iface: "wlan0mon".into(),
+                host_iface: "awdl0".into(),
+                anchor_channel: 44,
+                assume_monitor: true,
+                pcap_path: None,
+                http_addr: Some(non_loopback),
+            };
+            assert_eq!(
+                iface::validate_config(bad),
+                Err(iface::ConfigError::NonLoopbackHttpAddr(non_loopback))
+            );
         }
     }
 }
