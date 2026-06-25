@@ -90,6 +90,21 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 35 (CH149 COVERAGE FIX LIVE — filin now tunes to 149; stack restarted; AWAITING human discovery retry).
+- COMMITS: 3a83f2f debug(filin) raw chanseq hex+decoded log; e979ae5 fix(filin) cover AWDL social channels
+  6/44/149 even when master omits them. filin 103 tests green, clippy clean, release built.
+- VERIFIED LIVE: filin debug log now shows channel=149 (66x), 44 (137x), 6 (96x), 52 (23x) — 149 IS covered now.
+  Chanseq debug confirms WHY 149 was missing: the only real external master [146,197,245,67,95,175] advertises
+  decoded=[6,0,44,0,...] (6/44 only); filin's own anchor seq is 16x44. NO master advertised 149 — social
+  coverage injects it. pty-5's decode was correct all along.
+- STACK RESTARTED on pty-7 (NEW pids): filin 1806251 (RUST_LOG=filin_rs=DEBUG so channel= + chanseq logs show),
+  luftlift 1806390 (RUST_LOG=luftlift_rs=debug, LUFTLIFT_DUMP_UPLOAD=/tmp/ldrop_raw, -o /tmp/ldrop). Logs
+  /tmp/fF.log + /tmp/lrF.log.
+- AWAITING HUMAN: open iPhone AirDrop sheet -> luftlift should now appear (filin visiting 149). Then send PHOTO.
+  SUCCESS = Discover/Ask/Upload in /tmp/lrF.log + non-empty file in /tmp/ldrop + raw capture /tmp/ldrop_raw/
+  upload-<ts>-iPhone42.bin. If discovery now works but upload stalls again -> transfer-pin tuning (the pin holds
+  128ms; bulk transfer needs continuous unicast RX to keep it armed).
+--- PRIOR cycle-34 below ---
 Last updated: cycle 34 (DISCOVERY REGRESSION: filin covers only ch6/44 never 149; dispatched pty-5 FILIN_CH149_COVERAGE.md).
 - After the cycle-33 fixes the iPhone NO LONGER sees luftlift in the picker (it DID in cycle 32). Root-cause
   evidence from filin debug log (`switched monitor channel channel=N`): 167x ch44, 166x ch6, ZERO ch149 across
