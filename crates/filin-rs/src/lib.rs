@@ -247,8 +247,23 @@ pub mod awdl {
         })
     }
 
-    pub fn parse_tlvs(_bytes: &[u8]) -> Result<Vec<Tlv<'_>>, ParseError> {
-        Err(ParseError::TooShort)
+    pub fn parse_tlvs(bytes: &[u8]) -> Result<Vec<Tlv<'_>>, ParseError> {
+        let mut offset = 0;
+        let mut tlvs = Vec::new();
+
+        while offset < bytes.len() {
+            let header = bytes.get(offset..offset + 3).ok_or(ParseError::TooShort)?;
+            let kind = header[0];
+            let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+            offset += 3;
+
+            let end = offset.checked_add(len).ok_or(ParseError::TooShort)?;
+            let value = bytes.get(offset..end).ok_or(ParseError::TooShort)?;
+            tlvs.push(Tlv { kind, value });
+            offset = end;
+        }
+
+        Ok(tlvs)
     }
 
     #[cfg(test)]
