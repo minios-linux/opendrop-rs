@@ -2288,6 +2288,78 @@ pub mod schedule {
             assert_eq!(distinct_channels(&seq, 44), vec![44]);
         }
 
+        // --- master anchor extraction (FILIN_ANCHOR_REBROADCAST.md) ---
+
+        #[test]
+        fn master_anchor_extracts_slot_zero_channel() {
+            // The live iPhone cluster's decoded sequence starts with 52 at
+            // slot 0: [52,0,44,0,0,0,0,0,6,0,44,0,...]. The anchor must be 52.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [52, 0x80];
+            seq[2] = [44, 0x80];
+            seq[8] = [6, 0x51];
+            seq[10] = [44, 0x80];
+            assert_eq!(master_anchor_channel(&seq), 52);
+        }
+
+        #[test]
+        fn master_anchor_falls_back_to_most_frequent_when_slot0_null() {
+            // If slot 0 is null, the anchor is the most-frequent non-zero
+            // channel (the "dominant" one).
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [0, 0]; // slot 0 null
+            seq[1] = [44, 0x80];
+            seq[2] = [44, 0x80];
+            seq[3] = [44, 0x80];
+            seq[4] = [149, 0x80];
+            assert_eq!(master_anchor_channel(&seq), 44);
+        }
+
+        #[test]
+        fn master_anchor_is_zero_for_all_null_sequence() {
+            let seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            assert_eq!(master_anchor_channel(&seq), 0);
+        }
+
+        #[test]
+        fn master_anchor_falls_back_to_most_frequent_tie_break_lowest() {
+            // On a tie in frequency, pick the lowest channel number for
+            // determinism.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [0, 0];
+            seq[1] = [149, 0x80];
+            seq[2] = [149, 0x80];
+            seq[3] = [44, 0x80];
+            seq[4] = [44, 0x80];
+            assert_eq!(master_anchor_channel(&seq), 44);
+        }
+
+        #[test]
+        fn rebroadcast_set_includes_non_social_anchor() {
+            // Anchor 52 is not a social channel → the rebroadcast set grows to
+            // include it alongside 6/44/149.
+            let set = rebroadcast_channels(52);
+            assert!(set.contains(&6));
+            assert!(set.contains(&44));
+            assert!(set.contains(&149));
+            assert!(set.contains(&52), "anchor 52 must be in the rebroadcast set");
+        }
+
+        #[test]
+        fn rebroadcast_set_unchanged_when_anchor_is_social() {
+            // If the anchor is already 6/44/149, the set is unchanged (no
+            // duplicate).
+            assert_eq!(rebroadcast_channels(44), vec![6, 44, 149]);
+            assert_eq!(rebroadcast_channels(6), vec![6, 44, 149]);
+            assert_eq!(rebroadcast_channels(149), vec![6, 44, 149]);
+        }
+
+        #[test]
+        fn rebroadcast_set_for_zero_anchor_is_socials_only() {
+            // No master adopted (anchor 0): just the three socials.
+            assert_eq!(rebroadcast_channels(0), vec![6, 44, 149]);
+        }
+
         #[test]
         fn spread_sends_on_every_distinct_channel_then_drops() {
             // Core regression: one mDNS announce enqueued while the master
