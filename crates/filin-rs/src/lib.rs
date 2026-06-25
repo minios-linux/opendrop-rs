@@ -747,7 +747,7 @@ pub mod election {
             let local = state([0x02, 0, 0, 0, 0, 1], 100, 0);
             let peer = state([0x02, 0, 0, 0, 0, 2], 200, 0);
 
-            let selected = choose_sync_master(&local, &[peer.clone()]);
+            let selected = choose_sync_master(&local, std::slice::from_ref(&peer));
 
             assert_eq!(selected.master_addr, peer.master_addr);
             assert_eq!(selected.sync_addr, peer.self_addr);
@@ -1520,19 +1520,6 @@ pub mod os {
             Io(i32),
         }
 
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-
-            #[test]
-            fn plans_packet_bind_for_eth_p_all() {
-                let plan = plan_bind(7).expect("valid ifindex");
-
-                assert_eq!(plan.ifindex, 7);
-                assert_eq!(plan.protocol_be, (libc::ETH_P_ALL as u16).to_be());
-            }
-        }
-
         pub struct PacketSocket {
             fd: OwnedFd,
         }
@@ -1627,6 +1614,19 @@ pub mod os {
 
         fn last_errno() -> Error {
             Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn plans_packet_bind_for_eth_p_all() {
+                let plan = plan_bind(7).expect("valid ifindex");
+
+                assert_eq!(plan.ifindex, 7);
+                assert_eq!(plan.protocol_be, (libc::ETH_P_ALL as u16).to_be());
+            }
         }
     }
 
