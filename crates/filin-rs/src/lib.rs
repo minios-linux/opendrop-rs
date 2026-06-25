@@ -1228,4 +1228,34 @@ pub mod os {
             }
         }
     }
+
+    pub mod packet {
+        #[derive(Debug, PartialEq, Eq)]
+        pub struct BindPlan {
+            pub ifindex: libc::c_int,
+            pub protocol_be: u16,
+        }
+
+        pub fn plan_bind(_ifindex: libc::c_int) -> Result<BindPlan, Error> {
+            Err(Error::InvalidIfIndex)
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum Error {
+            InvalidIfIndex,
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn plans_packet_bind_for_eth_p_all() {
+                let plan = plan_bind(7).expect("valid ifindex");
+
+                assert_eq!(plan.ifindex, 7);
+                assert_eq!(plan.protocol_be, (libc::ETH_P_ALL as u16).to_be());
+            }
+        }
+    }
 }
