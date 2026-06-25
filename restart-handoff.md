@@ -83,38 +83,50 @@ Verify healthy:
 Then ask the human to open the iPhone AirDrop sheet → luftlift should appear → send a PHOTO.
 
 ## 5. RECREATE THE tttt ENVIRONMENT (PTYs / agents)
-Each terminal is a tttt PTY launched as `tttt -e <command>`. After reboot the human (or you,
-via the `tttt_pty_launch` tool) recreate them. Roles + how to RE-BRIEF each (fresh agents have
-NO memory — point them at the repo files):
+**IMPORTANT mental model:** the tttt PTYs are persistent terminal WINDOWS (shells). The
+"agents" are just **commands you run INSIDE a window** — `opencode`, `codex`, `claude` — they
+are NOT separate `tttt -e <agent>` instances. So to restore an agent: pick/identify a window
+(`tttt_pty_list` + read each screen), and in it run the agent's command, then RE-BRIEF it
+(fresh agents have NO memory — point them at the repo files). The human normally sets up the
+windows; you drive what runs inside them via `tttt_pty_send_keys`.
 
-- **pty-1 = YOU** (orchestrator): `tttt -e claude --dangerously-skip-permissions`. You read
-  this file + handoff.md and drive. You run the heartbeat loop via **ScheduleWakeup** (~180-360s;
-  prompt = "HEARTBEAT: read handoff.md and continue"). NEVER use self_inject for the loop.
-- **filin agent** (owns ONLY `crates/filin-rs`): `tttt -e opencode` (was GLM-5.2 via OpenCode).
+**Always start a window as a plain `bash` shell, then run the agent command inside it** — do
+NOT launch a window directly into `opencode`/`codex`/`claude`. That way the window persists as a
+shell when the agent exits/crashes, so you can simply re-run the command (or run git/cargo/
+hardware commands) in the same window instead of losing it. If you create windows via
+`tttt_pty_launch`, launch `bash`; for the root hardware window, a root `bash` (sudo).
+
+- **YOU = orchestrator**: the `claude` command running in your window. You read this file +
+  handoff.md and drive. Heartbeat loop via **ScheduleWakeup** (~180-360s; prompt = "HEARTBEAT:
+  read handoff.md and continue"). NEVER use self_inject for the loop.
+- **filin agent** (owns ONLY `crates/filin-rs`): run `opencode` in a window (was GLM-5.2).
   Re-brief: "You own crates/filin-rs of a clean-room Rust AWDL port. Read ARCHITECTURE.md,
   WORKFLOW.md (TDD: red/green/refactor commits), crates/filin-rs/PORT.md, and the FILIN_*.md
   task/diagnosis files. The code is feature-complete + 113 tests; current work is live-discovery
   tuning (announce re-broadcast on social channels, ch149 coverage)." TDD, commit per change,
   only edits filin-rs. OpenCode runs commands autonomously; long prompts MANGLE on paste — write
   the task to a *.md and send a short "read X and do it".
-- **luftlift agent** (owns ONLY `crates/luftlift-rs`): `tttt -e opencode` (GLM-5.2). Re-brief:
-  "You own crates/luftlift-rs (AirDrop). Read ARCHITECTURE.md, WORKFLOW.md,
+- **luftlift agent** (owns ONLY `crates/luftlift-rs`): run `opencode` in a window (GLM-5.2).
+  Re-brief: "You own crates/luftlift-rs (AirDrop). Read ARCHITECTURE.md, WORKFLOW.md,
   crates/luftlift-rs/PORT.md, docs/airdrop-protocol.md, the LUFTLIFT_*.md files, and the python
   reference opendrop-patch/. ~104 tests green; current state = receive works, decode fixed."
-- (Optional) **Codex agent** `tttt -e codex` (gpt-5.5) — was STOOD DOWN off filin to avoid
-  edit conflicts on the single working tree. Only one agent edits filin at a time. Leave idle
-  unless you deliberately reassign.
-- **Root hardware shells** ×1-2: `root@ayourtch-x280` shells for the carl9170 + stack (sections
-  3-4). SHORT commands only (long one-liners mangle). One is enough; a 2nd is handy.
-- **MacBook shell** (optional, only for Apple-side tests): root shell on the MacBook.
-- **notify watcher** (only if you run a Codex agent that asks for approvals): recreate a
-  `notify_on_pattern` watching the Codex PTY for `Would you like to run|Press enter to confirm
-  or esc`, injecting a heartbeat into pty-1 so you wake on its approval prompts. Not needed for
-  the OpenCode (autonomous) agents.
+- (Optional) **Codex agent**: run `codex` in a window (gpt-5.5) — was STOOD DOWN off filin to
+  avoid edit conflicts on the single working tree. Only ONE agent edits filin at a time. Leave
+  idle unless you deliberately reassign. Codex is a TUI that asks per-command APPROVAL (send the
+  text, then [ENTER] as a SEPARATE call; sometimes a 2nd [ENTER]; approve with [ENTER]).
+- **Root hardware shell(s)**: a window with a `root@ayourtch-x280` shell (sudo) for the carl9170
+  + stack (sections 3-4). SHORT commands only (long one-liners mangle). One is enough; a 2nd is
+  handy.
+- **MacBook shell** (optional, only for Apple-side tests): a window with a root shell on the
+  MacBook (separate machine).
+- **notify watcher** (only if you run a Codex agent that asks for approvals): create a
+  `notify_on_pattern` watching the Codex window for `Would you like to run|Press enter to confirm
+  or esc`, injecting a heartbeat into YOUR window so you wake on its approval prompts. Not needed
+  for the OpenCode (autonomous) agents.
 
-NOTE: PTY numbers (pty-2, pty-3, pty-5, pty-7…) are NOT guaranteed to be the same after a
-restart — identify each by what's running in it (`tttt_pty_list` + read each screen), don't
-assume the old numbering.
+NOTE: PTY numbers are NOT guaranteed to be the same after a restart, and a window may be a plain
+shell or already running an agent — ALWAYS identify each by reading its screen (`tttt_pty_list`
++ `tttt_pty_get_screen`), never assume the old numbering or contents.
 
 ## 6. THE LOOP + WHERE TO LOOK
 - Per-heartbeat: `git -C /home/ayourtch/rust/opendrop log --oneline -15`; check each agent PTY
