@@ -90,6 +90,20 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 37 (announce re-broadcast + denser-149 LIVE & verified on-wire; AWAITING human discovery retry).
+- COMMITS: e4873ac fix(filin) re-broadcast cached mDNS announce on each social-channel visit; a43bd3e fix(filin)
+  denser social dwell (fill null slots round-robin). filin 113 tests green, clippy clean, release built.
+- VERIFIED LIVE (filin pid 1812754 debug): channel dwell now 44=182, 149=87, 6=80, 52=3 (149 way up from 1 slot).
+  Re-broadcast firing ~1s: "re-broadcast cached mDNS announce on social channel" on ch149 27x, ch44 127x, ch6 25x.
+  So the announce is now on 149 ~1/sec whenever filin is there (was only on luftlift's 10s cadence -> wasted hops
+  fixed, per human's insight). luftlift pid 1813068 announcing every 10s.
+- STACK on pty-7: filin 1812754 (RUST_LOG=filin_rs=debug), luftlift 1813068 (luftlift_rs=debug,
+  LUFTLIFT_DUMP_UPLOAD=/tmp/ldrop_raw, -o /tmp/ldrop). Logs /tmp/fF.log + /tmp/lrF.log.
+- AWAITING HUMAN: open iPhone AirDrop sheet -> luftlift should appear now. Then send PHOTO. SUCCESS = Discover/
+  Ask/Upload in /tmp/lrF.log + non-empty file /tmp/ldrop + raw /tmp/ldrop_raw/upload-<ts>-iPhone42.bin.
+- REMINDER (per [[no-hardware-defeatism]]): hardware is proven (received real AirDrops cycles 28/29); failures =
+  our software. Keep iterating on filin/luftlift logic, no hardware excuses.
+--- PRIOR cycle-36 below ---
 Last updated: cycle 36 (filin VISITS 149 but iPhone STILL not in picker = wasted hops; dispatched pty-5 announce re-broadcast + denser 149).
 - iPhone opened AirDrop sheet, luftlift STILL not visible despite filin covering 149. DIAGNOSIS (human's insight,
   confirmed): the mDNS announce and the 149 hops don't coincide -> wasted hops. Evidence:
