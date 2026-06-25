@@ -1011,18 +1011,39 @@ pub mod rx {
 
 pub mod cli {
     use crate::iface;
+    use clap::Parser;
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum CliError {
         Invalid,
     }
 
-    pub fn parse_config_from<I, S>(_args: I) -> Result<iface::Config, CliError>
+    #[derive(Debug, Parser)]
+    #[command(name = "filin", disable_help_flag = true)]
+    struct Args {
+        #[arg(short = 'i')]
+        monitor_iface: String,
+        #[arg(short = 'c', default_value_t = 44)]
+        anchor_channel: u16,
+        #[arg(short = 'h', default_value = "awdl0")]
+        host_iface: String,
+        #[arg(short = 'N')]
+        assume_monitor: bool,
+    }
+
+    pub fn parse_config_from<I, S>(args: I) -> Result<iface::Config, CliError>
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<std::ffi::OsString> + Clone,
     {
-        Err(CliError::Invalid)
+        let args = Args::try_parse_from(args).map_err(|_| CliError::Invalid)?;
+        iface::validate_config(iface::Config {
+            monitor_iface: args.monitor_iface,
+            host_iface: args.host_iface,
+            anchor_channel: args.anchor_channel,
+            assume_monitor: args.assume_monitor,
+        })
+        .map_err(|_| CliError::Invalid)
     }
 
     #[cfg(test)]
