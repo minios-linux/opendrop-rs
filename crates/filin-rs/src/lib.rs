@@ -2812,7 +2812,34 @@ pub mod schedule {
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
-            assert!(cache.rebroadcast(36, 1_500_000).is_none());
+            assert!(cache.rebroadcast(36, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_none());
+        }
+
+        #[test]
+        fn announce_cache_rebroadcasts_on_anchor_channel_when_in_allowed_set() {
+            // FILIN_ANCHOR_REBROADCAST.md: when the master anchors on a
+            // non-social channel (e.g. 52), the anchor must be in the allowed
+            // set so the cached announce is re-broadcast there too.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA, 0xBB], 1_000_000);
+            let allowed = rebroadcast_channels(52);
+            assert_eq!(cache.rebroadcast(52, 1_500_000, &allowed), Some(&[0xAA, 0xBB][..]));
+        }
+
+        #[test]
+        fn announce_cache_still_rate_limits_on_anchor_channel() {
+            // The per-channel rate limit must apply to the anchor channel too,
+            // so filin does not flood a DFS channel.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA], 1_000_000);
+            let allowed = rebroadcast_channels(52);
+            assert!(cache.rebroadcast(52, 1_500_000, &allowed).is_some());
+            assert!(
+                cache.rebroadcast(52, 1_900_000, &allowed).is_none(),
+                "anchor channel must be rate-limited"
+            );
         }
 
         #[test]
