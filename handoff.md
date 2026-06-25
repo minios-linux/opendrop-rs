@@ -90,6 +90,23 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 11 (filin COMPLETE incl OS layer; luftlift building send client; 79 tests green).
+- filin (gpt-5.5): **DONE through all of PORT.md incl. the real OS layer** — TAP awdl0,
+  AF_PACKET RX/TX, netdev ioctls (MAC/MTU1450/up), nl80211 channel set, binary poll
+  loop, TAP<->AWDL inject/decap, TSFT-bridged sync-error logging. 27 tests, clippy
+  clean, git clean. Idle. Tasked it with one finisher: crates/filin-rs/RUN.md operator
+  guide for the hardware pass (then stand by). filin needs NO more feature work.
+- luftlift (GLM-5.2): building `send` client (TDD) — sender HTTP done; doing CPIO
+  encoder -> dvzip encoder -> TLS client cfg -> request builders -> send orchestration
+  -> main wiring. 52 tests. Autonomous.
+- Tree: 79 tests green (filin 27 + luftlift 52), both clippy clean.
+- ENDGAME now mostly gated on luftlift `send`. When it lands: root `cargo build
+  --release` + `cargo test --workspace` + `cargo clippy --workspace -- -D warnings`,
+  run `filin --help` / `luftlift --help` / `luftlift find` sanity, then SUCCESS REPORT
+  to human (what works + tested, how to run each bin, what needs the hardware pass).
+  opendrop-rs is still a near-empty stub — the two crate bins (filin, luftlift) are the
+  deliverables; opendrop-rs wrapper is optional, don't block on it.
+--- (prior cycle notes below) ---
 Last updated: cycle 10 (luftlift RECEIVE+FIND complete; filin awdl0 bringup wired; both finishing).
 - luftlift (GLM-5.2): FEATURE-COMPLETE receive path — tls/mdns(announce+browse)/
   server(serve_forever + tested handle_one_connection)/netutil(/proc/net/if_inet6)/
