@@ -13,7 +13,6 @@ use crate::plist_impl::ReceiverConfig;
 use anyhow::Result;
 use plist::{Dictionary, Value};
 use std::collections::HashMap;
-use std::io::Write;
 use tracing::info;
 
 /// Sender identity/configuration used to build /Discover and /Ask requests.
@@ -38,34 +37,76 @@ pub struct FileToSend {
 /// responds with its own record so we appear in its picker — actually for a
 /// sender, /Discover makes the *receiver* appear in *our* picker. Body is a
 /// minimal sender plist; Content-Type application/x-apple-plist.
-pub fn build_discover_request(_cfg: &SenderConfig) -> HttpRequest {
+pub fn build_discover_request(cfg: &SenderConfig) -> HttpRequest {
+    let mut dict = Dictionary::new();
+    dict.insert("SenderComputerName".into(), Value::String(cfg.computer_name.clone()));
+    dict.insert("SenderModelName".into(), Value::String(cfg.model_name.clone()));
+    let mut body = Vec::new();
+    Value::Dictionary(dict).to_writer_binary(&mut body).expect("serialise discover request");
+
+    let mut headers = HashMap::new();
+    headers.insert("host".into(), "airdrop._tcp.local.".into());
+    headers.insert("content-type".into(), "application/x-apple-plist".into());
     HttpRequest {
         method: "POST".into(),
         path: "/Discover".into(),
-        headers: HashMap::new(),
-        body: Vec::new(),
+        headers,
+        body,
     }
 }
 
 /// Build the `/Ask` request body (file metadata plist). `transfer_id` is a
 /// caller-generated UUID; the receiver auto-accepts by replying 200.
-pub fn build_ask_request(_cfg: &SenderConfig, _transfer_id: &str, _files: &[FileToSend]) -> HttpRequest {
+pub fn build_ask_request(cfg: &SenderConfig, transfer_id: &str, files: &[FileToSend]) -> HttpRequest {
+    let mut files_arr = Vec::new();
+    for f in files {
+        let mut entry = Dictionary::new();
+        entry.insert("FileName".into(), Value::String(f.name.clone()));
+        entry.insert("FileType".into(), Value::String(f.uti_type.clone()));
+        entry.insert("FileSize".into(), Value::Integer((f.data.len() as i64).into()));
+        entry.insert("FileBomPath".into(), Value::String(format!("./{}", f.name)));
+        files_arr.push(Value::Dictionary(entry));
+    }
+
+    let mut root = Dictionary::new();
+    root.insert("TransferID".into(), Value::String(transfer_id.into()));
+    root.insert("TransferType".into(), Value::String("files".into()));
+    root.insert("SenderComputerName".into(), Value::String(cfg.computer_name.clone()));
+    root.insert("SenderModelName".into(), Value::String(cfg.model_name.clone()));
+    root.insert("BundleID".into(), Value::String(cfg.bundle_id.clone()));
+    root.insert("Files".into(), Value::Array(files_arr));
+    root.insert("Items".into(), Value::Array(Vec::new()));
+
+    let mut body = Vec::new();
+    Value::Dictionary(root).to_writer_binary(&mut body).expect("serialise ask request");
+
+    let mut headers = HashMap::new();
+    headers.insert("host".into(), "airdrop._tcp.local.".into());
+    headers.insert("content-type".into(), "application/x-apple-plist".into());
     HttpRequest {
         method: "POST".into(),
         path: "/Ask".into(),
-        headers: HashMap::new(),
-        body: Vec::new(),
+        headers,
+        body,
     }
 }
 
 /// Build the `/Upload` request body: a CPIO archive of the files, framed as
 /// dvzip (iOS-18 Content-Type `application/x-dvzip`).
-pub fn build_upload_request(_files: &[FileToSend]) -> HttpRequest {
+pub fn build_upload_request(files: &[FileToSend]) -> HttpRequest {
+    let entries: Vec<(&str, &[u8])> =
+        files.iter().map(|f| (f.name.as_str(), f.data.as_slice())).collect();
+    let cpio = build_odc_cpio(&entries);
+    let dvzip = cpio_to_dvzip(&cpio);
+
+    let mut headers = HashMap::new();
+    headers.insert("host".into(), "airdrop._tcp.local.".into());
+    headers.insert("content-type".into(), "application/x-dvzip".into());
     HttpRequest {
         method: "POST".into(),
         path: "/Upload".into(),
-        headers: HashMap::new(),
-        body: Vec::new(),
+        headers,
+        body: dvzip,
     }
 }
 
