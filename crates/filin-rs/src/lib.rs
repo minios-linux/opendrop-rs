@@ -5854,3 +5854,58 @@ pub mod os {
         }
     }
 }
+
+pub mod introspect {
+    //! Localhost HTTP/JSON introspection API (see FILIN_HTTP_INTROSPECT.md).
+    //!
+    //! Exposes filin's live state (current channel, master, peer table, sync
+    //! health, mDNS-reception counters, per-channel rebroadcast counts) plus a
+    //! runtime-toggleable ring-buffer trace, over a loopback-only HTTP server.
+    //! The hot path updates atomic counters and refreshes a `RwLock` snapshot;
+    //! the HTTP thread reads — it never blocks the AF_PACKET inject/receive
+    //! loop.
+    #[cfg(test)]
+    mod tests {
+        use super::Counters;
+
+        #[test]
+        fn counters_start_at_zero_for_social_channels() {
+            let c = Counters::new();
+            assert_eq!(c.mdns_rx_self(), 0);
+            assert_eq!(c.mdns_rx_other(), 0);
+            assert_eq!(c.rebroadcast_for(6), 0);
+            assert_eq!(c.rebroadcast_for(44), 0);
+            assert_eq!(c.rebroadcast_for(149), 0);
+        }
+
+        #[test]
+        fn mdns_and_rebroadcast_counters_are_independent_atomics() {
+            let c = Counters::new();
+            c.inc_mdns_rx_self();
+            c.inc_mdns_rx_self();
+            c.inc_mdns_rx_other();
+            c.inc_rebroadcast(44);
+            c.inc_rebroadcast(44);
+            c.inc_rebroadcast(44);
+            c.inc_rebroadcast(149);
+            c.inc_rebroadcast(99); // ignored — not a social channel
+
+            assert_eq!(c.mdns_rx_self(), 2);
+            assert_eq!(c.mdns_rx_other(), 1);
+            assert_eq!(c.rebroadcast_for(44), 3);
+            assert_eq!(c.rebroadcast_for(149), 1);
+            assert_eq!(c.rebroadcast_for(6), 0);
+            assert_eq!(c.rebroadcast_for(99), 0);
+        }
+
+        #[test]
+        fn rebroadcast_pairs_round_trips_all_social_channels() {
+            let c = Counters::new();
+            c.inc_rebroadcast(6);
+            c.inc_rebroadcast(149);
+            c.inc_rebroadcast(149);
+
+            assert_eq!(c.rebroadcast_pairs(), vec![(6, 1), (44, 0), (149, 2)]);
+        }
+    }
+}
