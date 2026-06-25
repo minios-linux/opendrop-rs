@@ -90,6 +90,47 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 29 (*** FULL-RUST STACK WORKS — but Upload decode yields empty file; live debug w/ human ***).
+- *** MILESTONE: the FULL-RUST stack (filin + luftlift, NO owl, zero C code) works at the
+  transport level. Swapped owl->filin: an iPhone DISCOVERED luftlift OVER FILIN (the
+  multicast-TX fix worked!) and Discover+Ask+Upload all completed, awdl0 RX climbed to
+  ~2519 pkts across filin's channel-hopping link. filin's full AWDL data path is validated
+  live end-to-end. ***
+- *** OPEN BUG (current): the received FILE IS EMPTY. luftlift log: "received file file=.
+  bytes=0" + "Upload complete count=1" + "failed to save file=. error=Is a directory".
+  The dvzip->CPIO decode only yielded the leading "." dir entry (0 bytes), NOT the real
+  file — even though ~2500 pkts of data arrived. iPhone42 sender, file_count=1, TWICE.
+  The Mac's 2 JPEGs decoded FINE earlier (over owl), so this is specific to the iPhone's
+  upload / its chunk framing. Earlier saw a "missing CRLF terminator" WARN from the chunked
+  body reader — likely the chunked-body reader truncates the real Apple upload (stops after
+  the first/"." CPIO entry). ALSO: luftlift should SKIP "." / directory CPIO entries instead
+  of trying to save them.
+- ASK THE HUMAN: what did you send from the iPhone (photo vs link/webloc vs note)? Then have
+  them send a PHOTO to compare (Mac photos worked).
+- NEXT ACTIONS:
+  1. Dispatch pty-3 (GLM luftlift, idle) to fix the Upload decode: harden the chunked-body
+     reader for real Apple uploads (read the FULL multi-chunk body; handle the iPhone's
+     chunk framing / the "missing CRLF terminator" case) + SKIP "."/directory CPIO entries
+     so real files extract. Write task to a *.md file, point pty-3 at it (don't paste long
+     multiline -> it mangles in OpenCode).
+  2. Mac never saw luftlift in picker (only iPhone did) = discovery flakiness; chase
+     separately (filin channel-hopping vs the Mac's listen windows; reduce contention).
+- STACK RUNNING on pty-7 (FULL-RUST): filin pid 1763226 (-i wlxbc05430d50a1 -c 44 -h awdl0
+  -N) + luftlift pid 1763244 (= luftlift-1763244 receive -o /tmp/ldrop). owl DOWN. carl9170
+  healthy (rebooted; monitor ch44). To restart: kill both; filin then luftlift.
+- FIXES committed this session: 6abe69e flush 100-continue (THE unlock for Mac Upload),
+  d0c2637 pid-in-ReceiverComputerName, 52f02a1 link-local scope_id send, 5e221db filin
+  multicast TX (no peer-gate), 5d4f782 luftlift periodic mDNS re-announce. Tree: filin 75 +
+  luftlift 93 tests green, clippy clean.
+- PROVEN EARLIER: AirDrop receive over owl+luftlift = real Mac AirDropped 2 valid JPEGs
+  (FullSizeRender 333KB + Image 188KB). luftlift send+receive round-trips byte-identical
+  (incl 512KB) locally. filin syncs (error_tu 0), channel-hops, peer table.
+- ENV: owl/src/election.h PATCHED force-master (not used now since filin is running; revert
+  + `make -C owl/build owl` for faithful owl). bluetoothd STOPPED pty-8. pty-5 = GLM filin
+  (fresh ctx after /new). pty-3 = GLM luftlift. pty-7 = root hardware shell. Long OpenCode
+  prompts -> write to *.md + short "read X and do it" pointer.
+--- DEEP HISTORY (older cycles, mostly superseded) below ---
+
 Last updated: cycle 28 (*** SHARING WORKS — real AirDrop receive validated end-to-end! ***).
 - *** SUCCESS: a real Mac ("Andrew's MacBook Pro") AirDropped files -> owl AWDL link ->
   luftlift RECEIVED them: FullSizeRender.jpg (333781 B, valid JPEG 1244x1838) + Image
