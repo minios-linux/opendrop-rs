@@ -1613,8 +1613,14 @@ pub mod os {
             pub frequency_mhz: u32,
         }
 
-        pub fn plan_set_channel(_ifindex: libc::c_int, _frequency_mhz: u32) -> Result<ChannelRequest, Error> {
-            Err(Error::Invalid)
+        pub fn plan_set_channel(ifindex: libc::c_int, frequency_mhz: u32) -> Result<ChannelRequest, Error> {
+            if ifindex <= 0 || frequency_mhz == 0 {
+                return Err(Error::Invalid);
+            }
+            Ok(ChannelRequest {
+                ifindex,
+                frequency_mhz,
+            })
         }
 
         #[derive(Debug, PartialEq, Eq)]
