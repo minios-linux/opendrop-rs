@@ -6345,5 +6345,71 @@ pub mod introspect {
             assert_eq!(GateLevel::from_request_str("bogus"), None);
             assert_eq!(GateLevel::from_request_str("INFO"), None); // case-sensitive per spec
         }
+
+        fn run_with_layer<F: FnOnce()>(gate: GateLevel, ring: Arc<TraceRing>, body: F) {
+            let gate_arc = Arc::new(TraceGate::new());
+            gate_arc.set(gate);
+            let layer = TraceLayer::new(ring, gate_arc);
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let dispatch = tracing::Dispatch::new(subscriber);
+            tracing::dispatcher::with_default(&dispatch, body);
+        }
+
+        #[test]
+        fn trace_layer_captures_event_with_message_and_typed_fields() {
+            let ring = Arc::new(TraceRing::new(TRACE_RING_CAP));
+            run_with_layer(GateLevel::Trace, ring.clone(), || {
+                tracing::info!(sent = 1u32, channel = 44u32, "injected awdl announce frame");
+            });
+
+            let captured = ring.last_n(10);
+            assert_eq!(captured.len(), 1);
+            let ev = &captured[0];
+            assert_eq!(ev.level, "INFO");
+            assert_eq!(ev.target, "filin_rs::introspect");
+            assert_eq!(ev.msg, "injected awdl announce frame");
+            assert_eq!(ev.fields.get("sent").and_then(|v| v.as_u64()), Some(1));
+            assert_eq!(ev.fields.get("channel").and_then(|v| v.as_u64()), Some(44));
+            // message must NOT also appear in `fields` — it has its own slot.
+            assert!(ev.fields.get("message").is_none());
+            assert!(ev.ts > 0);
+        }
+
+        #[test]
+        fn trace_layer_captures_string_and_bool_fields_typed() {
+            let ring = Arc::new(TraceRing::new(TRACE_RING_CAP));
+            run_with_layer(GateLevel::Trace, ring.clone(), || {
+                tracing::warn!(iface = "wlan0mon", ok = true, "channel switch failed");
+            });
+
+            let ev = &ring.last_n(1)[0];
+            assert_eq!(ev.level, "WARN");
+            assert_eq!(ev.msg, "channel switch failed");
+            assert_eq!(ev.fields.get("iface").and_then(|v| v.as_str()), Some("wlan0mon"));
+            assert_eq!(ev.fields.get("ok").and_then(|v| v.as_bool()), Some(true));
+        }
+
+        #[test]
+        fn trace_layer_off_by_default_captures_nothing() {
+            let ring = Arc::new(TraceRing::new(TRACE_RING_CAP));
+            run_with_layer(GateLevel::Off, ring.clone(), || {
+                tracing::error!("must not be captured");
+            });
+
+            assert!(ring.is_empty());
+        }
+
+        #[test]
+        fn trace_layer_debug_gate_skips_trace_events() {
+            let ring = Arc::new(TraceRing::new(TRACE_RING_CAP));
+            run_with_layer(GateLevel::Debug, ring.clone(), || {
+                tracing::info!("info captured");
+                tracing::trace!("trace skipped");
+                tracing::debug!("debug captured");
+            });
+
+            let msgs: Vec<&str> = ring.last_n(10).iter().map(|e| e.msg.as_str()).collect();
+            assert_eq!(msgs, vec!["info captured", "debug captured"]);
+        }
     }
 }
