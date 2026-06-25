@@ -3878,6 +3878,10 @@ pub mod state {
         /// Last-seen direct parent (election.sync_addr), used by
         /// [`note_election_transitions`] to detect re-parenting.
         last_seen_sync_addr: [u8; 6],
+        /// FILIN_SYNC_QUALITY.md pivot: when `Some`, filin is in single-channel
+        /// park mode — `desired_channel` returns this channel for every EAW
+        /// slot and `update_channel` never hops. Set via [`enable_park`].
+        park_channel: Option<u8>,
     }
 
     impl AwdlState {
@@ -3910,6 +3914,7 @@ pub mod state {
                 last_sync_error_tu: None,
                 last_seen_master_addr: self_addr,
                 last_seen_sync_addr: self_addr,
+                park_channel: None,
             }
         }
 
@@ -4092,6 +4097,12 @@ pub mod state {
         /// channel instead of the slot channel, so [`update_channel`] does not
         /// hop the radio away mid-upload.
         pub fn desired_channel(&self, now_us: u64) -> u8 {
+            // FILIN_SYNC_QUALITY.md pivot: in park mode, return the parked
+            // channel for every EAW slot — no hopping. The dedicated monitor
+            // doesn't share a radio, so it need not time-share channels.
+            if let Some(ch) = self.park_channel {
+                return ch;
+            }
             if let Some((_, channel)) = crate::schedule::transfer_active(
                 self.transfer.as_ref(),
                 now_us,
@@ -4101,6 +4112,53 @@ pub mod state {
             }
             let slot = usize::from(self.sync.current_eaw(now_us) % CHANSEQ_LEN as u16);
             self.channel_sequence[slot][0]
+        }
+
+        /// Enable single-channel park mode on `channel`. Subsequent calls to
+        /// [`desired_channel`] / [`update_channel`] stay fixed on it; only a
+        /// different `enable_park` call (or the runtime updating the park
+        /// channel to track the top master's anchor) moves the radio.
+        pub fn enable_park(&mut self, channel: u8) {
+            self.park_channel = Some(channel);
+        }
+
+        /// Disable park mode and resume hopping.
+        pub fn disable_park(&mut self) {
+            self.park_channel = None;
+        }
+
+        /// Whether park mode is currently active.
+        pub fn is_parked(&self) -> bool {
+            self.park_channel.is_some()
+        }
+
+        /// The channel filin should park on (FILIN_SYNC_QUALITY.md): the
+        /// dominant slot-0 channel among peers reporting the elected cluster
+        /// top master (`election.master_addr`). Falls back to the configured
+        /// anchor channel when no such peers are known yet. This keys off
+        /// master_addr (stable) NOT sync_addr (churning parent), so the park
+        /// channel is stable across re-parenting.
+        pub fn park_channel(&self) -> u8 {
+            use std::collections::BTreeMap;
+            let top = self.election.master_addr;
+            let mut counts: BTreeMap<u8, usize> = BTreeMap::new();
+            for peer in self.peers.iter() {
+                if peer.election.master_addr == top && peer.sequence[0][0] != 0 {
+                    *counts.entry(peer.sequence[0][0]).or_default() += 1;
+                }
+            }
+            if let Some((&ch, _)) = counts.iter().max_by_key(|(_, c)| *c) {
+                return ch;
+            }
+            // No peers reporting the top master's slot-0: if the top master is
+            // itself a peer, use its anchor.
+            if let Some(top_peer) = self.peers.get(&top) {
+                if top_peer.sequence[0][0] != 0 {
+                    return top_peer.sequence[0][0];
+                }
+            }
+            // Last resort: the configured anchor channel.
+            self.anchor_channel as u8
         }
 
         /// Bug C: record a received unicast data frame from `peer` on
