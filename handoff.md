@@ -90,6 +90,23 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 31 (ALL 3 FIXES COMMITTED + GREEN + STACK RESTARTED w/ debug+dump — awaiting human iPhone re-test).
+- 3 commits landed + tree green (filin 84 + luftlift 104 lib/3 bin tests, clippy clean, release builds):
+  - 43e6451 green(luftlift): fix iPhone /Upload decode (chunked truncation + CPIO dir filtering)
+  - 71203ba fix(luftlift): re-announce mDNS every 10s instead of 60s
+  - 547ec94 fix(filin): spread multicast announce across the channel hop cycle
+- STACK RESTARTED on pty-7 (NEW pids): filin 1785176 (-i wlxbc05430d50a1 -c 44 -h awdl0 -N, RUST_LOG=filin_rs=info)
+  + luftlift 1785200 (RUST_LOG=luftlift_rs=debug, LUFTLIFT_DUMP_UPLOAD=/tmp/ldrop_raw, -o /tmp/ldrop). Logs:
+  /tmp/fF.log (filin), /tmp/lrF.log (luftlift). VERIFIED LIVE: luftlift logs "mDNS re-announcer started
+  interval_secs=10" then "mDNS re-announced" exactly 10s later (10s change works). filin adopted master chanseq
+  [146,197,245,67,95,175], peer table=2.
+- ⚠️ WATCH: that master chanseq [146,197,245,67,95,175] looks odd (earlier good runs were ch 6/44/149). Could be
+  opclass-encoded or a chanseq-parse quirk; not blocking (iPhone discovered+transferred before). Confirm via re-test.
+- AWAITING HUMAN: re-send a PHOTO from iPhone42. Then check: (1) luftlift STAYS in picker (10s re-announce + filin
+  multicast spread), (2) the received file is NON-EMPTY in /tmp/ldrop (decode fix), (3) raw capture lands in
+  /tmp/ldrop_raw/upload-<ts>-iPhone42.bin (run `python3 opendrop-patch/dvzip.py <that>.bin` to cross-check decode).
+- TODO (minor, pty-3 later): main.rs:136 comment still says re-announce "(60)" — stale, should say 10.
+--- PRIOR cycle-30 below ---
 Last updated: cycle 30 (DISPATCHED pty-3 to fix iPhone /Upload decode — chunked truncation + skip dir CPIO entries).
 - ACTION THIS CYCLE: wrote LUFTLIFT_UPLOAD_DECODE.md + dispatched pty-3 (GLM luftlift, was idle) to fix the
   empty-"." Upload bug. Two root causes identified from reading the code:
