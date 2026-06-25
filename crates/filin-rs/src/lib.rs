@@ -5249,6 +5249,72 @@ pub mod runtime {
             assert_eq!(ieee80211_payload_preview(&frame).split(' ').count(), 64);
             assert!(ieee80211_payload_preview(&frame).starts_with("d0 00 00 01"));
         }
+
+        #[test]
+        fn status_snapshot_carries_state_and_last_injected_seq() {
+            let mut state = crate::state::AwdlState::new(
+                [0x02, 0, 0, 0, 0, 1],
+                "filin".into(),
+                44,
+                1_000_000,
+            );
+            state.current_channel = 44;
+            state.peers.touch([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee], 1_000_000);
+
+            let snapshot = build_status_snapshot(&state, 17);
+
+            assert_eq!(snapshot.current_channel, 44);
+            // self-master initially
+            assert_eq!(snapshot.master_mac, "02:00:00:00:00:01");
+            assert_eq!(snapshot.master_seq, 17);
+            assert!(!snapshot.synced);
+            assert_eq!(snapshot.peer_count, 1);
+        }
+
+        #[test]
+        fn status_snapshot_marks_synced_when_external_master_adopted() {
+            let mut state = crate::state::AwdlState::new(
+                [0x02, 0, 0, 0, 0, 1],
+                "filin".into(),
+                44,
+                1_000_000,
+            );
+            // pretend an external master was elected
+            state.election.sync_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            state.election.master_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+            let snapshot = build_status_snapshot(&state, 0);
+
+            assert_eq!(snapshot.master_mac, "02:aa:bb:cc:dd:ee");
+            assert!(snapshot.synced);
+        }
+
+        #[test]
+        fn peer_views_carry_chanseq_chan_ms_ago() {
+            let mut state = crate::state::AwdlState::new(
+                [0x02, 0, 0, 0, 0, 1],
+                "filin".into(),
+                44,
+                1_000_000,
+            );
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            state.peers.touch(peer_addr, 1_000_000);
+            {
+                let p = state.peers.get_mut(&peer_addr).unwrap();
+                p.sequence[0] = [44, 0x80];
+                p.sequence[1] = [149, 0x80];
+            }
+            state.current_channel = 44;
+
+            let views = build_peer_views(&state, 1_500_000);
+            assert_eq!(views.len(), 1);
+            let v = &views[0];
+            assert_eq!(v.mac, "02:aa:bb:cc:dd:ee");
+            assert_eq!(v.last_seen_ms_ago, 500); // 500_000 us = 500 ms
+            assert_eq!(v.current_channel, 44);
+            assert_eq!(v.decoded_chanseq[0], 44);
+            assert_eq!(v.decoded_chanseq[1], 149);
+        }
     }
 }
 
