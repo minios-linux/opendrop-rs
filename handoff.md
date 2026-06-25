@@ -90,6 +90,26 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 27 (RADIO RECOVERED + stack up; GLM FOUND the /Upload bug = missing flush!).
+- *** RADIO RECOVERED *** (human rebooted; carl9170 healthy: monitor ch44 UP, RX works,
+  no -110). Stack RUNNING on pty-7: owl(force-master) pid 1741917 peering (3280+ frames,
+  2 Apple peers) + luftlift pid 1741936 announced as luftlift-1741936 (picker-name fix
+  works). Awaiting human's Mac send (stepped away mid-test; discover=0 so far).
+- *** /Upload STALL ROOT CAUSE FOUND (real software regression, NOT just RF): ***
+  server.rs Expect:100-continue path writes "HTTP/1.1 100 Continue" but DID NOT flush()
+  it — on the TLS path rustls buffers the write internally, so the 100 never reaches the
+  Apple sender, which waits forever for it before sending the Upload body => DEADLOCK.
+  Exactly matches the live symptom (Mac "Waiting...", awdl0 RX freezes right after /Ask).
+  Round-trips passed because our own sender doesn't gate on the 100. FIX = add
+  writer.flush()? after the 100 Continue write. GLM (pty-3) finalizing fix + regression
+  test (chunked + Expect:100-continue + multi-chunk dvzip). luftlift tests 84->86.
+- WHEN GLM COMMITS THE FLUSH FIX: rebuild release (cargo build --release -p luftlift-rs),
+  restart luftlift on pty-7, and RETEST the live Mac->luftlift transfer — the Upload now
+  has a real chance to complete (was a deadlock, not just slow RF). Radio is healthy now.
+- still TODO (filin): multicast-announce TX-gating regression (filin invisible to Apple).
+  pty-5 idle. Tree: filin 68 + luftlift 84/86 green. owl patched force-master; bluetoothd
+  stopped pty-8.
+--- PRIOR cycle-26 below ---
 Last updated: cycle 26 (LIVE TEST done + RADIO WEDGED; GLM fixing /Upload stall; picker-name fixed).
 *** STATE CHANGE — do NOT try to restart the filin/luftlift stack: the carl9170 RADIO
     IS WEDGED and needs a REBOOT. Interface wlxbc05430d50a1 is GONE. ***
