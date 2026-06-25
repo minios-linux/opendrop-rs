@@ -1150,8 +1150,18 @@ pub mod os {
             pub flags: libc::c_short,
         }
 
-        pub fn plan_tap_ifreq(_name: &str) -> Result<IfReqPlan, Error> {
-            Err(Error::InvalidName)
+        pub fn plan_tap_ifreq(name: &str) -> Result<IfReqPlan, Error> {
+            let bytes = name.as_bytes();
+            if bytes.is_empty() || bytes.len() >= libc::IFNAMSIZ {
+                return Err(Error::InvalidName);
+            }
+
+            let mut if_name = [0u8; libc::IFNAMSIZ];
+            if_name[..bytes.len()].copy_from_slice(bytes);
+            Ok(IfReqPlan {
+                name: if_name,
+                flags: (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short,
+            })
         }
 
         #[cfg(test)]
