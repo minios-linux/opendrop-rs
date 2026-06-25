@@ -101,9 +101,37 @@ fn parse_octal(field: &[u8]) -> usize {
     usize::from_str_radix(trimmed, 8).unwrap_or(0)
 }
 
+// ---- Encoder (sender side) ----
+
+/// Build a single 76-byte ODC header as ASCII octal.
+fn build_header(ino: u32, namesize: usize, filesize: usize) -> String {
+    let mut s = String::new();
+    s.push_str("070707"); // c_magic
+    s.push_str("000000"); // c_dev
+    s.push_str(&format!("{:06o}", ino & 0o777777)); // c_ino
+    s.push_str("100644"); // c_mode (regular file, 0644)
+    s.push_str("000000"); // c_uid
+    s.push_str("000000"); // c_gid
+    s.push_str("000001"); // c_nlink
+    s.push_str("000000"); // c_rdev
+    s.push_str("00000000000"); // c_mtime (11 octal digits)
+    s.push_str(&format!("{:06o}", namesize)); // c_namesize
+    s.push_str(&format!("{:011o}", filesize)); // c_filesize
+    debug_assert_eq!(s.len(), HDR_LEN, "ODC header must be exactly 76 bytes");
+    s
+}
+
+/// Encode a sequence of `(name, data)` entries as an ODC CPIO archive,
+/// terminated by the `TRAILER!!!` entry. This is the inverse of
+/// [`read_odc_cpio`] and the inner payload the AirDrop sender frames as
+/// dvzip for `/Upload`.
+pub fn build_odc_cpio(_entries: &[(&str, &[u8])]) -> Vec<u8> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CpioEntry, HDR_LEN, MAGIC, read_odc_cpio};
+    use super::{CpioEntry, HDR_LEN, MAGIC, build_odc_cpio, read_odc_cpio};
 
     /// Build a single 76-byte ODC header as ASCII. Asserts its own length so
     /// a field-offset regression in the test scaffolding is caught loudly.
@@ -216,5 +244,44 @@ mod tests {
         assert!(read_odc_cpio(bogus).is_empty());
         // Sanity: the magic constant is what we expect on the wire.
         assert_eq!(MAGIC, b"070707");
+    }
+
+    // ---- public encoder round-trips (sender side) ----
+
+    #[test]
+    fn build_odc_cpio_roundtrips_through_read_odc_cpio() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let entries: &[(&str, &[u8])] = &[
+            ("photo.jpg", &data),
+            ("hello.txt", b"hi"),
+            ("dir/nested.bin", &[0x00, 0xFF, 0x7F]),
+        ];
+        let archive = build_odc_cpio(entries);
+        assert_eq!(&archive[..6], MAGIC, "archive starts with ODC magic");
+
+        let decoded = read_odc_cpio(&archive);
+        assert_eq!(decoded.len(), entries.len());
+        for (expected, actual) in entries.iter().zip(decoded.iter()) {
+            assert_eq!(actual.name, expected.0);
+            assert_eq!(actual.data, expected.1);
+        }
+    }
+
+    #[test]
+    fn build_odc_cpio_empty_entries_yields_only_trailer() {
+        let archive = build_odc_cpio(&[]);
+        // Only the TRAILER!!! header+name — read_odc_cpio stops at it, no entries.
+        assert_eq!(archive.len(), HDR_LEN + "TRAILER!!!\0".len());
+        assert!(read_odc_cpio(&archive).is_empty());
+    }
+
+    #[test]
+    fn build_odc_cpio_single_entry_exact_bytes() {
+        // Byte-exact check for a known-small archive: one entry "a" + empty data.
+        let archive = build_odc_cpio(&[("a", b"")]);
+        // header(76) + "a\0"(2) + trailer header(76) + "TRAILER!!!\0"(11)
+        assert_eq!(archive.len(), HDR_LEN + 2 + HDR_LEN + 11);
+        let decoded = read_odc_cpio(&archive);
+        assert_eq!(decoded, vec![CpioEntry { name: "a".to_string(), data: b"" }]);
     }
 }
