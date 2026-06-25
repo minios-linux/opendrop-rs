@@ -710,7 +710,7 @@ pub mod awdl {
         let payload = &ethernet[14..];
         let mut body = Vec::with_capacity(16 + payload.len());
         body.extend_from_slice(&[0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00]);
-        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0x0403u16.to_le_bytes()); // AWDL_DATA_HEAD (owl/src/tx.c:33)
         body.extend_from_slice(&seq.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(&ethertype);
