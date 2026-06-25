@@ -61,21 +61,50 @@ pub fn dvzip_to_cpio(data: &[u8]) -> Vec<u8> {
 /// correct and round-trips exactly. This is the AirDrop sender's `/Upload`
 /// body builder.
 pub fn cpio_to_dvzip(cpio: &[u8]) -> Vec<u8> {
+    cpio_to_dvzip_blocks(cpio, 1)
+}
+
+/// Encode a CPIO archive as a dvzip payload split across `num_blocks` zlib
+/// blocks, each independently framed `[u32 BE length][zlib stream]`. Real
+/// Apple senders emit multiple zlib blocks (the captured `/tmp/upload.bin`
+/// fixture was 4 blocks); the decoder concatenates them. Splits the CPIO
+/// into `num_blocks` roughly-equal contiguous slices. `num_blocks` is clamped
+/// to `[1, len]`.
+pub fn cpio_to_dvzip_blocks(cpio: &[u8], num_blocks: usize) -> Vec<u8> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(cpio).expect("zlib encode cpio");
-    let compressed = encoder.finish().expect("zlib finish");
-    let mut out = Vec::with_capacity(4 + compressed.len());
-    out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-    out.extend_from_slice(&compressed);
+    // Empty CPIO still produces one framed (empty-output) zlib block. Handle
+    // inline rather than recursing through cpio_to_dvzip.
+    if cpio.is_empty() {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"").expect("zlib encode empty");
+        let compressed = encoder.finish().expect("zlib finish");
+        let mut out = Vec::with_capacity(4 + compressed.len());
+        out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        out.extend_from_slice(&compressed);
+        return out;
+    }
+    let n = num_blocks.clamp(1, cpio.len());
+    let block = cpio.len() / n;
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for i in 0..n {
+        let end = if i + 1 == n { cpio.len() } else { pos + block };
+        let chunk = &cpio[pos..end];
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(chunk).expect("zlib encode block");
+        let compressed = encoder.finish().expect("zlib finish");
+        out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        out.extend_from_slice(&compressed);
+        pos = end;
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cpio_to_dvzip, dvzip_to_cpio};
+    use super::{cpio_to_dvzip, cpio_to_dvzip_blocks, dvzip_to_cpio};
     use crate::cpio::build_odc_cpio;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -164,6 +193,29 @@ mod tests {
     fn cpio_to_dvzip_empty_cpio_round_trips() {
         let dvzip = cpio_to_dvzip(&[]);
         assert!(!dvzip.is_empty(), "even empty CPIO produces a framed zlib block");
+        assert_eq!(dvzip_to_cpio(&dvzip), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn cpio_to_dvzip_blocks_multi_roundtrips_through_dvzip_to_cpio() {
+        // Multi-block dvzip (like the real /tmp/upload.bin fixture = 4 blocks).
+        let cpio = build_odc_cpio(&[("a.txt", b"hello"), ("b.bin", &[0, 1, 2, 3, 4, 5])]);
+        let dvzip = cpio_to_dvzip_blocks(&cpio, 4);
+        assert!(!dvzip.is_empty());
+        let decoded = dvzip_to_cpio(&dvzip);
+        assert_eq!(decoded, cpio, "multi-block must round-trip exactly");
+    }
+
+    #[test]
+    fn cpio_to_dvzip_blocks_single_matches_cpio_to_dvzip() {
+        let cpio = build_odc_cpio(&[("x", b"data")]);
+        assert_eq!(cpio_to_dvzip_blocks(&cpio, 1), cpio_to_dvzip(&cpio));
+    }
+
+    #[test]
+    fn cpio_to_dvzip_blocks_empty_round_trips() {
+        let dvzip = cpio_to_dvzip_blocks(&[], 4);
+        assert!(!dvzip.is_empty(), "empty CPIO still produces one zlib block");
         assert_eq!(dvzip_to_cpio(&dvzip), Vec::<u8>::new());
     }
 }

@@ -33,6 +33,10 @@ pub struct CpioEntry<'a> {
     pub name: String,
     /// Raw file bytes, borrowed from the input archive.
     pub data: &'a [u8],
+    /// The `c_mode` field (file type + permissions) from the header. The
+    /// file-type bits (`mode & 0o170000`) distinguish regular files
+    /// (`0o100000`) from directories (`0o040000`), symlinks, etc.
+    pub mode: u32,
 }
 
 /// Fixed width of an ODC CPIO header (ASCII octal fields, no padding).
@@ -44,15 +48,28 @@ const NAMESIZE_OFF: usize = 59;
 const NAMESIZE_LEN: usize = 6;
 const FILESIZE_OFF: usize = 65;
 const FILESIZE_LEN: usize = 11;
+const MODE_OFF: usize = 18;
+const MODE_LEN: usize = 6;
 const TRAILER_NAME: &str = "TRAILER!!!";
+
+/// `S_IFMT` mask for the file-type bits in a cpio `c_mode` field.
+const S_IFMT: u32 = 0o170_000;
+/// `S_IFDIR` — directory entry type.
+const S_IFDIR: u32 = 0o040_000;
 
 /// Extract entries from an ODC CPIO archive (magic `070707`).
 ///
-/// Walks 76-byte ASCII-octal headers, emitting each entry's name + data.
-/// Stops at the `TRAILER!!!` entry (which is not emitted) or at a short /
+/// Walks 76-byte ASCII-octal headers, emitting each entry's name + data +
+/// mode. Stops at the `TRAILER!!!` entry (which is not emitted) or at a short /
 /// malformed frame. A missing or wrong magic on the first header yields no
 /// entries — the downstream caller is expected to treat an empty result on
 /// a non-empty input as "not a CPIO".
+///
+/// **Directory entries are skipped**: real Apple ODC CPIO archives lead with
+/// a `"."` directory entry (mode `040755`) before the regular file(s), and
+/// trying to save that as a file fails with `EISDIR`. Any entry whose mode
+/// has `S_IFDIR` set (`mode & 0o170000 == 0o040000`) or whose name is `"."`
+/// / `".."` is silently omitted from the result.
 pub fn read_odc_cpio(data: &[u8]) -> Vec<CpioEntry<'_>> {
     let mut entries = Vec::new();
     let mut pos = 0;
@@ -61,6 +78,7 @@ pub fn read_odc_cpio(data: &[u8]) -> Vec<CpioEntry<'_>> {
             debug!(pos, "cpio: stopping, no ODC magic at header");
             break;
         }
+        let mode = parse_octal(&data[pos + MODE_OFF..pos + MODE_OFF + MODE_LEN]) as u32;
         let namesize = parse_octal(&data[pos + NAMESIZE_OFF..pos + NAMESIZE_OFF + NAMESIZE_LEN]);
         let filesize = parse_octal(&data[pos + FILESIZE_OFF..pos + FILESIZE_OFF + FILESIZE_LEN]);
         pos += HDR_LEN;
@@ -86,7 +104,16 @@ pub fn read_odc_cpio(data: &[u8]) -> Vec<CpioEntry<'_>> {
         if name == TRAILER_NAME {
             break;
         }
-        entries.push(CpioEntry { name, data: file_data });
+
+        // Skip directory entries (real Apple CPIO archives lead with a "."
+        // directory entry; trying to save it as a file fails with EISDIR).
+        // Also defensively skip "." / ".." regardless of mode bits.
+        if (mode & S_IFMT) == S_IFDIR || name == "." || name == ".." {
+            debug!(name = %name, mode = format!("{:06o}", mode), "cpio: skipping directory entry");
+            continue;
+        }
+
+        entries.push(CpioEntry { name, data: file_data, mode });
     }
     entries
 }
@@ -103,13 +130,15 @@ fn parse_octal(field: &[u8]) -> usize {
 
 // ---- Encoder (sender side) ----
 
-/// Build a single 76-byte ODC header as ASCII octal.
-fn build_header(ino: u32, namesize: usize, filesize: usize) -> String {
+/// Build a single 76-byte ODC header with an explicit `c_mode` (file type +
+/// permission bits). Used internally by the encoder (regular file 100644) and
+/// by tests to craft directory entries (040755).
+fn build_header_with_mode(ino: u32, namesize: usize, filesize: usize, mode: u32) -> String {
     let mut s = String::new();
     s.push_str("070707"); // c_magic
     s.push_str("000000"); // c_dev
     s.push_str(&format!("{:06o}", ino & 0o777777)); // c_ino
-    s.push_str("100644"); // c_mode (regular file, 0644)
+    s.push_str(&format!("{:06o}", mode & 0o777_777)); // c_mode
     s.push_str("000000"); // c_uid
     s.push_str("000000"); // c_gid
     s.push_str("000001"); // c_nlink
@@ -124,18 +153,37 @@ fn build_header(ino: u32, namesize: usize, filesize: usize) -> String {
 /// Encode a sequence of `(name, data)` entries as an ODC CPIO archive,
 /// terminated by the `TRAILER!!!` entry. This is the inverse of
 /// [`read_odc_cpio`] and the inner payload the AirDrop sender frames as
-/// dvzip for `/Upload`.
+/// dvzip for `/Upload`. Does NOT prepend a leading "." directory entry —
+/// the luftlift sender produces plain regular-file archives.
 pub fn build_odc_cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    build_odc_cpio_with_leading_dir(entries, false)
+}
+
+/// Like [`build_odc_cpio`] but optionally prepends a `"."` directory entry
+/// (mode `040755`, 0 bytes) — the shape a real Apple sender produces. When
+/// `include_dot_dir` is false this is identical to `build_odc_cpio`. The
+/// leading directory entry is filtered out by [`read_odc_cpio`]; it exists
+/// here so tests can reproduce the real on-wire archive byte shape.
+pub fn build_odc_cpio_with_leading_dir(entries: &[(&str, &[u8])], include_dot_dir: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    for (i, &(name, data)) in entries.iter().enumerate() {
+    let mut ino = 1u32;
+    if include_dot_dir {
+        let dot_name = ".\0";
+        let header = build_header_with_mode(ino, dot_name.len(), 0, 0o040_755);
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(dot_name.as_bytes());
+        ino += 1;
+    }
+    for &(name, data) in entries.iter() {
         let name_with_nul = format!("{}\0", name);
-        let header = build_header((i + 1) as u32, name_with_nul.len(), data.len());
+        let header = build_header_with_mode(ino, name_with_nul.len(), data.len(), 0o100_644);
         out.extend_from_slice(header.as_bytes());
         out.extend_from_slice(name_with_nul.as_bytes());
         out.extend_from_slice(data);
+        ino += 1;
     }
     let trailer = "TRAILER!!!\0";
-    let header = build_header(0, trailer.len(), 0);
+    let header = build_header_with_mode(0, trailer.len(), 0, 0);
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(trailer.as_bytes());
     out
@@ -143,25 +191,15 @@ pub fn build_odc_cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpioEntry, HDR_LEN, MAGIC, build_odc_cpio, read_odc_cpio};
+    use super::{
+        CpioEntry, HDR_LEN, MAGIC, S_IFMT, build_header_with_mode, build_odc_cpio,
+        read_odc_cpio,
+    };
 
     /// Build a single 76-byte ODC header as ASCII. Asserts its own length so
     /// a field-offset regression in the test scaffolding is caught loudly.
     fn build_header(ino: u32, namesize: usize, filesize: usize) -> String {
-        let mut s = String::new();
-        s.push_str("070707"); // c_magic
-        s.push_str("000000"); // c_dev
-        s.push_str(&format!("{:06o}", ino & 0o777777)); // c_ino
-        s.push_str("100644"); // c_mode  (regular file, 0644)
-        s.push_str("000000"); // c_uid
-        s.push_str("000000"); // c_gid
-        s.push_str("000001"); // c_nlink
-        s.push_str("000000"); // c_rdev
-        s.push_str("00000000000"); // c_mtime (11 octal digits)
-        s.push_str(&format!("{:06o}", namesize)); // c_namesize
-        s.push_str(&format!("{:011o}", filesize)); // c_filesize
-        assert_eq!(s.len(), HDR_LEN, "ODC header must be exactly 76 bytes");
-        s
+        build_header_with_mode(ino, namesize, filesize, 0o100_644)
     }
 
     /// Encode a sequence of (name, data) entries as an ODC CPIO archive,
@@ -199,6 +237,7 @@ mod tests {
             vec![CpioEntry {
                 name: "a".to_string(),
                 data: b"",
+                mode: 0o100_644,
             }]
         );
     }
@@ -294,6 +333,82 @@ mod tests {
         // header(76) + "a\0"(2) + trailer header(76) + "TRAILER!!!\0"(11)
         assert_eq!(archive.len(), HDR_LEN + 2 + HDR_LEN + 11);
         let decoded = read_odc_cpio(&archive);
-        assert_eq!(decoded, vec![CpioEntry { name: "a".to_string(), data: b"" }]);
+        assert_eq!(decoded, vec![CpioEntry { name: "a".to_string(), data: b"", mode: 0o100_644 }]);
+    }
+
+    // ---- directory entry filtering (the iPhone "." bug) ----
+
+    /// Build an ODC CPIO archive with a leading "." directory entry (mode
+    /// 040755, 0 bytes) followed by regular file entries — the shape a real
+    /// Apple sender produces. Returns the raw archive bytes.
+    fn build_apple_style_cpio(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Leading "." directory entry (mode 040755).
+        let dot_name = ".\0";
+        let dot_hdr = build_header_with_mode(1, dot_name.len(), 0, 0o040_755);
+        out.extend_from_slice(dot_hdr.as_bytes());
+        out.extend_from_slice(dot_name.as_bytes());
+        // Regular file entries.
+        for (i, &(name, data)) in files.iter().enumerate() {
+            let name_with_nul = format!("{}\0", name);
+            let header = build_header_with_mode(
+                (i + 2) as u32,
+                name_with_nul.len(),
+                data.len(),
+                0o100_644,
+            );
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(name_with_nul.as_bytes());
+            out.extend_from_slice(data);
+        }
+        // Trailer.
+        let trailer = "TRAILER!!!\0";
+        let header = build_header_with_mode(0, trailer.len(), 0, 0);
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(trailer.as_bytes());
+        out
+    }
+
+    #[test]
+    fn read_odc_cpio_skips_leading_dot_directory_entry() {
+        // Real Apple CPIO: leading "." dir (040755) + a real file.
+        let archive = build_apple_style_cpio(&[("photo.jpg", b"JPEG_DATA")]);
+        let entries = read_odc_cpio(&archive);
+        // The "." directory entry must NOT appear — only the real file.
+        assert_eq!(entries.len(), 1, "directory entry must be skipped");
+        assert_eq!(entries[0].name, "photo.jpg");
+        assert_eq!(entries[0].data, b"JPEG_DATA");
+        assert_eq!(entries[0].mode & S_IFMT, 0o100_000, "mode must be regular file");
+    }
+
+    #[test]
+    fn read_odc_cpio_skips_dot_dot_directory_entry() {
+        // Defensively skip ".." even if mode bits are wrong.
+        let mut out = Vec::new();
+        let name = "..\0";
+        let hdr = build_header_with_mode(1, name.len(), 0, 0o100_644);
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(name.as_bytes());
+        let file_name = "real.txt\0";
+        let hdr2 = build_header_with_mode(2, file_name.len(), 3, 0o100_644);
+        out.extend_from_slice(hdr2.as_bytes());
+        out.extend_from_slice(file_name.as_bytes());
+        out.extend_from_slice(b"abc");
+        let trailer = "TRAILER!!!\0";
+        let hdr3 = build_header_with_mode(0, trailer.len(), 0, 0);
+        out.extend_from_slice(hdr3.as_bytes());
+        out.extend_from_slice(trailer.as_bytes());
+
+        let entries = read_odc_cpio(&out);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "real.txt");
+    }
+
+    #[test]
+    fn read_odc_cpio_parses_mode_field() {
+        // Verify the mode field is parsed and exposed on CpioEntry.
+        let archive = build_odc_cpio(&[("file.txt", b"hi")]);
+        let entries = read_odc_cpio(&archive);
+        assert_eq!(entries[0].mode, 0o100_644, "regular-file mode must be parsed");
     }
 }

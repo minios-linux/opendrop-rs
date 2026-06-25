@@ -239,4 +239,57 @@ mod tests {
             .map(|(_, v)| v.as_str());
         assert_eq!(ct, Some("application/x-cpio"), "406 must advertise Content-Type: application/x-cpio");
     }
+
+    // ---- Regression: real Apple-style /Upload decode (iPhone "." bug) ----
+    //
+    // A real iPhone sends an ODC CPIO with a LEADING "." directory entry
+    // (mode 040755), then the real file(s). The dvzip is split across
+    // MULTIPLE zlib blocks, and the chunked HTTP body arrives as MULTIPLE
+    // chunks. The earlier code (a) silently truncated the chunked body at
+    // the first read desync (unwrap_or(0) treated any parse failure as
+    // last-chunk) and (b) returned the "." directory as a saveable file
+    // (EISDIR). This test reproduces the real shape end-to-end and asserts
+    // the real file is extracted byte-exact, the "." is filtered, and no
+    // truncation occurs.
+
+    #[test]
+    fn decode_upload_apple_style_dot_dir_plus_file_multi_block_multi_chunk() {
+        use crate::chunked::decode_chunked;
+        use crate::cpio::build_odc_cpio_with_leading_dir;
+        use crate::dvzip::cpio_to_dvzip_blocks;
+
+        // 1. Build an Apple-style CPIO: leading "." dir + real file.
+        let file_content: Vec<u8> = (0u8..200).collect();
+        let entries: &[(&str, &[u8])] = &[("photo.jpg", &file_content)];
+        let cpio = build_odc_cpio_with_leading_dir(entries, true);
+        assert!(cpio.starts_with(b"070707"), "cpio must start with ODC magic");
+
+        // 2. Frame as multi-block dvzip (4 zlib blocks, like the real fixture).
+        let dvzip = cpio_to_dvzip_blocks(&cpio, 4);
+
+        // 3. Frame the dvzip as an HTTP chunked body split across multiple
+        //    chunks (simulating how the iPhone sends it).
+        let chunk_size = dvzip.len() / 3 + 1;
+        let mut chunked_body = Vec::new();
+        for chunk in dvzip.chunks(chunk_size) {
+            chunked_body.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            chunked_body.extend_from_slice(chunk);
+            chunked_body.extend_from_slice(b"\r\n");
+        }
+        chunked_body.extend_from_slice(b"0\r\n\r\n");
+
+        // 4. Decode the chunked body (the pure path — simulates what
+        //    parse_request does after read_chunked_stream reads the raw).
+        let body = decode_chunked(&chunked_body).expect("chunked decode must not truncate");
+        assert_eq!(body.len(), dvzip.len(), "no body truncation: full dvzip recovered");
+
+        // 5. Decode through the handler's decode_upload_body.
+        let files = decode_upload_body("application/x-dvzip", &body);
+
+        // 6. Assert: the real file is extracted byte-exact, "." is filtered.
+        assert_eq!(files.len(), 1, "only the real file, not the '.' directory");
+        assert_eq!(files[0].name, "photo.jpg");
+        assert_eq!(files[0].bytes, file_content, "file bytes must be exact");
+        assert!(!files.iter().any(|f| f.name == "."), "no '.' directory entry");
+    }
 }

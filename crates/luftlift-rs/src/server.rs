@@ -12,8 +12,9 @@ use rustls::ServerConfig;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 /// Handle a single HTTP request from `reader`, write the response to `writer`.
@@ -119,6 +120,12 @@ fn read_body(reader: &mut impl BufRead, header_bytes: &[u8]) -> Result<Vec<u8>> 
 
 /// Serve forever on the given listener. Each connection is handled in a
 /// thread. If `output_dir` is set, received files are saved there.
+///
+/// If the `LUFTLIFT_DUMP_UPLOAD` env var is set to a directory, each /Upload
+/// raw body is also written there as `upload-<unix_ts>-<sender>.bin` for
+/// offline decode diffing against the Python reference (`dvzip.py`). The
+/// sender name is tracked across the per-connection AirDrop flow via a
+/// shared `last_sender` cell updated when /Ask arrives.
 pub fn serve_forever(
     listener: TcpListener,
     tls_config: Arc<ServerConfig>,
@@ -127,14 +134,20 @@ pub fn serve_forever(
 ) {
     let cfg = Arc::new(cfg);
     let output_dir = Arc::new(output_dir);
+    let dump_dir = dump_upload_dir();
+    let last_sender: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     for stream in listener.incoming() {
         match stream {
             Ok(tcp_stream) => {
                 let tls_config = tls_config.clone();
                 let cfg = cfg.clone();
                 let output_dir = output_dir.clone();
+                let dump_dir = dump_dir.clone();
+                let last_sender = last_sender.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_tls_connection(tcp_stream, tls_config, cfg, output_dir) {
+                    if let Err(e) =
+                        handle_tls_connection(tcp_stream, tls_config, cfg, output_dir, dump_dir, last_sender)
+                    {
                         warn!(error = %e, "connection error");
                     }
                 });
@@ -149,6 +162,8 @@ fn handle_tls_connection(
     tls_config: Arc<ServerConfig>,
     cfg: Arc<ReceiverConfig>,
     output_dir: Arc<Option<PathBuf>>,
+    dump_dir: Option<PathBuf>,
+    last_sender: Arc<Mutex<String>>,
 ) -> Result<()> {
     let conn = rustls::ServerConnection::new(tls_config)?;
     let mut tls = rustls::StreamOwned::new(conn, tcp_stream);
@@ -178,7 +193,35 @@ fn handle_tls_connection(
     raw.extend_from_slice(&body);
 
     let req = parse_request(&raw)?;
+
+    // Track the sender name across the per-connection AirDrop flow so the
+    // raw-upload dump (on the /Upload connection) can be named after the
+    // device that sent the preceding /Ask. AirDrop opens a fresh TLS
+    // connection per POST, so we hold this in a shared cell.
+    if req.path == "/Ask" {
+        if let Ok(ask) = crate::plist_impl::parse_ask_request(&req.body) {
+            if !ask.sender_computer_name.is_empty() {
+                if let Ok(mut cell) = last_sender.lock() {
+                    *cell = ask.sender_computer_name.clone();
+                }
+            }
+        }
+    }
+    let sender_snapshot = last_sender
+        .lock()
+        .map(|cell| cell.clone())
+        .unwrap_or_default();
+
     let result = handle_post(&req, &cfg);
+
+    // Env-gated raw /Upload capture for offline decode diffing against the
+    // Python reference (opendrop-patch/dvzip.py). Off by default.
+    if req.path == "/Upload" {
+        if let Some(dir) = dump_dir.as_ref() {
+            dump_raw_upload(dir, &sender_snapshot, &req.body);
+        }
+    }
+
     let response_bytes = format_response(&result.response);
     tls.write_all(&response_bytes)?;
     for f in &result.received_files {
@@ -216,16 +259,46 @@ fn parse_header_value(headers: &str, name: &str) -> Option<String> {
     None
 }
 
+/// Read an HTTP/1.1 chunked body from a `BufRead` into a byte buffer
+/// preserving the raw chunk framing (so the downstream `parse_request` /
+/// `decode_chunked` can re-decode it). Stops at the genuine `0` last-chunk.
+///
+/// Robustness note: a malformed chunk-size line (partial read, CRLF desync,
+/// stray byte) MUST NOT be silently treated as the `0` last-chunk. The
+/// earlier `unwrap_or(0)` here did exactly that: a single bad size line
+/// truncated the whole body after the first chunk, dropping the real file
+/// payload (only the leading "." directory entry survived). We now error
+/// loudly so truncation is visible instead of silently corrupting the
+/// upload.
 fn read_chunked_stream(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut raw = Vec::new();
     loop {
         let mut size_line = String::new();
-        reader.read_line(&mut size_line)?;
+        let n = reader.read_line(&mut size_line)?;
+        if n == 0 {
+            anyhow::bail!("chunked body: EOF before last-chunk (truncated)");
+        }
         raw.extend_from_slice(size_line.as_bytes());
-        let size_str = size_line.trim();
-        let size = usize::from_str_radix(size_str.split(';').next().unwrap().trim(), 16).unwrap_or(0);
+        // Strip any chunk-extension (";name=value"); only the leading hex
+        // token is the size.
+        let size_token = size_line.trim().split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(size_token, 16) {
+            Ok(s) => s,
+            Err(_) => {
+                // Distinguish the genuine last-chunk ("0") from a parse
+                // FAILURE. A real "0" parses fine; anything else that fails
+                // to parse as hex is a CRLF desync / partial read, NOT a
+                // last-chunk. Bail loudly rather than silently truncating.
+                anyhow::bail!(
+                    "chunked body: malformed chunk-size line {:?} \
+                     (not valid hex; would have silently truncated with unwrap_or(0))",
+                    size_line.trim()
+                );
+            }
+        };
         if size == 0 {
-            // last-chunk: read trailing CRLF
+            // Genuine last-chunk: consume the trailing CRLF (and any
+            // optional trailer-part up to the blank line).
             let mut trailer = String::new();
             reader.read_line(&mut trailer)?;
             raw.extend_from_slice(trailer.as_bytes());
@@ -239,6 +312,67 @@ fn read_chunked_stream(reader: &mut impl BufRead) -> Result<Vec<u8>> {
         raw.extend_from_slice(&crlf);
     }
     Ok(raw)
+}
+
+// ---- raw /Upload body capture (LUFTLIFT_DUMP_UPLOAD) ----
+
+/// Read the `LUFTLIFT_DUMP_UPLOAD` env var as a directory path. Returns None
+/// if unset (the default — capture is off) or if the path doesn't exist (we
+/// don't auto-create it to avoid surprising filesystem writes).
+pub fn dump_upload_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("LUFTLIFT_DUMP_UPLOAD")?;
+    let path = PathBuf::from(dir);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        warn!(
+            dir = %path.display(),
+            "LUFTLIFT_DUMP_UPLOAD is set but is not a directory; raw upload capture disabled"
+        );
+        None
+    }
+}
+
+/// Sanitize a sender name for use in a filename: keep alphanumerics, dash,
+/// underscore, dot; replace everything else (spaces, apostrophes in
+/// "Andrew's MacBook Pro", etc.) with `_`. Pure (no I/O) so it's unit-testable.
+pub fn sanitize_sender_for_filename(sender: &str) -> String {
+    sender
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Write a raw /Upload body to `<dir>/upload-<unix_ts>-<sanitized_sender>.bin`
+/// for offline decode diffing against the Python reference (`dvzip.py`).
+/// Best-effort: logs a warning on failure but never propagates the error —
+/// the dump is a debugging aid, not part of the receive path.
+pub fn dump_raw_upload(dir: &std::path::Path, sender: &str, body: &[u8]) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sender_part = if sender.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitize_sender_for_filename(sender)
+    };
+    let filename = format!("upload-{ts}-{sender_part}.bin");
+    let path = dir.join(&filename);
+    match std::fs::write(&path, body) {
+        Ok(_) => info!(
+            path = %path.display(),
+            bytes = body.len(),
+            "dumped raw /Upload body (LUFTLIFT_DUMP_UPLOAD)"
+        ),
+        Err(e) => warn!(path = %path.display(), error = %e, "failed to dump raw /Upload body"),
+    }
 }
 
 #[cfg(test)]
@@ -525,5 +659,84 @@ mod tests {
         assert_eq!(result.received_files.len(), 1);
         assert_eq!(result.received_files[0].name, "expect_test.txt");
         assert_eq!(result.received_files[0].bytes, b"chunked + expect body");
+    }
+
+    // ---- raw /Upload capture (LUFTLIFT_DUMP_UPLOAD) ----
+
+    #[test]
+    fn sanitize_sender_replaces_unsafe_chars() {
+        // "Andrew's MacBook Pro" -> "Andrew_s_MacBook_Pro"
+        assert_eq!(sanitize_sender_for_filename("Andrew's MacBook Pro"), "Andrew_s_MacBook_Pro");
+        // Alphanumeric / -_./ are kept.
+        assert_eq!(sanitize_sender_for_filename("iPhone42"), "iPhone42");
+        assert_eq!(sanitize_sender_for_filename("luftlift-pc.local"), "luftlift-pc.local");
+        assert_eq!(sanitize_sender_for_filename("a_b-c.d"), "a_b-c.d");
+    }
+
+    #[test]
+    fn sanitize_sender_handles_empty_and_unicode() {
+        assert_eq!(sanitize_sender_for_filename(""), "");
+        // Non-ASCII chars are replaced with `_`; ASCII alphanumerics survive.
+        // Use a string of only non-ASCII chars so output is all underscores.
+        let s = sanitize_sender_for_filename("üïöé");
+        assert!(s.chars().all(|c| c == '_'), "expected all underscores, got {s:?}");
+        // Mixed: ASCII kept, non-ASCII replaced.
+        assert_eq!(sanitize_sender_for_filename("café"), "caf_");
+    }
+
+    #[test]
+    fn dump_raw_upload_writes_file_with_sender_and_timestamp_pattern() {
+        // Best-effort dump: writes <dir>/upload-<ts>-<sender>.bin with the
+        // raw body bytes. Verify in a tempdir.
+        let dir = std::env::temp_dir();
+        let body = b"raw dvzip body bytes";
+        dump_raw_upload(&dir, "iPhone42", body);
+        // Find the most recent matching file and verify its content + name.
+        let pattern = "upload-";
+        let mut found: Option<PathBuf> = None;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(pattern)
+                    && name.ends_with("-iPhone42.bin")
+                    && entry.metadata().map(|m| m.len() as usize == body.len()).unwrap_or(false)
+                {
+                    let candidate = entry.path();
+                    if found.as_ref().is_none_or(|p| {
+                        candidate.metadata().and_then(|m| m.modified()).ok()
+                            > p.metadata().and_then(|m| m.modified()).ok()
+                    }) {
+                        found = Some(candidate);
+                    }
+                }
+            }
+        }
+        let path = found.expect("dump file must exist after dump_raw_upload");
+        let read_back = std::fs::read(&path).expect("read dumped file");
+        assert_eq!(read_back, body, "dumped bytes must match the input body");
+        let fname = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(fname.contains("-iPhone42.bin"), "filename must include sender: {fname}");
+        assert!(fname.starts_with("upload-"), "filename must start with upload-: {fname}");
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dump_raw_upload_uses_unknown_for_empty_sender() {
+        let dir = std::env::temp_dir();
+        let body = b"x";
+        dump_raw_upload(&dir, "", body);
+        // Find a matching upload-*-unknown.bin from the last few seconds.
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("upload-") && name.ends_with("-unknown.bin") {
+                    let _ = std::fs::remove_file(entry.path());
+                    return; // pass
+                }
+            }
+        }
+        panic!("expected an upload-*-unknown.bin file after dumping with empty sender");
     }
 }
