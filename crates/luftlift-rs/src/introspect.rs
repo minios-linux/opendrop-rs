@@ -7,6 +7,7 @@
 //!
 //! See LUFTLIFT_HTTP_INTROSPECT.md for the spec.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
@@ -50,9 +51,15 @@ pub struct IntrospectState {
     pub upload_count: AtomicU64,
     /// Most recent peer's sender name (from `/Ask`), for "who tried us last".
     pub last_peer: Mutex<String>,
+    /// Trace ring buffer; oldest events dropped past `TRACE_RING_CAP`.
+    pub trace_ring: Mutex<VecDeque<TraceEvent>>,
     /// Whether the trace ring is accepting events (off by default).
     /// 0 = off, 1 = on.
     pub trace_enabled: AtomicU8,
+    /// Current trace level setting (`"off"` / `"debug"` / `"trace"`), off by
+    /// default. Stored for `/status` transparency and for re-applying on
+    /// POST /trace. The atomic flag above is the hot-path gate.
+    pub trace_level: Mutex<String>,
 }
 
 impl IntrospectState {
@@ -119,6 +126,38 @@ impl IntrospectState {
             last_peer,
         }
     }
+
+    /// Push a trace event into the ring. **No-op when `trace_enabled == 0`**
+    /// (the default) — the hot path pays only a single atomic load.
+    pub fn push_trace(&self, _event: TraceEvent) {
+        todo!()
+    }
+
+    /// Return the last `n` trace events (newest last). `n == 0` returns all.
+    pub fn trace_last_n(&self, _n: usize) -> Vec<TraceEvent> {
+        todo!()
+    }
+
+    /// Set the trace level (`"off"` / `"debug"` / `"trace"`).
+    pub fn set_trace_level(&self, _level: &str) {
+        todo!()
+    }
+
+    /// Current trace level (`"off"` / `"debug"` / `"trace"`).
+    pub fn trace_level(&self) -> String {
+        todo!()
+    }
+
+    /// Whether the trace ring is currently accepting events.
+    pub fn trace_enabled(&self) -> bool {
+        todo!()
+    }
+}
+
+/// Normalise a POSTed trace level to one of `off|debug|trace`. Unknown
+/// values default to `"off"` (fail-safe).
+pub fn normalize_trace_level(_level: &str) -> String {
+    todo!()
 }
 
 /// A captured structured trace event in the ring buffer.
@@ -236,5 +275,127 @@ mod tests {
         }
         assert_eq!(obj["discover_count"], serde_json::json!(1));
         assert_eq!(obj["mdns_announced"], serde_json::json!(true));
+    }
+
+    // ---- trace ring + off-by-default gate ----
+
+    fn ev(msg: &str) -> TraceEvent {
+        TraceEvent {
+            ts: 0,
+            level: "INFO".into(),
+            target: "test".into(),
+            msg: msg.into(),
+            fields: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn trace_off_by_default_push_is_noop() {
+        let st = IntrospectState::new();
+        assert!(!st.trace_enabled(), "trace must be off by default");
+        assert_eq!(st.trace_level(), "off");
+        st.push_trace(ev("a"));
+        assert!(st.trace_last_n(0).is_empty(), "push must be a no-op when off");
+    }
+
+    #[test]
+    fn trace_enabled_push_appends_and_returns_in_order() {
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        assert!(st.trace_enabled());
+        assert_eq!(st.trace_level(), "debug");
+        st.push_trace(ev("a"));
+        st.push_trace(ev("b"));
+        st.push_trace(ev("c"));
+        let events = st.trace_last_n(0);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].msg, "a");
+        assert_eq!(events[1].msg, "b");
+        assert_eq!(events[2].msg, "c");
+    }
+
+    #[test]
+    fn trace_last_n_returns_tail_respecting_n() {
+        let st = IntrospectState::new();
+        st.set_trace_level("trace");
+        for i in 0..5 {
+            st.push_trace(ev(&format!("e{i}")));
+        }
+        assert_eq!(st.trace_last_n(0).len(), 5, "n == 0 returns all");
+        let last3 = st.trace_last_n(3);
+        assert_eq!(last3.len(), 3);
+        assert_eq!(last3[0].msg, "e2");
+        assert_eq!(last3[2].msg, "e4");
+        // n larger than the ring returns everything.
+        assert_eq!(st.trace_last_n(100).len(), 5);
+    }
+
+    #[test]
+    fn trace_ring_drops_oldest_past_cap() {
+        // Sanity: cap is the documented ~2000.
+        assert_eq!(TRACE_RING_CAP, 2000);
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        for i in 0..(TRACE_RING_CAP + 50) {
+            st.push_trace(ev(&format!("e{i}")));
+        }
+        let all = st.trace_last_n(0);
+        assert_eq!(all.len(), TRACE_RING_CAP, "ring must be capped");
+        // Oldest entries (e0..e49) were dropped; newest first kept is e50.
+        assert_eq!(all.first().unwrap().msg, "e50", "oldest in ring is e50");
+        assert_eq!(all.last().unwrap().msg, format!("e{}", TRACE_RING_CAP + 49));
+    }
+
+    #[test]
+    fn trace_set_level_off_disables_but_does_not_clear_buffer() {
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        st.push_trace(ev("captured"));
+        assert_eq!(st.trace_last_n(0).len(), 1);
+        st.set_trace_level("off");
+        assert!(!st.trace_enabled());
+        // Push is a no-op again.
+        st.push_trace(ev("ignored"));
+        // But previously captured events are still retrievable.
+        assert_eq!(st.trace_last_n(0).len(), 1);
+        assert_eq!(st.trace_last_n(0)[0].msg, "captured");
+    }
+
+    #[test]
+    fn trace_normalize_level_accepts_off_debug_trace_rejects_unknown() {
+        assert_eq!(normalize_trace_level("off"), "off");
+        assert_eq!(normalize_trace_level("DEBUG"), "debug");
+        assert_eq!(normalize_trace_level("trace"), "trace");
+        assert_eq!(normalize_trace_level("  debug  "), "debug");
+        // Unknown values fail-safe to "off" — never silently enable tracing.
+        assert_eq!(normalize_trace_level("verbose"), "off");
+        assert_eq!(normalize_trace_level(""), "off");
+    }
+
+    #[test]
+    fn trace_set_level_unknown_fails_safe_to_off() {
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        st.set_trace_level("nonsense");
+        assert!(!st.trace_enabled(), "unknown level must disable tracing");
+        st.push_trace(ev("x"));
+        assert!(st.trace_last_n(0).is_empty());
+    }
+
+    #[test]
+    fn trace_event_serialises_to_json_with_expected_shape() {
+        let e = TraceEvent {
+            ts: 1_700_000_000_000,
+            level: "INFO".into(),
+            target: "luftlift_rs::server".into(),
+            msg: "Discover request".into(),
+            fields: serde_json::json!({"peer": "fe80::1"}),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in ["ts", "level", "target", "msg", "fields"] {
+            assert!(obj.contains_key(key), "TraceEvent JSON must include {key}");
+        }
+        assert_eq!(obj["fields"]["peer"], serde_json::json!("fe80::1"));
     }
 }
