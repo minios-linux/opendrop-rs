@@ -214,6 +214,12 @@ pub mod awdl {
         UnsupportedSubtype(u8),
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Tlv<'a> {
+        pub kind: u8,
+        pub value: &'a [u8],
+    }
+
     pub fn parse_action_frame(body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
         if body.len() < 16 {
             return Err(ParseError::TooShort);
@@ -241,6 +247,10 @@ pub mod awdl {
         })
     }
 
+    pub fn parse_tlvs(_bytes: &[u8]) -> Result<Vec<Tlv<'_>>, ParseError> {
+        Err(ParseError::TooShort)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -265,6 +275,30 @@ pub mod awdl {
             assert_eq!(parsed.phy_tx, 0x1122_3344);
             assert_eq!(parsed.target_tx, 0x5566_7788);
             assert_eq!(parsed.tlvs, &[0x04, 0x02, 0x00, 0xaa, 0xbb]);
+        }
+
+        #[test]
+        fn parses_repeated_tlvs() {
+            let tlvs = [
+                0x04, 0x02, 0x00, 0xaa, 0xbb, // sync params fragment
+                0x18, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04, // election v2 fragment
+            ];
+
+            let parsed = parse_tlvs(&tlvs).expect("valid AWDL TLVs");
+
+            assert_eq!(
+                parsed,
+                vec![
+                    Tlv {
+                        kind: 0x04,
+                        value: &[0xaa, 0xbb]
+                    },
+                    Tlv {
+                        kind: 0x18,
+                        value: &[0x01, 0x02, 0x03, 0x04]
+                    }
+                ]
+            );
         }
     }
 }
