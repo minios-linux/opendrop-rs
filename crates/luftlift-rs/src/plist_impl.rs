@@ -98,7 +98,11 @@ pub fn parse_ask_request(body: &[u8]) -> Result<AskRequest, PlistError> {
         .as_dictionary()
         .ok_or(PlistError::TypeError { field: "root".into(), expected: "dictionary" })?;
 
-    let transfer_id = get_string(dict, "TransferID")?;
+    // Real iOS senders do NOT include TransferID in the /Ask body (the python
+    // opendrop reference requires no fields at all here — it just accepts and
+    // responds with the receiver name/model). Keep every field optional so a
+    // missing one never rejects a genuine transfer.
+    let transfer_id = get_string(dict, "TransferID").unwrap_or_default();
     let transfer_type = get_string(dict, "TransferType").unwrap_or_default();
     let sender_computer_name = get_string(dict, "SenderComputerName").unwrap_or_default();
     let sender_model_name = get_string(dict, "SenderModelName").unwrap_or_default();
