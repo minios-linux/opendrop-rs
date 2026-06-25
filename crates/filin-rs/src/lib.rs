@@ -1960,11 +1960,22 @@ pub mod schedule {
         }
 
         /// Returns the cached frame to re-broadcast on `channel` now, iff:
-        /// the cache is live (not expired), the channel is a social channel,
-        /// and we have not already re-broadcast on this channel within the
+        /// the cache is live (not expired), the channel is in `allowed`, and
+        /// we have not already re-broadcast on this channel within the
         /// rate-limit window. Updates the per-channel rate-limit clock on a
         /// hit. Returns `None` if suppressed/expired/empty.
-        pub fn rebroadcast(&mut self, channel: u8, now_us: u64) -> Option<&[u8]> {
+        ///
+        /// `allowed` is the set of channels worth re-broadcasting on —
+        /// typically [`rebroadcast_channels`] (the AWDL social channels plus
+        /// the adopted master's anchor). This makes filin adaptive: when the
+        /// master anchors on e.g. 52, the cached announce is re-broadcast on
+        /// 52 too, not just 6/44/149.
+        pub fn rebroadcast(
+            &mut self,
+            channel: u8,
+            now_us: u64,
+            allowed: &[u8],
+        ) -> Option<&[u8]> {
             // Expire stale cache so a dead receiver stops being advertised.
             // Done before borrowing self.frame below to avoid a borrow conflict.
             if self.frame.is_some()
@@ -1973,8 +1984,8 @@ pub mod schedule {
                 self.frame = None;
             }
             let frame = self.frame.as_deref()?;
-            if !AWDL_SOCIAL_CHANNELS.iter().any(|(c, _)| *c == channel) {
-                return None; // re-broadcast only on social channels
+            if !allowed.contains(&channel) {
+                return None; // not a re-broadcast channel
             }
             if let Some(&last) = self.last_sent.get(&channel) {
                 if now_us.saturating_sub(last) < self.min_gap_us {
@@ -2750,7 +2761,10 @@ pub mod schedule {
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA, 0xBB], 1_000_000);
-            assert_eq!(cache.rebroadcast(149, 1_500_000), Some(&[0xAA, 0xBB][..]));
+            assert_eq!(
+                cache.rebroadcast(149, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS),
+                Some(&[0xAA, 0xBB][..])
+            );
         }
 
         #[test]
@@ -2760,13 +2774,13 @@ pub mod schedule {
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
-            assert!(cache.rebroadcast(149, 1_500_000).is_some());
+            assert!(cache.rebroadcast(149, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_some());
             assert!(
-                cache.rebroadcast(149, 1_900_000).is_none(),
+                cache.rebroadcast(149, 1_900_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_none(),
                 "second send within window must be suppressed"
             );
             // Past the window it fires again.
-            assert!(cache.rebroadcast(149, 2_501_000).is_some());
+            assert!(cache.rebroadcast(149, 2_501_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_some());
         }
 
         #[test]
@@ -2777,9 +2791,9 @@ pub mod schedule {
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
-            assert!(cache.rebroadcast(6, 1_500_000).is_some());
+            assert!(cache.rebroadcast(6, 1_500_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_some());
             assert!(
-                cache.rebroadcast(149, 1_500_001).is_some(),
+                cache.rebroadcast(149, 1_500_001, &AWDL_SOCIAL_CHANNEL_NUMS).is_some(),
                 "ch149 must not be rate-limited by a ch6 send"
             );
         }
@@ -2791,7 +2805,10 @@ pub mod schedule {
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
             cache.refresh(vec![0xCC, 0xDD], 2_000_000);
-            assert_eq!(cache.rebroadcast(149, 2_500_000), Some(&[0xCC, 0xDD][..]));
+            assert_eq!(
+                cache.rebroadcast(149, 2_500_000, &AWDL_SOCIAL_CHANNEL_NUMS),
+                Some(&[0xCC, 0xDD][..])
+            );
         }
 
         #[test]
@@ -2802,7 +2819,7 @@ pub mod schedule {
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
             cache.refresh(vec![0xAA], 1_000_000);
             let stale = 1_000_000 + ANNOUNCE_CACHE_TTL_US + 1;
-            assert!(cache.rebroadcast(149, stale).is_none());
+            assert!(cache.rebroadcast(149, stale, &AWDL_SOCIAL_CHANNEL_NUMS).is_none());
             assert!(!cache.is_live(stale));
         }
 
@@ -2847,7 +2864,7 @@ pub mod schedule {
             // With no frame cached, nothing is ever re-broadcast.
             let mut cache =
                 AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
-            assert!(cache.rebroadcast(149, 1_000_000).is_none());
+            assert!(cache.rebroadcast(149, 1_000_000, &AWDL_SOCIAL_CHANNEL_NUMS).is_none());
         }
     }
 }
@@ -4947,7 +4964,11 @@ pub mod runtime {
         ) != 0 {
             return; // inside multicast guard; retry next iteration
         }
-        if let Some(frame) = cache.rebroadcast(channel, now_us) {
+        // TEMP: use static social channels; the integration step swaps this
+        // for rebroadcast_channels(awdl_state.master_anchor) so the anchor is
+        // included adaptively.
+        let allowed = crate::schedule::AWDL_SOCIAL_CHANNEL_NUMS;
+        if let Some(frame) = cache.rebroadcast(channel, now_us, &allowed) {
             match links.packet.send(frame) {
                 Ok(sent) => {
                     introspect.counters.inc_rebroadcast(channel);
