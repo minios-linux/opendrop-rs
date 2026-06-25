@@ -294,14 +294,35 @@ pub mod awdl {
     }
 
     pub fn parse_election_parameters_v2(
-        _value: &[u8],
+        value: &[u8],
     ) -> Result<ElectionParametersV2, ParseError> {
-        Err(ParseError::TooShort)
+        Ok(ElectionParametersV2 {
+            master_addr: read_addr(value, 0)?,
+            sync_addr: read_addr(value, 6)?,
+            master_counter: read_le32(value, 12)?,
+            distance_to_master: read_le32(value, 16)?,
+            master_metric: read_le32(value, 20)?,
+            self_metric: read_le32(value, 24)?,
+            self_counter: read_le32(value, 36)?,
+        })
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
         let field = bytes.get(offset..offset + 2).ok_or(ParseError::TooShort)?;
         Ok(u16::from_le_bytes([field[0], field[1]]))
+    }
+
+    fn read_le32(bytes: &[u8], offset: usize) -> Result<u32, ParseError> {
+        let field = bytes.get(offset..offset + 4).ok_or(ParseError::TooShort)?;
+        Ok(u32::from_le_bytes([field[0], field[1], field[2], field[3]]))
+    }
+
+    fn read_addr(bytes: &[u8], offset: usize) -> Result<[u8; 6], ParseError> {
+        Ok(bytes
+            .get(offset..offset + 6)
+            .ok_or(ParseError::TooShort)?
+            .try_into()
+            .expect("slice length matches mac address length"))
     }
 
     #[cfg(test)]
