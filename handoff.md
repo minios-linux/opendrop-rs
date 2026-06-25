@@ -90,6 +90,16 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 9 (TREE GREEN 69 tests; filin syscall layer in TDD; luftlift main wiring).
+- filin (24 tests): syscall layer underway w/ good discipline — tap-iface-request,
+  packet-socket-bind, netdev-ioctl-name all have TESTED planning fns + thin unsafe
+  runtime glue (compile-tested). Adding MAC/MTU/flags ioctl helpers next, then the
+  actual RX/TX loop + awdl0 creation. NOTE: Codex auto-reviewer now auto-approves
+  narrow filin TDD commits (standing authorization) -> fewer pty-2 approval prompts;
+  watcher still armed for real questions/blockers.
+- luftlift (45 tests, clippy clean): netutil + main.rs receive flow, then find (mDNS
+  browse). Near done.
+--- (prior cycle notes below) ---
 Last updated: cycle 8 (TREE GREEN 62 tests; filin unblocked into HW syscalls; luftlift ~done).
 - ***libc = "0.2" added to [workspace.dependencies]*** (commit) to unblock filin's
   tun/AF_PACKET/netlink work. filin uses `libc = { workspace = true }` in its crate.
