@@ -23,6 +23,8 @@ fn main() -> anyhow::Result<()> {
         assume_monitor = config.assume_monitor,
         "validated filin configuration"
     );
-    // TODO(gpt-5.5): open monitor iface and create awdl0 per PORT.md.
-    Ok(())
+    let links = filin_rs::runtime::open_links(&config)
+        .map_err(|err| anyhow::anyhow!("failed to open filin links: {err:?}"))?;
+    tracing::info!("filin links are up");
+    filin_rs::runtime::run(links).map_err(|err| anyhow::anyhow!("filin runtime stopped: {err:?}"))
 }

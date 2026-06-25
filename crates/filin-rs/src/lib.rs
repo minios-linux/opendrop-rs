@@ -1139,8 +1139,10 @@ pub mod cli {
 
 pub mod runtime {
     use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
 
-    use crate::{channel, iface::Config, os};
+    use crate::{channel, iface::Config, os, rx, sync::TsftBridge};
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Error {
@@ -1148,6 +1150,8 @@ pub mod runtime {
         Netdev,
         Packet,
         Channel,
+        Poll,
+        Io,
     }
 
     pub struct Links {
@@ -1169,6 +1173,68 @@ pub mod runtime {
             os::packet::PacketSocket::open_bound(&config.monitor_iface).map_err(|_| Error::Packet)?;
 
         Ok(Links { tap, packet })
+    }
+
+    pub fn run(mut links: Links) -> Result<(), Error> {
+        let mut bridge = TsftBridge::default();
+        let mut wlan_buf = vec![0u8; 4096];
+        let mut tap_buf = vec![0u8; 2048];
+
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: links.packet.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: links.tap.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: fds points to two valid pollfd entries for the duration of the call.
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if rc < 0 {
+                return Err(Error::Poll);
+            }
+
+            if fds[0].revents & libc::POLLIN != 0 {
+                match links.packet.recv(&mut wlan_buf) {
+                    Ok(len) => {
+                        let now_us = host_time_us();
+                        match rx::parse_action_frame(&wlan_buf[..len], now_us, &mut bridge) {
+                            Ok(frame) => tracing::trace!(
+                                rx_time_us = frame.rx_time_us,
+                                rssi_dbm = frame.rssi_dbm,
+                                tlv_count = frame.tlvs.len(),
+                                "rx awdl action frame"
+                            ),
+                            Err(err) => tracing::trace!(?err, "ignored wlan frame"),
+                        }
+                    }
+                    Err(err) => tracing::trace!(?err, "packet recv failed"),
+                }
+            }
+
+            if fds[1].revents & libc::POLLIN != 0 {
+                let len = links.tap.read(&mut tap_buf).map_err(|_| Error::Io)?;
+                tracing::trace!(len, "rx host tap frame");
+            }
+        }
+    }
+
+    fn host_time_us() -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: ts is valid writable memory for clock_gettime.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        if rc < 0 {
+            return 0;
+        }
+        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
     }
 }
 
