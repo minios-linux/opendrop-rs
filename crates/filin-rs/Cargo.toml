@@ -17,4 +17,5 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
-# Add as needed: libc, nix, pcap, neli/nl80211, tokio, etc. (coordinate big additions)
+libc = { workspace = true }
+# Add as needed: nix, pcap, neli/nl80211, tokio, etc. (coordinate big additions)
