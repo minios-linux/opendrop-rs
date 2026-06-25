@@ -33,6 +33,14 @@ Every cycle:
 Tune the interval up (e.g. 300-600s) if agents need more time per milestone; down
 if Codex is blocking on approvals. Cache cost is irrelevant across heartbeats.
 
+**Event-based wake for pty-2 approvals:** a `notify_on_pattern` watcher (`notify-1`,
+watching pty-2 for `Would you like to run|Press enter to confirm or esc`) injects a
+heartbeat into pty-1 the moment Codex blocks on an approval — so you don't idle the
+full ~180s while pty-2 waits. Check it's still registered with
+`mcp__tttt__tttt_notify_list`; re-create it (see the notify_on_pattern call) if gone.
+This is the ONE sanctioned inject into pty-1 — it's event-triggered + auto-submits,
+unlike the broken self_inject self-clear.
+
 ## THE AGENTS & TERMINALS (tttt PTYs)
 - **pty-1** = YOU (claude, root). Self-inject /clear here.
 - **pty-2** = **gpt-5.5** via OpenAI Codex CLI → owns crate **`crates/filin-rs/`**
