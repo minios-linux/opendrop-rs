@@ -90,11 +90,12 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
-Last updated: cycle 24 (AUTONOMOUS health-check — all green, idle, ready for human).
-- Light cycle, nothing changed: tree green (filin 68 + luftlift 84 tests, builds,
-  clippy clean, git clean besides owl force-master patch). Stack alive on pty-7
-  (filin + luftlift receive running). Both GLM agents idle/done. No new code work —
-  everything remaining is the human's live Apple test of filin channel hopping.
+Last updated: cycle 25 (AUTONOMOUS idle-monitor — all green, idle, ready for human; no change).
+- Idle health-checks (cycles 24-25), nothing changed: tree green (filin 68 + luftlift
+  84 tests, builds, clippy clean, git clean besides owl force-master patch). Stack
+  alive on pty-7 (filin + luftlift receive). Both GLM agents idle/done, no stray
+  prompts. No new code work — everything remaining is the human's live Apple test of
+  filin channel hopping (see WAKEUP_REPORT.md). Monitoring at 30-min cadence.
 --- PRIOR cycle-23 below ---
 Last updated: cycle 23 (AUTONOMOUS — luftlift SEND+RECEIVE fully validated locally; scope_id bug fixed).
 - *** luftlift FULL send+receive VALIDATED end-to-end (no Apple needed): ***
