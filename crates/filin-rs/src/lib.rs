@@ -6901,5 +6901,123 @@ pub mod introspect {
             assert_eq!(route(&intro, &req("POST", "/status")).status, 404);
             assert_eq!(route(&intro, &req("DELETE", "/trace")).status, 404);
         }
+
+        #[test]
+        fn parse_request_line_extracts_method_path_query() {
+            let p = parse_request_line("GET /trace?n=300 HTTP/1.1\r\n").expect("valid line");
+            assert_eq!(p.method, "GET");
+            assert_eq!(p.path, "/trace");
+            assert_eq!(p.query, "n=300");
+
+            let p = parse_request_line("POST /trace HTTP/1.1\r\n").expect("valid line");
+            assert_eq!(p.method, "POST");
+            assert_eq!(p.path, "/trace");
+            assert_eq!(p.query, "");
+
+            assert!(parse_request_line("garbage").is_none());
+            assert!(parse_request_line("").is_none());
+        }
+
+        #[test]
+        fn format_response_writes_status_headers_and_body() {
+            let resp = Response {
+                status: 200,
+                content_type: "application/json",
+                body: b"{\"ok\":1}".to_vec(),
+            };
+            let bytes = format_response(&resp);
+            let text = String::from_utf8_lossy(&bytes);
+
+            assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(text.contains("Content-Type: application/json\r\n"));
+            assert!(text.contains("Content-Length: 7\r\n"));
+            assert!(text.contains("Connection: close\r\n"));
+            assert!(text.ends_with("{\"ok\":1}"));
+        }
+
+        #[test]
+        fn format_response_uses_correct_reason_phrase_for_errors() {
+            let not_found = Response {
+                status: 404,
+                content_type: "text/plain; charset=utf-8",
+                body: b"not found".to_vec(),
+            };
+            let bad = Response {
+                status: 400,
+                content_type: "text/plain; charset=utf-8",
+                body: b"bad".to_vec(),
+            };
+            assert!(String::from_utf8(format_response(&not_found)).unwrap().contains("404 Not Found"));
+            assert!(String::from_utf8(format_response(&bad)).unwrap().contains("400 Bad Request"));
+        }
+
+        #[test]
+        fn spawn_serves_endpoints_over_real_loopback_tcp() {
+            use std::io::{Read, Write};
+            use std::net::{SocketAddr, TcpStream};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            let addr = listener.local_addr().expect("local addr");
+            let intro = Introspection::new();
+            intro.set_status(StatusSnapshot {
+                current_channel: 44,
+                master_mac: "02:aa:bb:cc:dd:ee".into(),
+                master_seq: 5,
+                synced: true,
+                peer_count: 1,
+            });
+            intro.counters.inc_mdns_rx_other();
+            intro.counters.inc_rebroadcast(44);
+            let _join = spawn(intro.clone(), listener);
+
+            // GET /status
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.write_all(b"GET /status HTTP/1.0\r\n\r\n").expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let status = String::from_utf8_lossy(&buf).into_owned();
+            let body = status.split("\r\n\r\n").nth(1).unwrap_or("");
+            assert!(status.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(body.contains("\"current_channel\":44"));
+            assert!(body.contains("\"master_mac\":\"02:aa:bb:cc:dd:ee\""));
+            assert!(body.contains("\"mdns_rx_other\":1"));
+            assert!(body.contains("\"rebroadcast_counts\""));
+            assert!(body.contains("\"44\":1"));
+
+            // GET /peers (empty array — no peers set)
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.write_all(b"GET /peers HTTP/1.0\r\n\r\n").expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let peers = String::from_utf8_lossy(&buf);
+            assert!(peers.split("\r\n\r\n").nth(1).unwrap_or("").contains("[]"));
+
+            // POST /trace {"level":"trace"}
+            assert!(!intro.trace_gate().allows(5));
+            let mut s = TcpStream::connect(addr).expect("connect");
+            write!(
+                s,
+                "POST /trace HTTP/1.0\r\nContent-Length: {}\r\n\r\n",
+                b"{\"level\":\"trace\"}".len()
+            )
+            .expect("write headers");
+            s.write_all(b"{\"level\":\"trace\"}").expect("write body");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let post = String::from_utf8_lossy(&buf);
+            assert!(post.starts_with("HTTP/1.1 200"));
+            assert!(intro.trace_gate().allows(5));
+
+            // 404 path
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.write_all(b"GET /nope HTTP/1.0\r\n\r\n").expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let notfound = String::from_utf8_lossy(&buf);
+            assert!(notfound.starts_with("HTTP/1.1 404"));
+
+            // silence unused import warning when SocketAddr differs by platform
+            let _: SocketAddr = addr;
+        }
     }
 }
