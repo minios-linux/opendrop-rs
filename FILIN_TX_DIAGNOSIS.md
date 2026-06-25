@@ -12,6 +12,8 @@
 2. **Incomplete owl PSF/MIF TLV set.**
    owl action frames include TLVs in this order: sync params, election params v1, channel sequence, election params v2, service params, MIF-only HT capabilities, MIF-only ARPA, data path state, version (`owl/src/tx.c:370-380`). filin currently emits only sync params, election v1, channel sequence, election v2, and service params (`crates/filin-rs/src/lib.rs:1766-1788`). Missing data path state and version are likely important for peer-table registration; missing MIF HT capabilities and ARPA may affect service/datapath readiness.
 
+   A related header divergence is addr3/BSSID: owl always writes the fixed AWDL BSSID (`00:25:00:ff:94:73`) in `owl/src/tx.c:321-330`, while filin was using its own MAC as addr3 in action frames. The fix should use the fixed AWDL BSSID for action and data frames.
+
 3. **Availability-window timing is approximate.**
    owl schedules PSF every `psf_interval` TU (`owl/daemon/core.c:410-415`) and schedules MIF into the middle of the next EAW (`owl/daemon/core.c:184-198`). filin now sends on a simple 110 TU periodic scheduler. This should be acceptable for getting frames heard, but it is less faithful than owl and may need refinement after TX is confirmed on-air.
 

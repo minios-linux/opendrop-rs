@@ -84,6 +84,14 @@ pub mod radiotap {
         })
     }
 
+    pub fn build_tx_header() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x09, 0x00, // version, pad, length
+            0x04, 0x00, 0x00, 0x00, // present: rate
+            0x18, // 12 Mbps encoded as 500 kbps units
+        ]
+    }
+
     fn align(offset: usize, alignment: usize) -> usize {
         debug_assert!(alignment.is_power_of_two());
         (offset + alignment - 1) & !(alignment - 1)
@@ -1681,13 +1689,13 @@ pub mod runtime {
                     let src = mac_from_slice(&tap_buf[6..12]);
                     match awdl::encapsulate_ethernet_payload(&tap_buf[..len], tx_seq) {
                         Ok(body) => {
-                            let frame = ieee80211::build_data_frame(
+                            let frame = radiotap_prefixed(ieee80211::build_data_frame(
                                 dst,
                                 src,
-                                [0x00, 0x25, 0x00, 0xff, 0x94, 0x73],
+                                AWDL_BSSID,
                                 tx_seq << 4,
                                 &body,
-                            );
+                            ));
                             tx_seq = tx_seq.wrapping_add(1);
                             match links.packet.send(&frame) {
                                 Ok(sent) => tracing::trace!(sent, "injected awdl data frame"),
@@ -1710,6 +1718,7 @@ pub mod runtime {
     const TU_US: u64 = 1024;
     const PSF_INTERVAL_TU: u64 = 110;
     const AWDL_BROADCAST: [u8; 6] = [0xff; 6];
+    const AWDL_BSSID: [u8; 6] = [0x00, 0x25, 0x00, 0xff, 0x94, 0x73];
 
     #[derive(Debug, PartialEq, Eq)]
     struct AnnounceScheduler {
@@ -1758,18 +1767,20 @@ pub mod runtime {
         sync: &crate::sync::SyncState,
         anchor_channel: u16,
     ) -> Vec<u8> {
-        let tlvs = build_announce_tlvs(self_addr, now_us, sync, anchor_channel);
+        let tlvs = build_announce_tlvs(subtype, self_addr, now_us, sync, anchor_channel);
         let action = awdl::build_action_body(subtype, now_us as u32, now_us as u32, &tlvs);
-        ieee80211::build_management_action_frame(
+        let frame = ieee80211::build_management_action_frame(
             AWDL_BROADCAST,
             self_addr,
-            self_addr,
+            AWDL_BSSID,
             sequence_control,
             &action,
-        )
+        );
+        radiotap_prefixed(frame)
     }
 
     fn build_announce_tlvs(
+        subtype: awdl::ActionSubtype,
         self_addr: [u8; 6],
         now_us: u64,
         sync: &crate::sync::SyncState,
@@ -1797,7 +1808,23 @@ pub mod runtime {
             &build_election_parameters_v2_tlv_value(self_addr),
         );
         push_tlv(&mut tlvs, 6, &build_service_parameters_tlv_value());
+        if subtype == awdl::ActionSubtype::Mif {
+            push_tlv(&mut tlvs, 7, &build_ht_capabilities_tlv_value());
+            push_tlv(&mut tlvs, 16, &build_arpa_tlv_value());
+        }
+        push_tlv(
+            &mut tlvs,
+            12,
+            &build_data_path_state_tlv_value(self_addr, anchor_channel),
+        );
+        push_tlv(&mut tlvs, 21, &build_version_tlv_value());
         tlvs
+    }
+
+    fn radiotap_prefixed(mut frame: Vec<u8>) -> Vec<u8> {
+        let mut prefixed = radiotap::build_tx_header();
+        prefixed.append(&mut frame);
+        prefixed
     }
 
     fn push_tlv(out: &mut Vec<u8>, kind: u8, value: &[u8]) {
@@ -1889,6 +1916,43 @@ pub mod runtime {
 
     fn build_service_parameters_tlv_value() -> [u8; 9] {
         [0; 9]
+    }
+
+    fn build_ht_capabilities_tlv_value() -> [u8; 8] {
+        [0x00, 0x00, 0xce, 0x11, 0x1b, 0xff, 0x00, 0x00]
+    }
+
+    fn build_arpa_tlv_value() -> Vec<u8> {
+        let name = b"filin";
+        let mut value = Vec::with_capacity(2 + name.len() + 2);
+        value.push(3);
+        value.push(name.len() as u8);
+        value.extend_from_slice(name);
+        value.extend_from_slice(&0xc00cu16.to_be_bytes());
+        value
+    }
+
+    fn build_data_path_state_tlv_value(self_addr: [u8; 6], anchor_channel: u16) -> Vec<u8> {
+        let mut value = Vec::with_capacity(15);
+        value.extend_from_slice(&0x8f24u16.to_le_bytes());
+        value.extend_from_slice(b"X0\0");
+        value.extend_from_slice(&social_channel_bits(anchor_channel).to_le_bytes());
+        value.extend_from_slice(&self_addr);
+        value.extend_from_slice(&0u16.to_le_bytes());
+        value
+    }
+
+    fn build_version_tlv_value() -> [u8; 2] {
+        [0x34, 1]
+    }
+
+    fn social_channel_bits(anchor_channel: u16) -> u16 {
+        match anchor_channel {
+            6 => 0x0001,
+            44 => 0x0002,
+            149 => 0x0004,
+            _ => 0,
+        }
     }
 
     fn self_metric(self_addr: [u8; 6]) -> u32 {
@@ -2029,7 +2093,7 @@ pub mod runtime {
             assert_eq!(mac.frame_control, 0x00d0);
             assert_eq!(mac.destination, [0xff; 6]);
             assert_eq!(mac.source, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
-            assert_eq!(mac.bssid, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            assert_eq!(mac.bssid, AWDL_BSSID);
             assert_eq!(mac.sequence_control, 0x0120);
             assert_eq!(action.subtype, awdl::ActionSubtype::Psf);
             assert!(tlvs.iter().any(|tlv| tlv.kind == 4));
