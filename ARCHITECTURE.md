@@ -1,8 +1,8 @@
 # opendrop-rs — a Rust port of owl (AWDL) + opendrop (AirDrop)
 
 Clean-room Rust reimplementation of Apple's AirDrop stack for Linux, porting:
-- **owl** (C, SEEMOO) — the AWDL link layer → crate `awdl-rs`
-- **opendrop** (Python, SEEMOO) — the AirDrop application layer → crate `airdrop-rs`
+- **owl** (C, SEEMOO) — the AWDL link layer → crate `filin-rs`
+- **opendrop** (Python, SEEMOO) — the AirDrop application layer → crate `luftlift-rs`
 
 We have working references (`owl/`, `opendrop-patch/`) and hard-won knowledge from
 getting a real iPhone 15 Pro Max (iOS 18.6.2) to AirDrop a photo to Linux. The
@@ -19,7 +19,7 @@ developed and tested independently.
 
 ```
   ┌────────────────────────────────────────────────┐
-  │  airdrop-rs   (mDNS, rustls HTTPS, Discover/Ask/ │   ← GLM-5.2
+  │  luftlift-rs   (mDNS, rustls HTTPS, Discover/Ask/ │   ← GLM-5.2
   │               Upload, plist, dvzip, cpio)        │
   └───────────────────────┬────────────────────────-┘
                           │ normal sockets bound to awdl0 (UDP 5353 mDNS, TCP 8771 https)
@@ -28,7 +28,7 @@ developed and tested independently.
   └───────────────────────┬────────────────────────-┘
                           │ tun/tap + raw 802.11 inject/capture (pcap/nl80211)
   ┌───────────────────────┴─────────────────────────┐
-  │  awdl-rs  (radiotap, AWDL frames, election,      │   ← gpt-5.5
+  │  filin-rs  (radiotap, AWDL frames, election,      │   ← gpt-5.5
   │           sync, channel hop, monitor iface)      │
   └──────────────────────────────────────────────────┘
                           │
@@ -36,8 +36,8 @@ developed and tested independently.
 ```
 
 ## Crates (Cargo workspace)
-- `crates/awdl-rs/`   — AWDL daemon. Binary `awdl-rs`. Owner: **gpt-5.5 (pty-2)**. Spec: `crates/awdl-rs/PORT.md`.
-- `crates/airdrop-rs/` — AirDrop CLI. Binary `airdrop-rs` (send/receive/find). Owner: **GLM-5.2 (pty-3)**. Spec: `crates/airdrop-rs/PORT.md`.
+- `crates/filin-rs/`   — AWDL daemon. Binary `filin-rs`. Owner: **gpt-5.5 (pty-2)**. Spec: `crates/filin-rs/PORT.md`.
+- `crates/luftlift-rs/` — AirDrop CLI. Binary `luftlift-rs` (send/receive/find). Owner: **GLM-5.2 (pty-3)**. Spec: `crates/luftlift-rs/PORT.md`.
 - `crates/opendrop-rs/` — top-level CLI tying both together + shared debug UI. Owner: **Claude**.
 
 ## Hard-won lessons to bake in (do NOT relearn these)

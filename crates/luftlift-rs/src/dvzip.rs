@@ -87,7 +87,7 @@ mod tests {
     /// decoder itself only cares about byte-exact round-trip.
     fn synthetic_cpio() -> Vec<u8> {
         let mut v = b"070707".to_vec();
-        v.extend_from_slice(b"hello airdrop from airdrop-rs!");
+        v.extend_from_slice(b"hello airdrop from luftlift-rs!");
         v
     }
 

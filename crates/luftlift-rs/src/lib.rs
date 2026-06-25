@@ -1,6 +1,6 @@
-//! airdrop-rs — Rust port of opendrop (the AirDrop application layer).
+//! luftlift-rs — Rust port of opendrop (the AirDrop application layer).
 //!
-//! Runs over the `awdl0` interface that `awdl-rs` brings up. See PORT.md for the
+//! Runs over the `awdl0` interface that `filin-rs` brings up. See PORT.md for the
 //! full spec and the reverse-engineered iOS-18 protocol details (dvzip, chunked
 //! Ask/Discover, etc.).
 //!

@@ -1,6 +1,6 @@
-//! opendrop-rs — top-level CLI orchestrating awdl-rs + airdrop-rs.
+//! opendrop-rs — top-level CLI orchestrating filin-rs + luftlift-rs.
 //!
-//! Brings up AWDL (awdl-rs) and runs AirDrop (airdrop-rs) over it, with a unified
+//! Brings up AWDL (filin-rs) and runs AirDrop (luftlift-rs) over it, with a unified
 //! status/debug view (peers, master, sync%, discovered services, transfers).
 
 fn main() -> anyhow::Result<()> {

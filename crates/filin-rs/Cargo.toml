@@ -1,14 +1,14 @@
 [package]
-name = "awdl-rs"
+name = "filin-rs"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 # A Rust port of SEEMOO's owl (Apple Wireless Direct Link daemon).
-# Brings up the awdl0 interface; everything above it (mDNS/HTTPS/AirDrop) is in airdrop-rs.
+# filin ("eagle-owl" in Russian) — a Rust port of SEEMOO's owl AWDL daemon.
 
 [[bin]]
-name = "awdl-rs"
+name = "filin"
 path = "src/main.rs"
 
 [dependencies]

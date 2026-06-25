@@ -1,5 +1,5 @@
 [package]
-name = "airdrop-rs"
+name = "luftlift-rs"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,11 @@ license.workspace = true
 # Runs over the awdl0 interface that awdl-rs brings up; talks to real Apple devices.
 
 [lib]
-name = "airdrop_rs"
+name = "luftlift_rs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "airdrop-rs"
+name = "luftlift"
 path = "src/main.rs"
 
 [dependencies]

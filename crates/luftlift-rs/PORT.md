@@ -1,11 +1,11 @@
-# PORT.md — `airdrop-rs` (port of opendrop)  — owner: GLM-5.2
+# PORT.md — `luftlift-rs` (port of opendrop)  — owner: GLM-5.2
 
 Goal: a Rust port of SEEMOO's **opendrop** (the AirDrop application layer). It
-runs over the `awdl0` interface (brought up by the separate `awdl-rs` crate) and
+runs over the `awdl0` interface (brought up by the separate `filin-rs` crate) and
 interoperates with **real Apple devices** — we have verified the patched Python
 opendrop receiving a photo from an iPhone 15 Pro Max on **iOS 18.6.2**.
 
-**You don't touch awdl-rs.** Your contract is: bind sockets to `awdl0` (an IPv6
+**You don't touch filin-rs.** Your contract is: bind sockets to `awdl0` (an IPv6
 link-local netdev). For pure-logic dev/tests you don't even need hardware.
 
 Reference: `../../opendrop-patch/` — the patched Python `server.py` (read it; it
@@ -13,9 +13,9 @@ already contains the iOS-18 fixes) and `dvzip.py` (the format decoder). Port tha
 behavior to Rust.
 
 ## Subcommands (match opendrop)
-`airdrop-rs -i awdl0 receive`
-`airdrop-rs -i awdl0 find`
-`airdrop-rs -i awdl0 send -r <id> -f <file>`
+`luftlift-rs -i awdl0 receive`
+`luftlift-rs -i awdl0 find`
+`luftlift-rs -i awdl0 send -r <id> -f <file>`
 
 ## Components to port
 1. **mDNS over awdl0**: announce `_airdrop._tcp` (for `receive`) and browse it
@@ -65,6 +65,6 @@ peers; a `receive` should narrate the Discover→Ask→Upload phases. The Python
 stack hid all this at debug level — surface it.
 
 ## Workflow
-Follow `../../WORKFLOW.md`: work on `main`, **only under `crates/airdrop-rs/`**,
+Follow `../../WORKFLOW.md`: work on `main`, **only under `crates/luftlift-rs/`**,
 TDD with red/green/review commits. Coordinate workspace `Cargo.toml` dep
 additions with Claude.

@@ -1,4 +1,4 @@
-//! awdl-rs — Rust port of owl (Apple Wireless Direct Link daemon).
+//! filin-rs — Rust port of owl (Apple Wireless Direct Link daemon).
 //!
 //! See PORT.md in this crate for the full implementation spec and the
 //! hard-won lessons (hardware-TSF sync, monitor mode, channel 44, etc.).
@@ -9,11 +9,11 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "awdl_rs=debug,info".into()),
+                .unwrap_or_else(|_| "filin_rs=debug,info".into()),
         )
         .init();
 
-    tracing::info!("awdl-rs starting (skeleton — see PORT.md)");
+    tracing::info!("filin starting (skeleton — see PORT.md)");
     // TODO(gpt-5.5): implement per PORT.md
     Ok(())
 }

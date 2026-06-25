@@ -1,14 +1,14 @@
 # Development workflow — TDD with staged commits
 
-Both agent crates (`awdl-rs`, `airdrop-rs`) are developed **test-first**, with a
+Both agent crates (`filin-rs`, `luftlift-rs`) are developed **test-first**, with a
 git commit at **each TDD stage**. This keeps the parallel work reviewable and
 lets the orchestrator (Claude) integrate confidently.
 
 ## Subdirectory ownership (avoid stepping on each other)
 Everyone works in the one repo on `main`. Collisions are avoided by **strict
 subdirectory ownership** — touch only your own crate:
-- gpt-5.5 → **only** files under `crates/awdl-rs/`.
-- GLM-5.2 → **only** files under `crates/airdrop-rs/`.
+- gpt-5.5 → **only** files under `crates/filin-rs/`.
+- GLM-5.2 → **only** files under `crates/luftlift-rs/`.
 - Claude owns `main` integration, the workspace `Cargo.toml`, `crates/opendrop-rs/`, and `docs/`.
 - Do NOT edit files outside your crate (especially the workspace `Cargo.toml`,
   the other crate, or docs) — if you need a change there, ask Claude.

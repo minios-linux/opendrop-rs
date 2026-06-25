@@ -1,7 +1,7 @@
 # AirDrop protocol notes (reverse-engineered, iOS 18.6.2)
 
 Captured from a real iPhone 15 Pro Max (iOS 18.6.2) and a MacBook (macOS 15.7.3)
-AirDropping to the patched Python opendrop. This is ground truth for `airdrop-rs`.
+AirDropping to the patched Python opendrop. This is ground truth for `luftlift-rs`.
 
 ## Transport
 - AWDL link (`awdl0`), IPv6 link-local. mDNS `_airdrop._tcp`, HTTPS on port 8771.

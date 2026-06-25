@@ -1,9 +1,9 @@
-# PORT.md — `awdl-rs` (port of owl)  — owner: gpt-5.5
+# PORT.md — `filin-rs` (port of owl)  — owner: gpt-5.5
 
 Goal: a Rust port of SEEMOO's **owl** AWDL daemon. It puts a Wi-Fi monitor
 interface to work, speaks Apple Wireless Direct Link, and brings up an `awdl0`
-network interface that the separate `airdrop-rs` crate uses via normal sockets.
-**You do not need to touch airdrop-rs** — the only contract is the `awdl0`
+network interface that the separate `luftlift-rs` crate uses via normal sockets.
+**You do not need to touch luftlift-rs** — the only contract is the `awdl0`
 netdev (IPv6 link-local, MTU 1450).
 
 Reference C source is in `../../owl/` (read it). Our key fix is in
@@ -36,7 +36,7 @@ not owl's buggy original.
    queue/retry rather than drop (owl just dropped → ~32% loss on USB).
 
 ## CLI (match owl where sensible)
-`awdl-rs -i <wlan> [-c 44] [-h awdl0] [-N] [-f] [-v...]`
+`filin-rs -i <wlan> [-c 44] [-h awdl0] [-N] [-f] [-v...]`
 - `-i` monitor iface, `-c` channel (6/44/149), `-h` host iface name (awdl0),
   `-N` assume already-monitor, `-f` disable RSSI filter.
 
@@ -55,9 +55,9 @@ discovery?" agony — make it observable here.
 1. iface setup + awdl0 up + radiotap/802.11/AWDL frame parsing (RX), structured peer logging.
 2. Election + sync (hardware TSF) — log sync% so we can verify against the C owl.
 3. Channel hopping + TX (PSF/MIF + data inject with backpressure handling).
-4. Validate: with a real Apple device active, `airdrop-rs` (other crate) should
+4. Validate: with a real Apple device active, `luftlift-rs` (other crate) should
    discover and receive a file over the awdl0 this brings up.
 
 Coordinate with Claude (orchestrator) for: workspace dep additions, the awdl0
 contract, and anything that would touch shared files. Keep all your code under
-`crates/awdl-rs/`.
+`crates/filin-rs/`.
