@@ -93,8 +93,22 @@ fn receive(interface: &str, output: PathBuf) -> Result<()> {
         port: 8771,
         flags: 1,
     };
-    let (_mdns_daemon, _info) = mdns::announce(&mdns_cfg, addr.into())?;
-    tracing::info!("mDNS announced — receiver visible in AirDrop picker");
+    let (daemon, info) = mdns::announce(&mdns_cfg, addr.into())?;
+    let fullname = info.get_fullname().to_string();
+    tracing::info!(service = %fullname, "mDNS announced — receiver visible in AirDrop picker");
+
+    // Install a SIGINT/SIGTERM handler that sends the mDNS TTL=0 goodbye so
+    // Apple devices remove us from their AirDrop picker immediately, instead
+    // of leaving a ghost entry lingering after Ctrl+C. The PID-suffixed
+    // instance name (set in build_airdrop_service_info) further lets you tell
+    // a fresh run from any stale ghost that survives a crash.
+    let goodbye_daemon = std::sync::Arc::new(daemon);
+    let goodbye_fullname = fullname.clone();
+    ctrlc::set_handler(move || {
+        tracing::info!(service = %goodbye_fullname, "signal received — sending mDNS goodbye");
+        let _ = mdns::goodbye(&goodbye_daemon, &goodbye_fullname);
+        std::process::exit(0);
+    })?;
 
     let listener = server::bind_listener(8771)?;
     tracing::info!(output = %output.display(), "saving received files to output dir");

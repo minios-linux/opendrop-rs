@@ -34,4 +34,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 # Pure-Rust mDNS (no system avahi/dbus dependency) for _airdrop._tcp announce.
 mdns-sd = "0.11"
+# SIGINT/SIGTERM handler for graceful mDNS goodbye (TTL=0) on `receive` exit.
+ctrlc = "3"
 # Add as needed: hyper/axum, cpio, etc.
