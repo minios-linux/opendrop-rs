@@ -7343,6 +7343,74 @@ pub mod introspect {
             assert!(c.rebroadcast_pairs().contains(&(52, 3)));
         }
 
+        // --- sync-quality metrics (FILIN_SYNC_QUALITY.md Part A) ---
+
+        #[test]
+        fn master_change_counter_increments_per_change() {
+            let c = Counters::new();
+            assert_eq!(c.master_changes(), 0);
+            c.inc_master_change();
+            c.inc_master_change();
+            assert_eq!(c.master_changes(), 2);
+        }
+
+        #[test]
+        fn last_master_macs_ring_caps_at_capacity_oldest_dropped() {
+            let c = Counters::new();
+            for i in 0..(LAST_MASTER_MACS_CAP + 3) {
+                c.push_master_mac(format!("02:00:00:00:00:{:02x}", i));
+            }
+            let macs = c.last_master_macs();
+            assert_eq!(macs.len(), LAST_MASTER_MACS_CAP);
+            // Oldest dropped; the newest is the last pushed.
+            assert_eq!(
+                macs.last().map(String::as_str),
+                Some(&*format!("02:00:00:00:00:{:02x}", LAST_MASTER_MACS_CAP + 2))
+            );
+        }
+
+        #[test]
+        fn last_master_macs_ring_preserves_insertion_order() {
+            let c = Counters::new();
+            c.push_master_mac("02:aa:bb:cc:dd:ee".into());
+            c.push_master_mac("02:00:00:00:00:01".into());
+            c.push_master_mac("02:00:00:00:00:02".into());
+            assert_eq!(
+                c.last_master_macs(),
+                vec![
+                    "02:aa:bb:cc:dd:ee".to_string(),
+                    "02:00:00:00:00:01".to_string(),
+                    "02:00:00:00:00:02".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn aw_alignment_pct_starts_at_zero_with_no_samples() {
+            let c = Counters::new();
+            assert_eq!(c.aw_alignment_pct(), 0);
+        }
+
+        #[test]
+        fn aw_alignment_pct_computes_aligned_fraction() {
+            let c = Counters::new();
+            c.record_aw_check(true);
+            c.record_aw_check(true);
+            c.record_aw_check(false);
+            c.record_aw_check(true);
+            // 3 aligned out of 4 total = 75%.
+            assert_eq!(c.aw_alignment_pct(), 75);
+        }
+
+        #[test]
+        fn aw_alignment_pct_clamps_to_100() {
+            let c = Counters::new();
+            for _ in 0..10 {
+                c.record_aw_check(true);
+            }
+            assert_eq!(c.aw_alignment_pct(), 100);
+        }
+
         #[test]
         fn status_snapshot_serializes_to_required_json_keys() {
             let snapshot = StatusSnapshot {
