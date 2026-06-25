@@ -1365,4 +1365,38 @@ pub mod os {
             Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
         }
     }
+
+    pub mod netdev {
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum Error {
+            InvalidName,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub struct IfName {
+            pub bytes: [u8; libc::IFNAMSIZ],
+        }
+
+        pub fn plan_if_name(_name: &str) -> Result<IfName, Error> {
+            Err(Error::InvalidName)
+        }
+
+        pub fn up_flags(existing: libc::c_short) -> libc::c_short {
+            existing | (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn plans_if_name_and_up_flags() {
+                let name = plan_if_name("awdl0").expect("valid if name");
+
+                assert_eq!(&name.bytes[..5], b"awdl0");
+                assert_eq!(name.bytes[5], 0);
+                assert_eq!(up_flags(0), (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
+            }
+        }
+    }
 }
