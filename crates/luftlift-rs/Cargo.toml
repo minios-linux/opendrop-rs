@@ -25,4 +25,6 @@ clap.workspace = true
 # backend (miniz_oxide); no system zlib needed. Local dep — ask Claude to hoist
 # into [workspace.dependencies] if other crates want it too.
 flate2 = "1"
-# Add as needed: rustls/tokio-rustls, hyper/axum, mdns/zeroconf, plist, cpio, etc.
+# Apple binary + XML plist read/write for Discover/Ask request+response.
+plist = "1"
+# Add as needed: rustls/tokio-rustls, hyper/axum, mdns/zeroconf, cpio, etc.
