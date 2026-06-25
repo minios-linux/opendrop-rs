@@ -123,12 +123,26 @@ fn read_body(reader: &mut impl BufRead, header_bytes: &[u8]) -> Result<Vec<u8>> 
 /// (no I/O) so it's unit-testable without sockets. Decodes the `/Ask` body
 /// for the sender name; if decoding fails the counter is still bumped, just
 /// without updating `last_peer`.
-pub fn bump_introspect_for_request(_state: &IntrospectState, _req: &HttpRequest) {
-    todo!()
+pub fn bump_introspect_for_request(state: &IntrospectState, req: &HttpRequest) {
+    match req.path.as_str() {
+        "/Discover" => state.bump_discover(),
+        "/Ask" => {
+            let sender = crate::plist_impl::parse_ask_request(&req.body)
+                .ok()
+                .map(|a| a.sender_computer_name);
+            state.bump_ask(sender.as_deref());
+        }
+        "/Upload" => state.bump_upload(),
+        _ => {}
+    }
 }
 
 /// Serve forever on the given listener. Each connection is handled in a
 /// thread. If `output_dir` is set, received files are saved there.
+///
+/// `introspect` is the shared receiver-state snapshot bumped on every
+/// `/Discover`, `/Ask`, `/Upload` POST so the loopback introspect API
+/// (`GET /status`) can report how far each Apple sender has progressed.
 ///
 /// If the `LUFTLIFT_DUMP_UPLOAD` env var is set to a directory, each /Upload
 /// raw body is also written there as `upload-<unix_ts>-<sender>.bin` for
@@ -140,6 +154,7 @@ pub fn serve_forever(
     tls_config: Arc<ServerConfig>,
     cfg: ReceiverConfig,
     output_dir: Option<PathBuf>,
+    introspect: Arc<IntrospectState>,
 ) {
     let cfg = Arc::new(cfg);
     let output_dir = Arc::new(output_dir);
@@ -153,6 +168,7 @@ pub fn serve_forever(
                 let output_dir = output_dir.clone();
                 let dump_dir = dump_dir.clone();
                 let last_sender = last_sender.clone();
+                let introspect = introspect.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_tls_connection(
                         tcp_stream,
@@ -161,6 +177,7 @@ pub fn serve_forever(
                         output_dir,
                         dump_dir,
                         last_sender,
+                        introspect,
                     ) {
                         warn!(error = %e, "connection error");
                     }
@@ -178,6 +195,7 @@ fn handle_tls_connection(
     output_dir: Arc<Option<PathBuf>>,
     dump_dir: Option<PathBuf>,
     last_sender: Arc<Mutex<String>>,
+    introspect: Arc<IntrospectState>,
 ) -> Result<()> {
     let conn = rustls::ServerConnection::new(tls_config)?;
     let mut tls = rustls::StreamOwned::new(conn, tcp_stream);
@@ -225,6 +243,11 @@ fn handle_tls_connection(
         .lock()
         .map(|cell| cell.clone())
         .unwrap_or_default();
+
+    // Bump the introspection counters before dispatching so /status reflects
+    // how far the Apple sender got (Discover -> Ask -> Upload) even if the
+    // handler errors out.
+    bump_introspect_for_request(&introspect, &req);
 
     let result = handle_post(&req, &cfg);
 
@@ -468,21 +491,6 @@ mod tests {
         let s = st.snapshot();
         assert_eq!(s.ask_count, 1);
         assert_eq!(s.last_peer, "");
-    }
-
-    #[test]
-    fn handle_tls_connection_bumps_introspect_via_serve_forever() {
-        // Verifies the end-to-end path: serve_forever receives a real TLS
-        // connection (via the in-memory TLS handshake) and bumps the
-        // introspect counters. Skipped if the wiring isn't reached.
-        //
-        // We can't easily exercise the TLS path in a unit test, so this is
-        // a structural placeholder that asserts the helper is called from
-        // handle_tls_connection. See bump_introspect_for_request_dispatches_by_path
-        // for the per-request logic.
-        // (no-op assertion: kept for naming; real coverage via live run.)
-        let st = std::sync::Arc::new(IntrospectState::new());
-        assert_eq!(st.snapshot().discover_count, 0);
     }
 
     #[test]

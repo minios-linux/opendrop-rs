@@ -10,6 +10,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use luftlift_rs::{
     client::{FileToSend, RustlsTransport, SenderConfig, send_files},
+    introspect::{
+        DEFAULT_HTTP_ADDR, IntrospectState, TraceCollector,
+        spawn_http_server,
+    },
     mdns, netutil, server, tls,
     mdns::DEFAULT_FLAGS,
     plist_impl::ReceiverConfig,
@@ -48,6 +52,12 @@ enum Command {
         /// `--name foo` is used verbatim (no PID suffix).
         #[arg(short = 'n', long)]
         name: Option<String>,
+        /// Bind address for the loopback JSON introspection API
+        /// (`/status`, `/trace`). Defaults to `127.0.0.1:9931`. Use
+        /// `--http-addr off` to disable it entirely. SEPARATE from the
+        /// AirDrop HTTPS listener on 8771; never reachable off-box.
+        #[arg(long, default_value = DEFAULT_HTTP_ADDR)]
+        http_addr: String,
     },
     /// Find AirDrop senders on the local network.
     Find {
@@ -75,29 +85,48 @@ fn parse_flags(s: &str) -> Result<u32, String> {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                // Default: our crate at debug, info elsewhere, but silence the
-                // mdns-sd 0.11 NSEC parse spam ("Invalid incoming DNS message:
-                // NSEC block length must be in the range 1-32: 0") triggered by
-                // other devices' mDNS records on the LAN — not our bug, but it
-                // drowns `luftlift find` output. RUST_LOG still overrides this.
-                "luftlift_rs=debug,info,mdns_sd=off".into()
-            }),
-        )
-        .init();
+    // Build the introspection state up-front so the TraceCollector layer can
+    // be installed alongside the fmt layer from the start. The HTTP server
+    // for the introspect API is only spawned by `receive`; `find` and `send`
+    // never expose it (the layer is a no-op until set_trace_level is called,
+    // which only POST /trace can do, and only `receive` serves that).
+    let introspect = Arc::new(IntrospectState::new());
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Default: our crate at debug, info elsewhere, but silence the
+        // mdns-sd 0.11 NSEC parse spam ("Invalid incoming DNS message:
+        // NSEC block length must be in the range 1-32: 0") triggered by
+        // other devices' mDNS records on the LAN — not our bug, but it
+        // drowns `luftlift find` output. RUST_LOG still overrides this.
+        "luftlift_rs=debug,info,mdns_sd=off".into()
+    });
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(TraceCollector::new(introspect.clone()));
+    registry.init();
 
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Receive { output, flags, name } => receive(&cli.interface, output, flags, name),
+        Command::Receive { output, flags, name, http_addr } => {
+            receive(&cli.interface, output, flags, name, http_addr, introspect)
+        }
         Command::Find { duration } => find(duration),
         Command::Send { recipient, file } => send(&cli.interface, &recipient, file),
     }
 }
 
-fn receive(interface: &str, output: PathBuf, flags: u32, name: Option<String>) -> Result<()> {
+fn receive(
+    interface: &str,
+    output: PathBuf,
+    flags: u32,
+    name: Option<String>,
+    http_addr: String,
+    introspect: Arc<IntrospectState>,
+) -> Result<()> {
     let addr = netutil::get_ipv6_for_interface(interface)
         .ok_or_else(|| anyhow::anyhow!("interface {interface} has no IPv6 address — is filin-rs/awdl0 running?"))?;
     tracing::info!(interface, %addr, flags = format!("0x{flags:02x}"), "starting AirDrop receiver");
@@ -117,7 +146,7 @@ fn receive(interface: &str, output: PathBuf, flags: u32, name: Option<String>) -
     tracing::info!(receiver_name = %receiver_name, "receiver display name (shown in AirDrop picker)");
 
     let cfg = ReceiverConfig {
-        computer_name: receiver_name,
+        computer_name: receiver_name.clone(),
         computer_model: "MacBookPro".into(),
         record_data: None,
     };
@@ -129,6 +158,29 @@ fn receive(interface: &str, output: PathBuf, flags: u32, name: Option<String>) -
     let (daemon, info) = mdns::announce(&mdns_cfg, addr.into())?;
     let fullname = info.get_fullname().to_string();
     tracing::info!(service = %fullname, "mDNS announced — receiver visible in AirDrop picker");
+
+    // Surface the announce in /status. record_announce sets the name/port,
+    // the announce flag, and a fresh timestamp for last_announce_ms_ago.
+    introspect.record_announce(receiver_name, 8771);
+
+    // Spawn the loopback introspect HTTP server unless explicitly disabled.
+    // Bound to 127.0.0.1 only — never reachable over the AWDL link. The
+    // server runs in its own thread so it does not block the receive path.
+    if !http_addr.eq_ignore_ascii_case("off") {
+        match spawn_http_server(&http_addr, introspect.clone()) {
+            Ok(server) => tracing::info!(
+                addr = %server.local_addr,
+                "introspect API serving /status and /trace (loopback)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                addr = %http_addr,
+                "introspect HTTP server failed to bind — continuing without it",
+            ),
+        }
+    } else {
+        tracing::info!("introspect HTTP server disabled (--http-addr off)");
+    }
 
     // mdns-sd's A/SRV TTL is 120s; if no announcement or query-answer crosses
     // the AWDL link within that window the receiver disappears from the Apple
@@ -158,7 +210,7 @@ fn receive(interface: &str, output: PathBuf, flags: u32, name: Option<String>) -
     let listener = server::bind_listener(8771)?;
     tracing::info!(output = %output.display(), "saving received files to output dir");
 
-    server::serve_forever(listener, Arc::new(tls_config), cfg, Some(output));
+    server::serve_forever(listener, Arc::new(tls_config), cfg, Some(output), introspect);
     Ok(())
 }
 
