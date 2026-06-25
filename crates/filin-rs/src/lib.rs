@@ -198,6 +198,18 @@ pub mod radiotap {
             assert_eq!(parsed.flags, Some(0x10));
             assert_eq!(parsed.antenna_signal_dbm, Some(-61));
         }
+
+        #[test]
+        fn builds_owl_compatible_tx_radiotap_header() {
+            assert_eq!(
+                build_tx_header(),
+                vec![
+                    0x00, 0x00, 0x09, 0x00, // version, pad, length
+                    0x04, 0x00, 0x00, 0x00, // present: rate
+                    0x18, // 12 Mbps encoded as 500 kbps units
+                ]
+            );
+        }
     }
 }
 
@@ -2008,7 +2020,9 @@ pub mod runtime {
                 &sync,
                 44,
             );
-            let mac = ieee80211::parse_mac_header(&frame).expect("valid action header");
+            let radiotap = radiotap::parse_header(&frame).expect("valid tx radiotap header");
+            assert_eq!(radiotap.header_len, 9);
+            let mac = ieee80211::parse_mac_header(radiotap.payload).expect("valid action header");
             let action = awdl::parse_action_frame(mac.body).expect("valid awdl action");
             let tlvs = awdl::parse_tlvs(action.tlvs).expect("valid announce TLVs");
 
@@ -2023,6 +2037,33 @@ pub mod runtime {
             assert!(tlvs.iter().any(|tlv| tlv.kind == 18));
             assert!(tlvs.iter().any(|tlv| tlv.kind == 24));
             assert!(tlvs.iter().any(|tlv| tlv.kind == 6));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 12));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 21));
+            assert!(!tlvs.iter().any(|tlv| tlv.kind == 7));
+            assert!(!tlvs.iter().any(|tlv| tlv.kind == 16));
+        }
+
+        #[test]
+        fn builds_mif_with_owl_extra_tlvs() {
+            let sync = crate::sync::SyncState::new(1_000_000);
+            let frame = build_announce_frame(
+                awdl::ActionSubtype::Mif,
+                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                0x0120,
+                1_000_000,
+                &sync,
+                44,
+            );
+            let radiotap = radiotap::parse_header(&frame).expect("valid tx radiotap header");
+            let mac = ieee80211::parse_mac_header(radiotap.payload).expect("valid action header");
+            let action = awdl::parse_action_frame(mac.body).expect("valid awdl action");
+            let tlvs = awdl::parse_tlvs(action.tlvs).expect("valid announce TLVs");
+
+            assert_eq!(action.subtype, awdl::ActionSubtype::Mif);
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 7));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 16));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 12));
+            assert!(tlvs.iter().any(|tlv| tlv.kind == 21));
         }
 
         #[test]
