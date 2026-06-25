@@ -297,11 +297,16 @@ Content-Length). The Ask body includes `SenderID` per the real capture.
   `read_full_response` (Content-Length-delimited, which is what Apple
   receivers send).
 
-**Gap / severity:** MEDIUM — sender Ask omits `SenderID` (see §4). Otherwise
-faithful.
+**Gap / severity:** MEDIUM — sender Ask omits `SenderID` (see §4). Also, the
+sender's `read_full_response` stopped at the first header terminator, so an
+interim `1xx` (e.g. `100 Continue`) from a real Apple receiver would be
+mistaken for the final response (RFC 7231 §6.2 violation).
 
-**RESULT:** Sender now includes `SenderID` in the Ask request. No other
-change.
+**RESULT:**
+- Sender now includes `SenderID` (`Value::Data`, 6 random bytes) in the Ask
+  request body, matching the real iOS-18 capture shape.
+- `read_full_response` now loops past interim `1xx` responses and returns the
+  first final (non-1xx) response, per RFC 7231 §6.2.
 
 ---
 
@@ -309,11 +314,16 @@ change.
 
 | Layer | Gap | Severity | Commit |
 |-------|-----|----------|--------|
-| §3/§6 | Expect: 100-continue not handled (deadlock risk) | HIGH | (below) |
-| §4b | mDNS `flags` default 1 → 0x06 + `--flags` CLI | MEDIUM | (below) |
-| §4/§7 | Ask request missing `SenderID` | MEDIUM | (below) |
-| §4 | media-caps JSON whitespace `{"Version": 1}` | LOW | (below) |
-| §6 | 406 response `Content-Type: application/x-cpio` | LOW | (below) |
-| §6 | `Connection: close` on all responses | LOW | (below) |
+| §3/§6 | Expect: 100-continue not handled (deadlock risk) | HIGH | `614818e` |
+| §4b | mDNS `flags` default 1 → 0x06 + `--flags` CLI | MEDIUM | `489ad0e` |
+| §4/§7 | Ask request missing `SenderID` | MEDIUM | `14b78ce` |
+| §4 | media-caps JSON whitespace `{"Version": 1}` | LOW | `9fa877c` |
+| §6 | 406 response `Content-Type: application/x-cpio` | LOW | `9fa877c` |
+| §6 | `Connection: close` on all responses | LOW | `9fa877c` |
+| §3/§7 | client must skip interim `1xx` responses (RFC 7231) | MEDIUM | `71a99c4` |
 
 Layers with no gap (§1 dvzip, §2 CPIO, §5 TLS) are left unchanged.
+
+Baseline → final: `cargo test -p luftlift-rs` 66 → **77 passed**;
+`cargo clippy -p luftlift-rs --all-targets -- -D warnings` clean throughout;
+release binary builds (`cargo build -p luftlift-rs --release`).
