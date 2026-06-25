@@ -2124,8 +2124,13 @@ pub mod state {
         pub peers: PeerTable,
         pub anchor_channel: u16,
         /// Own channel sequence as `(chan_num, opclass)` pairs. owl fills this
-        /// with the master channel via `awdl_chanseq_init_static`.
+        /// with the master channel via `awdl_chanseq_init_static`. When filin
+        /// syncs to a master, it adopts the master's sequence so they hop in
+        /// lockstep.
         pub channel_sequence: [[u8; 2]; CHANSEQ_LEN],
+        /// owl `state->channel.current` — the channel the monitor is currently
+        /// tuned to (0 = not yet set / null slot).
+        pub current_channel: u8,
         pub tx_seq: u16,
     }
 
@@ -2148,6 +2153,7 @@ pub mod state {
                 peers: PeerTable::new(),
                 anchor_channel,
                 channel_sequence: [[anchor_channel as u8, opclass]; CHANSEQ_LEN],
+                current_channel: 0,
                 tx_seq: 0,
             }
         }
@@ -2206,6 +2212,61 @@ pub mod state {
             // run election (owl awdl_clean_peers, core.c:333).
             self.peers.touch(src, rx_time_us);
             self.election.run(&self.peers.election_views());
+            // Adopt the elected master's channel sequence so filin hops to the
+            // same channels as the peer. When filin is self-master, keep the
+            // default static anchor sequence.
+            self.sync_channel_sequence();
+        }
+
+        /// If we have an elected master with a non-trivial channel sequence,
+        /// adopt it as our own. When we lose the master, revert to the static
+        /// anchor sequence. This ensures filin is on the same channel as the
+        /// peer during each EAW slot.
+        fn sync_channel_sequence(&mut self) {
+            let master = self.election.sync_addr;
+            if master == self.self_addr {
+                // self-master: use static anchor sequence
+                let opclass = chan_opclass(self.anchor_channel);
+                let anchor_seq = [[self.anchor_channel as u8, opclass]; CHANSEQ_LEN];
+                if self.channel_sequence != anchor_seq {
+                    self.channel_sequence = anchor_seq;
+                    tracing::debug!("reverted to static anchor channel sequence");
+                }
+            } else if let Some(peer) = self.peers.get(&master) {
+                // adopted master: copy its sequence if it has any non-null slots
+                if peer.sequence.iter().any(|s| s[0] != 0)
+                    && self.channel_sequence != peer.sequence
+                {
+                    self.channel_sequence = peer.sequence;
+                    tracing::info!(
+                        master = ?master,
+                        "adopted master channel sequence"
+                    );
+                }
+            }
+        }
+
+        /// owl `awdl_chan_num(state->channel.sequence[slot], enc)` — the channel
+        /// number for the current EAW slot from our own sequence.
+        pub fn desired_channel(&self, now_us: u64) -> u8 {
+            let slot = usize::from(self.sync.current_eaw(now_us) % CHANSEQ_LEN as u16);
+            self.channel_sequence[slot][0]
+        }
+
+        /// owl `awdl_switch_channel` decision (owl/daemon/core.c:279-308):
+        /// returns `Some(channel)` if the monitor must be retuned, `None` if
+        /// no switch is needed (same channel, or null slot).
+        pub fn update_channel(&mut self, now_us: u64) -> Option<u16> {
+            let desired = self.desired_channel(now_us);
+            if desired == self.current_channel {
+                return None;
+            }
+            self.current_channel = desired;
+            if desired > 0 {
+                Some(u16::from(desired))
+            } else {
+                None
+            }
         }
 
         /// owl `awdl_clean_peers` (owl/daemon/core.c:320-336): drop stale peers
@@ -2214,6 +2275,7 @@ pub mod state {
             let cutoff = now_us.saturating_sub(peers::PEER_TIMEOUT_US);
             let removed = self.peers.remove_stale(cutoff);
             self.election.run(&self.peers.election_views());
+            self.sync_channel_sequence();
             removed
         }
 
@@ -2389,6 +2451,85 @@ pub mod state {
             state.clean_peers(1_000 + peers::PEER_TIMEOUT_US + 1);
             assert!(state.peers.get(&peer_addr).is_none());
             assert_eq!(state.election.sync_addr, state.election.self_addr);
+        }
+
+        #[test]
+        fn adopts_master_channel_sequence_on_election() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+            // build a chanseq TLV value with mixed channels
+            let mut chanseq_val = vec![15, 3, 0, 3];
+            chanseq_val.extend_from_slice(&0xffffu16.to_le_bytes());
+            for i in 0..16 {
+                let ch = match i {
+                    0..=7 => 149u16,
+                    _ => 6u16,
+                };
+                chanseq_val.extend_from_slice(&ch.to_le_bytes());
+            }
+            let tlvs = vec![
+                election_v2_tlv(50, 200),
+                version_tlv(0x34, 1),
+                awdl::Tlv { kind: 18, value: &chanseq_val },
+            ];
+            state.apply_action(peer_addr, mif(), &tlvs, 1_000);
+
+            // filin should have adopted the master's sequence
+            assert_eq!(state.channel_sequence[0], [149, 0]); // chan 149
+            assert_eq!(state.channel_sequence[8], [6, 0]); // chan 6
+            assert_ne!(
+                state.channel_sequence[0],
+                [44, state.channel_sequence[0][1]]
+            );
+        }
+
+        #[test]
+        fn reverts_to_static_anchor_sequence_when_master_lost() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+            // adopt a master with a non-44 sequence
+            let mut chanseq_val = vec![15, 3, 0, 3];
+            chanseq_val.extend_from_slice(&0xffffu16.to_le_bytes());
+            for _ in 0..16 {
+                chanseq_val.extend_from_slice(&149u16.to_le_bytes());
+            }
+            let tlvs = vec![
+                election_v2_tlv(50, 200),
+                version_tlv(0x34, 1),
+                awdl::Tlv { kind: 18, value: &chanseq_val },
+            ];
+            state.apply_action(peer_addr, mif(), &tlvs, 1_000);
+            assert_eq!(state.channel_sequence[0][0], 149);
+
+            // master times out → revert to anchor (44)
+            state.clean_peers(1_000 + peers::PEER_TIMEOUT_US + 1);
+            assert_eq!(state.channel_sequence[0][0], 44);
+        }
+
+        #[test]
+        fn update_channel_detects_needed_switch() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            // current_channel starts at 0; desired is 44 (slot 0)
+            let switch = state.update_channel(0);
+            assert_eq!(switch, Some(44));
+            assert_eq!(state.current_channel, 44);
+
+            // calling again: no switch needed
+            assert_eq!(state.update_channel(0), None);
+        }
+
+        #[test]
+        fn desired_channel_reflects_sequence_slot() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            // put a null slot at position 1
+            state.channel_sequence[1] = [0, 0];
+
+            // slot 0 (t=0): channel 44
+            assert_eq!(state.desired_channel(0), 44);
+            // advance to EAW slot 1: 64 TU later = 65536 us
+            assert_eq!(state.desired_channel(65536), 0);
         }
     }
 }
