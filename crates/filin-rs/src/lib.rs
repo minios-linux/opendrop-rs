@@ -226,6 +226,17 @@ pub mod awdl {
         pub aw_counter: u16,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ElectionParametersV2 {
+        pub master_addr: [u8; 6],
+        pub sync_addr: [u8; 6],
+        pub master_counter: u32,
+        pub distance_to_master: u32,
+        pub master_metric: u32,
+        pub self_metric: u32,
+        pub self_counter: u32,
+    }
+
     pub fn parse_action_frame(body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
         if body.len() < 16 {
             return Err(ParseError::TooShort);
@@ -280,6 +291,12 @@ pub mod awdl {
             time_to_next_aw_tu,
             aw_counter,
         })
+    }
+
+    pub fn parse_election_parameters_v2(
+        _value: &[u8],
+    ) -> Result<ElectionParametersV2, ParseError> {
+        Err(ParseError::TooShort)
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
@@ -350,6 +367,34 @@ pub mod awdl {
                 SyncParameters {
                     time_to_next_aw_tu: 0x1234,
                     aw_counter: 0x5678
+                }
+            );
+        }
+
+        #[test]
+        fn parses_election_parameters_v2_tlv() {
+            let mut value = [0u8; 40];
+            value[0..6].copy_from_slice(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            value[6..12].copy_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+            value[12..16].copy_from_slice(&10u32.to_le_bytes());
+            value[16..20].copy_from_slice(&2u32.to_le_bytes());
+            value[20..24].copy_from_slice(&900u32.to_le_bytes());
+            value[24..28].copy_from_slice(&800u32.to_le_bytes());
+            value[36..40].copy_from_slice(&7u32.to_le_bytes());
+
+            let parsed =
+                parse_election_parameters_v2(&value).expect("valid election parameters v2 TLV");
+
+            assert_eq!(
+                parsed,
+                ElectionParametersV2 {
+                    master_addr: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                    sync_addr: [0x02, 0x11, 0x22, 0x33, 0x44, 0x55],
+                    master_counter: 10,
+                    distance_to_master: 2,
+                    master_metric: 900,
+                    self_metric: 800,
+                    self_counter: 7,
                 }
             );
         }
