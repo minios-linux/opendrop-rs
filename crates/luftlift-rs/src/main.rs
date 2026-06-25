@@ -9,6 +9,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use luftlift_rs::{
+    client::{FileToSend, RustlsTransport, SenderConfig, send_files},
     mdns, netutil, server, tls,
     plist_impl::ReceiverConfig,
 };
@@ -63,10 +64,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Receive { output } => receive(&cli.interface, output),
         Command::Find { duration } => find(duration),
-        Command::Send { recipient, file } => {
-            tracing::error!("send not yet implemented (recipient={recipient}, file={file:?})");
-            anyhow::bail!("send not yet implemented")
-        }
+        Command::Send { recipient, file } => send(&cli.interface, &recipient, file),
     }
 }
 
@@ -124,4 +122,86 @@ fn find(duration: u64) -> Result<()> {
 fn hostname() -> String {
     std::env::var("LUFTLIFT_NAME")
         .unwrap_or_else(|_| "luftlift".to_string())
+}
+
+/// Send a file to an AirDrop receiver. `recipient` is matched against mDNS
+/// instance names (a prefix match is enough; the full names are long).
+fn send(interface: &str, recipient: &str, file: PathBuf) -> Result<()> {
+    let data = std::fs::read(&file)?;
+    tracing::info!(file = %file.display(), bytes = data.len(), "loaded file to send");
+
+    // Resolve the recipient via mDNS (browse briefly, pick the matching peer).
+    tracing::info!(recipient, "browsing for receiver");
+    let peers = mdns::browse(Duration::from_secs(5))?;
+    let peer = peers
+        .iter()
+        .find(|p| p.name.contains(recipient))
+        .or_else(|| peers.first())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no AirDrop receiver matching '{recipient}' found \
+                 (Apple devices announce only while their sharing pane is open)"
+            )
+        })?;
+    let addr = peer
+        .addresses
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("receiver {recipient} has no resolved address"))?;
+    let port = peer.port;
+    tracing::info!(peer = %peer.name, %addr, port, "receiver found");
+
+    let _ = interface; // binding to the interface is implicit via the route table
+    let tls_config = Arc::new(tls::build_client_config()?);
+    let peer_addr = std::net::SocketAddr::new(*addr, port);
+    let mut transport = RustlsTransport::new(tls_config, peer_addr);
+
+    let sender = SenderConfig {
+        computer_name: hostname(),
+        model_name: "MacBookPro".into(),
+        bundle_id: "com.luftlift.app".into(),
+    };
+    let file_name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let files = vec![FileToSend {
+        name: file_name,
+        uti_type: uti_for(&file).to_string(),
+        data,
+    }];
+    let transfer_id = format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        rand_u32(), rand_u16(), rand_u16(), rand_u16(), rand_u64() & 0xFFFFFFFFFFFF);
+    send_files(&mut transport, &sender, &files, &transfer_id)?;
+    println!("Send complete.");
+    Ok(())
+}
+
+/// Best-effort UTI type from a file extension.
+fn uti_for(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("jpg") | Some("jpeg") => "public.jpeg",
+        Some("png") => "public.png",
+        Some("heic") => "public.heic",
+        Some("gif") => "com.compuserve.gif",
+        Some("mov") => "com.apple.quicktime-movie",
+        Some("mp4") => "public.mpeg-4",
+        Some("pdf") => "com.adobe.pdf",
+        Some("webloc") => "com.apple.web-internet-location",
+        _ => "public.data",
+    }
+}
+
+fn rand_u32() -> u32 {
+    use std::time::SystemTime;
+    let s = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    (s.subsec_nanos()) ^ (s.as_secs() as u32)
+}
+fn rand_u16() -> u16 {
+    (rand_u32() & 0xFFFF) as u16
+}
+fn rand_u64() -> u64 {
+    use std::time::SystemTime;
+    let s = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    s.as_nanos() as u64
 }

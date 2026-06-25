@@ -176,6 +176,90 @@ pub fn send_files(
     Ok(())
 }
 
+// ---- real TLS transport ----
+
+use crate::http::{format_request, parse_response};
+use rustls::ClientConfig;
+use std::io::BufReader;
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
+
+/// A real HTTP-over-TLS transport targeting a single AirDrop receiver.
+/// Opens one TLS TCP connection per request (matching the AirDrop flow where
+/// each POST is a fresh connection from the sender).
+pub struct RustlsTransport {
+    config: Arc<ClientConfig>,
+    peer: SocketAddr,
+}
+
+impl RustlsTransport {
+    pub fn new(config: Arc<ClientConfig>, peer: SocketAddr) -> Self {
+        Self { config, peer }
+    }
+}
+
+impl AirDropTransport for RustlsTransport {
+    fn send(&mut self, req: &HttpRequest) -> Result<HttpResponse> {
+        // Fresh connection per request (AirDrop sender opens new TLS each time).
+        let tcp = TcpStream::connect(self.peer)?;
+        let server_name = rustls::pki_types::ServerName::try_from("airdrop")?;
+        let conn = rustls::ClientConnection::new(self.config.clone(), server_name)?;
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+
+        // Write request, shutdown write half so the server sees EOF / flush.
+        let wire = format_request(req);
+        use std::io::Write as _;
+        tls.write_all(&wire)?;
+
+        // Read the full response.
+        let mut reader = BufReader::new(&mut tls);
+        let raw = read_full_response(&mut reader)?;
+        let resp = parse_response(&raw)?;
+        Ok(resp)
+    }
+}
+
+/// Read a full HTTP response (status line + headers + Content-Length body)
+/// from a BufRead. Mirrors `server::read_full_request` but for responses.
+fn read_full_response(reader: &mut impl std::io::BufRead) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&line);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        anyhow::bail!("connection closed before response headers complete");
+    }
+    // Read Content-Length-delimited body.
+    let head = std::str::from_utf8(&buf).unwrap_or("");
+    if let Some(cl) = parse_header_value(head, "content-length") {
+        let len: usize = cl.parse().unwrap_or(0);
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body)?;
+        buf.extend_from_slice(&body);
+    }
+    Ok(buf)
+}
+
+fn parse_header_value(headers: &str, name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    for line in headers.split("\r\n") {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().to_ascii_lowercase() == lower {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
