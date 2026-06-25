@@ -5864,9 +5864,85 @@ pub mod introspect {
     //! The hot path updates atomic counters and refreshes a `RwLock` snapshot;
     //! the HTTP thread reads — it never blocks the AF_PACKET inject/receive
     //! loop.
+    //!
+    //! Lock-free where it matters: hot-loop bumps are `AtomicU64::fetch_add`.
+    //! Snapshot reads on the HTTP path take a brief `RwLock::read`; snapshot
+    //! writes on the hot path are throttled to ~10 Hz.
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Hot-path counters for the introspection API. Every field is a plain
+    /// `AtomicU64` so the AF_PACKET loop can bump them without taking a lock.
+    /// Reads happen only from the HTTP thread.
+    #[derive(Debug)]
+    pub struct Counters {
+        mdns_rx_self: AtomicU64,
+        mdns_rx_other: AtomicU64,
+        /// Per-channel rebroadcast counts for the AWDL social channels
+        /// (6 / 44 / 149). Stored as `(channel, count)` pairs so the JSON
+        /// serializer can emit them as a `{"6": N, "44": N, "149": N}` map.
+        rebroadcast: [(u8, AtomicU64); 3],
+    }
+
+    impl Default for Counters {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Counters {
+        pub const fn new() -> Self {
+            Self {
+                mdns_rx_self: AtomicU64::new(0),
+                mdns_rx_other: AtomicU64::new(0),
+                rebroadcast: [
+                    (6, AtomicU64::new(0)),
+                    (44, AtomicU64::new(0)),
+                    (149, AtomicU64::new(0)),
+                ],
+            }
+        }
+
+        pub fn inc_mdns_rx_self(&self) {
+            self.mdns_rx_self.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn inc_mdns_rx_other(&self) {
+            self.mdns_rx_other.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn inc_rebroadcast(&self, channel: u8) {
+            if let Some((_, c)) = self.rebroadcast.iter().find(|(ch, _)| *ch == channel) {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        pub fn mdns_rx_self(&self) -> u64 {
+            self.mdns_rx_self.load(Ordering::Relaxed)
+        }
+
+        pub fn mdns_rx_other(&self) -> u64 {
+            self.mdns_rx_other.load(Ordering::Relaxed)
+        }
+
+        pub fn rebroadcast_for(&self, channel: u8) -> u64 {
+            self.rebroadcast
+                .iter()
+                .find(|(ch, _)| *ch == channel)
+                .map(|(_, c)| c.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        }
+
+        pub fn rebroadcast_pairs(&self) -> Vec<(u8, u64)> {
+            self.rebroadcast
+                .iter()
+                .map(|(ch, c)| (*ch, c.load(Ordering::Relaxed)))
+                .collect()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::Counters;
+        use super::*;
 
         #[test]
         fn counters_start_at_zero_for_social_channels() {
