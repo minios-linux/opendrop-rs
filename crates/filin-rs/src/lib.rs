@@ -827,3 +827,40 @@ pub mod tx {
         }
     }
 }
+
+pub mod iface {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Config {
+        pub monitor_iface: String,
+        pub host_iface: String,
+        pub anchor_channel: u16,
+        pub assume_monitor: bool,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ConfigError {
+        MissingMonitorInterface,
+        UnsupportedAnchorChannel(u16),
+    }
+
+    pub fn validate_config(_config: Config) -> Result<Config, ConfigError> {
+        unimplemented!("RED: iface config validation not implemented yet")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn accepts_default_awdl0_channel_44_config() {
+            let config = Config {
+                monitor_iface: "wlan0mon".into(),
+                host_iface: "awdl0".into(),
+                anchor_channel: 44,
+                assume_monitor: true,
+            };
+
+            assert_eq!(validate_config(config.clone()), Ok(config));
+        }
+    }
+}
