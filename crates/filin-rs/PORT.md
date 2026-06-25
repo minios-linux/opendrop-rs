@@ -99,6 +99,39 @@ Key types: `schedule::master_anchor_channel`, `schedule::rebroadcast_channels`,
 `state::AwdlState::master_anchor`. All read at runtime — no hardcoded channel
 numbers beyond the AWDL social baseline.
 
+## Sync-quality metrics + master-adoption hysteresis (FILIN_SYNC_QUALITY.md)
+Live iPhone debugging showed the AWDL cluster here has **5 Apple devices churning
+as master**. Key refinement: what filin logs as "master" is `election.sync_addr`
+(our PARENT peer), NOT `election.master_addr` (the cluster's TOP master). The
+apparent churn is re-PARENTING among peers sharing one `master_addr`.
+
+**/status now distinguishes both** (Part A):
+- `master_mac` = cluster top master (`master_addr`, the stable one).
+- `sync_addr_mac` = our direct parent (`sync_addr`, which re-parents as filin
+  hops and hears different peer subsets).
+- `master_addr_changes` / `sync_addr_changes` — separate change counters so you
+  can prove `master_addr` is stable while `sync_addr` churns.
+- `tsf_offset_us`, `master_age_ms`, `aw_alignment_pct`, `last_master_macs` —
+  the rest of the sync-quality surface.
+
+**Single-channel park mode** (the bigger pivot; opt-in via `--park`):
+- The carl9170 is a DEDICATED monitor — it doesn't share a radio with infra like
+  a real Apple device, so hopping is only needed to time-share, which we don't
+  need to do. `--park` makes filin **stop hopping** and stay fixed on ONE
+  channel = the stable top master's anchor (`park_channel()`, keyed off
+  `master_addr` NOT the churning `sync_addr`). Maximizes presence on the
+  iPhone's primary channel, always-listens (catches all inbound), and sidesteps
+  the re-parenting channel thrash entirely. AW timing is kept so announces still
+  transmit during availability windows. Default remains the hopping mode.
+
+**Re-parent hysteresis keyed on master_addr** (Part B):
+- In `sync_channel_sequence`, when the election winner is a different peer but
+  reports the SAME `master_addr` as the current committed parent (and that
+  parent is still alive), filin does NOT re-parent — it rides through the
+  intra-cluster churn. Only a real `master_addr` change or the current parent
+  going stale allows a re-sync. Cross-cluster switches still go through the
+  existing Bug B debounce (`MASTER_DEBOUNCE_US`).
+
 Coordinate with Claude (orchestrator) for: workspace dep additions, the awdl0
 contract, and anything that would touch shared files. Keep all your code under
 `crates/filin-rs/`.
