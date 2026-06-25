@@ -2081,11 +2081,12 @@ pub mod state {
         }
 
         /// owl `awdl_clean_peers` (owl/daemon/core.c:320-336): drop stale peers
-        /// then re-run election.
-        pub fn clean_peers(&mut self, now_us: u64) {
+        /// then re-run election. Returns the removed peer addresses.
+        pub fn clean_peers(&mut self, now_us: u64) -> Vec<[u8; 6]> {
             let cutoff = now_us.saturating_sub(peers::PEER_TIMEOUT_US);
-            self.peers.remove_stale(cutoff);
+            let removed = self.peers.remove_stale(cutoff);
             self.election.run(&self.peers.election_views());
+            removed
         }
 
         /// owl `awdl_state_next_sequence_number` (owl/src/state.c:79-81).
@@ -2326,24 +2327,27 @@ pub mod runtime {
 
     pub fn run(mut links: Links) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
-        let mut sync = crate::sync::SyncState::new(host_time_us());
-        let mut tx_seq = 0u16;
+        let mut awdl_state = crate::state::AwdlState::new(
+            links.self_addr,
+            hostname(),
+            links.anchor_channel,
+            host_time_us(),
+        );
         let mut announce = AnnounceScheduler::new(host_time_us());
         let mut wlan_buf = vec![0u8; 4096];
         let mut tap_buf = vec![0u8; 2048];
 
         loop {
             let now_us = host_time_us();
+            if announce.clean_due(now_us) {
+                let removed = awdl_state.clean_peers(now_us);
+                if !removed.is_empty() {
+                    tracing::info!(removed = removed.len(), peers = awdl_state.peers.len(), "peer table cleaned");
+                }
+            }
             for subtype in announce.due(now_us) {
-                let frame = build_announce_frame(
-                    subtype,
-                    links.self_addr,
-                    tx_seq << 4,
-                    now_us,
-                    &sync,
-                    links.anchor_channel,
-                );
-                tx_seq = tx_seq.wrapping_add(1);
+                let seq = awdl_state.next_data_seq();
+                let frame = build_announce_frame(subtype, &awdl_state, seq << 4, now_us);
                 match links.packet.send(&frame) {
                     Ok(sent) => tracing::trace!(sent, ?subtype, "injected awdl announce frame"),
                     Err(err) => tracing::trace!(?err, ?subtype, "packet announce send failed"),
@@ -2376,13 +2380,18 @@ pub mod runtime {
                         let now_us = host_time_us();
                         match rx::parse_action_frame(&wlan_buf[..len], now_us, &mut bridge) {
                             Ok(frame) => {
-                                for tlv in &frame.tlvs {
-                                    handle_action_tlv(tlv, frame.rx_time_us, &mut sync);
-                                }
+                                let src = frame.source;
+                                let subtype = frame.action.subtype;
+                                let rx_time_us = frame.rx_time_us;
+                                let rssi_dbm = frame.rssi_dbm;
+                                let tlv_count = frame.tlvs.len();
+                                awdl_state.apply_action(src, subtype, &frame.tlvs, rx_time_us);
                                 tracing::trace!(
-                                    rx_time_us = frame.rx_time_us,
-                                    rssi_dbm = frame.rssi_dbm,
-                                    tlv_count = frame.tlvs.len(),
+                                    rx_time_us,
+                                    rssi_dbm,
+                                    tlv_count,
+                                    master = ?awdl_state.election.master_addr,
+                                    peers = awdl_state.peers.len(),
                                     "rx awdl action frame"
                                 );
                             }
@@ -2426,16 +2435,16 @@ pub mod runtime {
                 if len >= 14 {
                     let dst = mac_from_slice(&tap_buf[0..6]);
                     let src = mac_from_slice(&tap_buf[6..12]);
-                    match awdl::encapsulate_ethernet_payload(&tap_buf[..len], tx_seq) {
+                    match awdl::encapsulate_ethernet_payload(&tap_buf[..len], awdl_state.tx_seq) {
                         Ok(body) => {
+                            let seq = awdl_state.next_data_seq();
                             let frame = radiotap_prefixed(ieee80211::build_data_frame(
                                 dst,
                                 src,
                                 AWDL_BSSID,
-                                tx_seq << 4,
+                                seq << 4,
                                 &body,
                             ));
-                            tx_seq = tx_seq.wrapping_add(1);
                             match links.packet.send(&frame) {
                                 Ok(sent) => tracing::trace!(sent, "injected awdl data frame"),
                                 Err(err) => tracing::trace!(?err, "packet send failed"),
@@ -2456,6 +2465,9 @@ pub mod runtime {
 
     const TU_US: u64 = 1024;
     const PSF_INTERVAL_TU: u64 = 110;
+    /// owl `PSF_INTERVAL_MASTER_TU` is 110; slave is 440. owl clean interval
+    /// (`PEERS_DEFAULT_CLEAN_INTERVAL`) = 1 000 000 us (owl/src/peers.c:29).
+    const CLEAN_INTERVAL_US: u64 = 1_000_000;
     const AWDL_BROADCAST: [u8; 6] = [0xff; 6];
     const AWDL_BSSID: [u8; 6] = [0x00, 0x25, 0x00, 0xff, 0x94, 0x73];
 
@@ -2463,6 +2475,7 @@ pub mod runtime {
     struct AnnounceScheduler {
         next_psf_us: u64,
         next_mif_us: u64,
+        next_clean_us: u64,
     }
 
     impl AnnounceScheduler {
@@ -2470,13 +2483,27 @@ pub mod runtime {
             Self {
                 next_psf_us: now_us + PSF_INTERVAL_TU * TU_US,
                 next_mif_us: now_us + 32 * TU_US,
+                next_clean_us: now_us + CLEAN_INTERVAL_US,
             }
         }
 
         fn poll_timeout_ms(&self, now_us: u64) -> i32 {
-            let next = self.next_psf_us.min(self.next_mif_us);
+            let next = self.next_psf_us.min(self.next_mif_us).min(self.next_clean_us);
             let delta_us = next.saturating_sub(now_us);
             delta_us.div_ceil(1_000).min(i32::MAX as u64) as i32
+        }
+
+        /// owl `awdl_clean_peers` timer (owl/daemon/core.c:320-336) fires every
+        /// `CLEAN_INTERVAL_US`.
+        fn clean_due(&mut self, now_us: u64) -> bool {
+            if now_us >= self.next_clean_us {
+                while self.next_clean_us <= now_us {
+                    self.next_clean_us += CLEAN_INTERVAL_US;
+                }
+                true
+            } else {
+                false
+            }
         }
 
         fn due(&mut self, now_us: u64) -> Vec<awdl::ActionSubtype> {
@@ -2500,17 +2527,15 @@ pub mod runtime {
 
     fn build_announce_frame(
         subtype: awdl::ActionSubtype,
-        self_addr: [u8; 6],
+        awdl_state: &crate::state::AwdlState,
         sequence_control: u16,
         now_us: u64,
-        sync: &crate::sync::SyncState,
-        anchor_channel: u16,
     ) -> Vec<u8> {
-        let tlvs = build_announce_tlvs(subtype, self_addr, now_us, sync, anchor_channel);
+        let tlvs = build_announce_tlvs(subtype, awdl_state, now_us);
         let action = awdl::build_action_body(subtype, now_us as u32, now_us as u32, &tlvs);
         let frame = ieee80211::build_management_action_frame(
             AWDL_BROADCAST,
-            self_addr,
+            awdl_state.self_addr,
             AWDL_BSSID,
             sequence_control,
             &action,
@@ -2520,43 +2545,41 @@ pub mod runtime {
 
     fn build_announce_tlvs(
         subtype: awdl::ActionSubtype,
-        self_addr: [u8; 6],
+        awdl_state: &crate::state::AwdlState,
         now_us: u64,
-        sync: &crate::sync::SyncState,
-        anchor_channel: u16,
     ) -> Vec<u8> {
         let mut tlvs = Vec::new();
         push_tlv(
             &mut tlvs,
             4,
-            &build_sync_parameters_tlv_value(self_addr, now_us, sync, anchor_channel),
+            &build_sync_parameters_tlv_value(awdl_state, now_us),
         );
         push_tlv(
             &mut tlvs,
             5,
-            &build_election_parameters_tlv_value(self_addr),
+            &build_election_parameters_tlv_value(&awdl_state.election),
         );
         push_tlv(
             &mut tlvs,
             18,
-            &build_channel_sequence_tlv_value(anchor_channel),
+            &build_channel_sequence_tlv_value(&awdl_state.channel_sequence),
         );
         push_tlv(
             &mut tlvs,
             24,
-            &build_election_parameters_v2_tlv_value(self_addr),
+            &build_election_parameters_v2_tlv_value(&awdl_state.election),
         );
         push_tlv(&mut tlvs, 6, &build_service_parameters_tlv_value());
         if subtype == awdl::ActionSubtype::Mif {
             push_tlv(&mut tlvs, 7, &build_ht_capabilities_tlv_value());
-            push_tlv(&mut tlvs, 16, &build_arpa_tlv_value());
+            push_tlv(&mut tlvs, 16, &build_arpa_tlv_value(&awdl_state.name));
         }
         push_tlv(
             &mut tlvs,
             12,
-            &build_data_path_state_tlv_value(self_addr, anchor_channel),
+            &build_data_path_state_tlv_value(awdl_state.self_addr, awdl_state.anchor_channel),
         );
-        push_tlv(&mut tlvs, 21, &build_version_tlv_value());
+        push_tlv(&mut tlvs, 21, &build_version_tlv_value(awdl_state.version, awdl_state.dev_class));
         tlvs
     }
 
@@ -2573,83 +2596,92 @@ pub mod runtime {
     }
 
     fn build_sync_parameters_tlv_value(
-        self_addr: [u8; 6],
+        awdl_state: &crate::state::AwdlState,
         now_us: u64,
-        sync: &crate::sync::SyncState,
-        anchor_channel: u16,
     ) -> Vec<u8> {
+        let sync = &awdl_state.sync;
         let next_aw_tu = sync.next_aw_tu(now_us);
         let aw_period = sync.aw_period_tu;
         let presence_mode = sync.presence_mode as u8;
         let eaw_len_tu = u16::from(presence_mode) * aw_period;
         let elapsed_in_eaw_tu = eaw_len_tu.saturating_sub(next_aw_tu);
         let remaining_aw_length = aw_period.saturating_sub(elapsed_in_eaw_tu);
-        let channel = anchor_channel as u8;
+        let channel = awdl_state.anchor_channel as u8;
         let mut value = Vec::with_capacity(73);
-        value.push(channel);
-        value.extend_from_slice(&next_aw_tu.to_le_bytes());
-        value.push(channel);
-        value.push(0);
-        value.extend_from_slice(&aw_period.to_le_bytes());
-        value.extend_from_slice(&(PSF_INTERVAL_TU as u16).to_le_bytes());
-        value.extend_from_slice(&0x1800u16.to_le_bytes());
-        value.extend_from_slice(&aw_period.to_le_bytes());
-        value.extend_from_slice(&aw_period.to_le_bytes());
+        value.push(channel); // next_aw_channel
+        value.extend_from_slice(&next_aw_tu.to_le_bytes()); // tx_down_counter
+        value.push(channel); // master_channel
+        value.push(0); // guard_time
+        value.extend_from_slice(&aw_period.to_le_bytes()); // aw_period
+        value.extend_from_slice(&(PSF_INTERVAL_TU as u16).to_le_bytes()); // af_period
+        value.extend_from_slice(&0x1800u16.to_le_bytes()); // flags
+        value.extend_from_slice(&aw_period.to_le_bytes()); // aw_ext_length
+        value.extend_from_slice(&aw_period.to_le_bytes()); // aw_com_length
         value.extend_from_slice(&remaining_aw_length.to_le_bytes());
-        value.push(presence_mode - 1);
-        value.push(presence_mode - 1);
-        value.push(presence_mode - 1);
-        value.push(presence_mode - 1);
-        value.extend_from_slice(&self_addr);
-        value.push(presence_mode);
-        value.push(0);
-        value.extend_from_slice(&sync.current_aw(now_us).to_le_bytes());
-        value.extend_from_slice(&sync.current_aw(now_us).to_le_bytes());
-        value.extend_from_slice(&build_channel_sequence_value(anchor_channel));
-        value.extend_from_slice(&[0, 0]);
+        value.push(presence_mode - 1); // min_ext
+        value.push(presence_mode - 1); // max_ext_multicast
+        value.push(presence_mode - 1); // max_ext_unicast
+        value.push(presence_mode - 1); // max_ext_af
+        value.extend_from_slice(&awdl_state.election.master_addr); // master_addr
+        value.push(presence_mode); // presence_mode
+        value.push(0); // reserved
+        value.extend_from_slice(&sync.current_aw(now_us).to_le_bytes()); // next_aw_seq
+        value.extend_from_slice(&sync.current_aw(now_us).to_le_bytes()); // ap_alignment
+        value.extend_from_slice(&build_channel_sequence_value(&awdl_state.channel_sequence));
+        value.extend_from_slice(&[0, 0]); // padding
         value
     }
 
-    fn build_channel_sequence_tlv_value(anchor_channel: u16) -> Vec<u8> {
-        let mut value = build_channel_sequence_value(anchor_channel);
-        value.extend_from_slice(&[0, 0, 0]);
+    fn build_channel_sequence_tlv_value(channel_sequence: &[[u8; 2]; 16]) -> Vec<u8> {
+        let mut value = build_channel_sequence_value(channel_sequence);
+        value.extend_from_slice(&[0, 0, 0]); // padding (owl awdl_init_chanseq_tlv)
         value
     }
 
-    fn build_channel_sequence_value(anchor_channel: u16) -> Vec<u8> {
+    /// owl `awdl_init_chanseq` (owl/src/tx.c:80-96): count=15, encoding=3
+    /// (OPCLASS), duplicate_count=0, step_count=3, fill=0xffff, then 16
+    /// `(chan_num, opclass)` pairs.
+    fn build_channel_sequence_value(channel_sequence: &[[u8; 2]; 16]) -> Vec<u8> {
         let mut value = Vec::with_capacity(38);
-        value.extend_from_slice(&[15, 2, 0, 3]);
+        value.extend_from_slice(&[15, 3, 0, 3]);
         value.extend_from_slice(&0xffffu16.to_le_bytes());
-        for _ in 0..16 {
-            value.extend_from_slice(&anchor_channel.to_le_bytes());
+        for slot in channel_sequence.iter() {
+            value.extend_from_slice(slot);
         }
         value
     }
 
-    fn build_election_parameters_tlv_value(self_addr: [u8; 6]) -> Vec<u8> {
+    /// owl `awdl_init_election_params_tlv` (owl/src/tx.c:166-186): flags, id,
+    /// distancetop(=height), unknown, master_addr, master_metric, self_metric.
+    fn build_election_parameters_tlv_value(
+        election: &crate::election::ElectionState,
+    ) -> Vec<u8> {
         let mut value = Vec::with_capacity(21);
-        value.push(0);
-        value.extend_from_slice(&0u16.to_le_bytes());
-        value.push(0);
-        value.push(0);
-        value.extend_from_slice(&self_addr);
-        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
-        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
-        value.extend_from_slice(&[0, 0]);
+        value.push(0); // flags
+        value.extend_from_slice(&0u16.to_le_bytes()); // id
+        value.push(election.height as u8); // distancetop
+        value.push(0); // unknown
+        value.extend_from_slice(&election.master_addr);
+        value.extend_from_slice(&election.master_metric.to_le_bytes());
+        value.extend_from_slice(&election.self_metric.to_le_bytes());
+        value.extend_from_slice(&[0, 0]); // pad
         value
     }
 
-    fn build_election_parameters_v2_tlv_value(self_addr: [u8; 6]) -> Vec<u8> {
+    /// owl `awdl_init_election_params_v2_tlv` (owl/src/tx.c:188-206).
+    fn build_election_parameters_v2_tlv_value(
+        election: &crate::election::ElectionState,
+    ) -> Vec<u8> {
         let mut value = Vec::with_capacity(40);
-        value.extend_from_slice(&self_addr);
-        value.extend_from_slice(&self_addr);
-        value.extend_from_slice(&1u32.to_le_bytes());
-        value.extend_from_slice(&0u32.to_le_bytes());
-        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
-        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
-        value.extend_from_slice(&0u32.to_le_bytes());
-        value.extend_from_slice(&0u32.to_le_bytes());
-        value.extend_from_slice(&1u32.to_le_bytes());
+        value.extend_from_slice(&election.master_addr);
+        value.extend_from_slice(&election.sync_addr);
+        value.extend_from_slice(&election.master_counter.to_le_bytes());
+        value.extend_from_slice(&election.height.to_le_bytes()); // distance_to_master
+        value.extend_from_slice(&election.master_metric.to_le_bytes());
+        value.extend_from_slice(&election.self_metric.to_le_bytes());
+        value.extend_from_slice(&0u32.to_le_bytes()); // unknown
+        value.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        value.extend_from_slice(&election.self_counter.to_le_bytes());
         value
     }
 
@@ -2661,13 +2693,12 @@ pub mod runtime {
         [0x00, 0x00, 0xce, 0x11, 0x1b, 0xff, 0x00, 0x00]
     }
 
-    fn build_arpa_tlv_value() -> Vec<u8> {
-        let name = b"filin";
+    fn build_arpa_tlv_value(name: &str) -> Vec<u8> {
         let mut value = Vec::with_capacity(2 + name.len() + 2);
-        value.push(3);
+        value.push(3); // flags
         value.push(name.len() as u8);
-        value.extend_from_slice(name);
-        value.extend_from_slice(&0xc00cu16.to_be_bytes());
+        value.extend_from_slice(name.as_bytes());
+        value.extend_from_slice(&0xc00cu16.to_be_bytes()); // .local
         value
     }
 
@@ -2681,8 +2712,8 @@ pub mod runtime {
         value
     }
 
-    fn build_version_tlv_value() -> [u8; 2] {
-        [0x34, 1]
+    fn build_version_tlv_value(version: u8, devclass: u8) -> [u8; 2] {
+        [version, devclass]
     }
 
     fn social_channel_bits(anchor_channel: u16) -> u16 {
@@ -2692,10 +2723,6 @@ pub mod runtime {
             149 => 0x0004,
             _ => 0,
         }
-    }
-
-    fn self_metric(self_addr: [u8; 6]) -> u32 {
-        0x8000_0000 | u32::from_be_bytes([self_addr[2], self_addr[3], self_addr[4], self_addr[5]])
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -2740,51 +2767,6 @@ pub mod runtime {
         out
     }
 
-    fn handle_action_tlv(tlv: &awdl::Tlv<'_>, rx_time_us: u64, sync: &mut crate::sync::SyncState) {
-        match tlv.kind {
-            4 => {
-                if let Ok(params) = awdl::parse_sync_parameters(tlv.value) {
-                    let error_tu = sync.sync_error_tu(
-                        rx_time_us,
-                        params.time_to_next_aw_tu,
-                        params.aw_counter,
-                    );
-                    sync.update_from_master(
-                        rx_time_us,
-                        params.time_to_next_aw_tu,
-                        params.aw_counter,
-                    );
-                    tracing::trace!(
-                        error_tu,
-                        aw_counter = params.aw_counter,
-                        time_to_next_aw_tu = params.time_to_next_aw_tu,
-                        "sync_error"
-                    );
-                }
-            }
-            18 => {
-                if let Ok(sequence) = awdl::parse_channel_sequence(tlv.value) {
-                    tracing::trace!(
-                        encoding = sequence.encoding,
-                        channels = ?sequence.channels,
-                        "peer channel sequence"
-                    );
-                }
-            }
-            24 => {
-                if let Ok(election) = awdl::parse_election_parameters_v2(tlv.value) {
-                    tracing::trace!(
-                        master_metric = election.master_metric,
-                        self_metric = election.self_metric,
-                        distance_to_master = election.distance_to_master,
-                        "peer election v2"
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn host_time_us() -> u64 {
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -2796,6 +2778,18 @@ pub mod runtime {
             return 0;
         }
         (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
+    }
+
+    /// owl `gethostname` for the ARPA TLV peer name (owl/daemon/core.c:362-364).
+    fn hostname() -> String {
+        let mut buf = [0u8; 256];
+        // SAFETY: buf is valid writable memory for gethostname.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc < 0 {
+            return String::from("filin");
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
     }
 
     #[cfg(test)]
@@ -2812,17 +2806,19 @@ pub mod runtime {
             assert_eq!(scheduler.due(1_112_640), vec![awdl::ActionSubtype::Psf]);
         }
 
+        fn demo_state() -> crate::state::AwdlState {
+            crate::state::AwdlState::new(
+                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                "filin".into(),
+                44,
+                1_000_000,
+            )
+        }
+
         #[test]
         fn builds_broadcast_psf_announce_frame() {
-            let sync = crate::sync::SyncState::new(1_000_000);
-            let frame = build_announce_frame(
-                awdl::ActionSubtype::Psf,
-                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-                0x0120,
-                1_000_000,
-                &sync,
-                44,
-            );
+            let state = demo_state();
+            let frame = build_announce_frame(awdl::ActionSubtype::Psf, &state, 0x0120, 1_000_000);
             let radiotap = radiotap::parse_header(&frame).expect("valid tx radiotap header");
             assert_eq!(radiotap.header_len, 9);
             let mac = ieee80211::parse_mac_header(radiotap.payload).expect("valid action header");
@@ -2844,19 +2840,49 @@ pub mod runtime {
             assert!(tlvs.iter().any(|tlv| tlv.kind == 21));
             assert!(!tlvs.iter().any(|tlv| tlv.kind == 7));
             assert!(!tlvs.iter().any(|tlv| tlv.kind == 16));
+            // chanseq TLV now uses owl OPCLASS encoding (3) with opclass byte 0x80.
+            let chanseq = tlvs.iter().find(|t| t.kind == 18).unwrap().value;
+            assert_eq!(chanseq[1], 3); // encoding = OPCLASS
+            assert_eq!(&chanseq[6..8], &[44, 0x80]); // first slot (chan 44, opclass 0x80)
+        }
+
+        #[test]
+        fn announce_election_tlvs_carry_real_state() {
+            let mut state = demo_state();
+            // adopt a peer as master so the election state is non-default
+            let peer_addr = [0x02, 0, 0, 0, 0, 9];
+            let mut v2 = vec![0u8; 40];
+            v2[0..6].copy_from_slice(&peer_addr);
+            v2[6..12].copy_from_slice(&peer_addr);
+            v2[12..16].copy_from_slice(&77u32.to_le_bytes());
+            v2[16..20].copy_from_slice(&1u32.to_le_bytes()); // distance -> height
+            v2[20..24].copy_from_slice(&333u32.to_le_bytes());
+            v2[24..28].copy_from_slice(&60u32.to_le_bytes());
+            v2[36..40].copy_from_slice(&5u32.to_le_bytes());
+            let version = awdl::Tlv { kind: 21, value: &[0x34, 1] };
+            let v2_tlv = awdl::Tlv { kind: 24, value: &v2 };
+            state.apply_action(peer_addr, awdl::ActionSubtype::Mif, &[version, v2_tlv], 1_100_000);
+
+            let frame = build_announce_frame(awdl::ActionSubtype::Psf, &state, 0, 1_200_000);
+            let radiotap = radiotap::parse_header(&frame).expect("valid tx radiotap");
+            let mac = ieee80211::parse_mac_header(radiotap.payload).expect("valid action header");
+            let action = awdl::parse_action_frame(mac.body).expect("valid awdl action");
+            let tlvs = awdl::parse_tlvs(action.tlvs).expect("valid announce TLVs");
+
+            // sync-params TLV master_addr must be the elected master, not self.
+            let sync = tlvs.iter().find(|t| t.kind == 4).unwrap().value;
+            assert_eq!(&sync[21..27], &peer_addr);
+            // election v2 TLV reflects adopted master/counter/height.
+            let ev2 = tlvs.iter().find(|t| t.kind == 24).unwrap().value;
+            assert_eq!(&ev2[0..6], &peer_addr); // master_addr
+            assert_eq!(&ev2[6..12], &peer_addr); // sync_addr
+            assert_eq!(u32::from_le_bytes(ev2[12..16].try_into().unwrap()), 77); // master_counter
         }
 
         #[test]
         fn builds_mif_with_owl_extra_tlvs() {
-            let sync = crate::sync::SyncState::new(1_000_000);
-            let frame = build_announce_frame(
-                awdl::ActionSubtype::Mif,
-                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
-                0x0120,
-                1_000_000,
-                &sync,
-                44,
-            );
+            let state = demo_state();
+            let frame = build_announce_frame(awdl::ActionSubtype::Mif, &state, 0x0120, 1_000_000);
             let radiotap = radiotap::parse_header(&frame).expect("valid tx radiotap header");
             let mac = ieee80211::parse_mac_header(radiotap.payload).expect("valid action header");
             let action = awdl::parse_action_frame(mac.body).expect("valid awdl action");
