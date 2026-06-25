@@ -90,6 +90,18 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 4 (filin sync+TSFT bridge DONE; luftlift on TLS).
+- filin (gpt-5.5): election (metric + tie-break) green; sync-update-from-hw-timestamp
+  green; **TSFT bridge green** (the critical jitter-rejection / TSF->derived offset —
+  matches docs/awdl-sync.md). Next: sync error calc + channel slot logic, then TX/awdl0.
+- luftlift (GLM-5.2): /Discover //Ask /Upload handlers green. Now on M5 TLS cert gen
+  (rcgen 0.13 generate_simple_self_signed -> rustls ServerConfig), then server loop,
+  mDNS announce (mdns-sd), wire receive flow in main.rs. Adding rcgen/rustls to its
+  OWN crate Cargo.toml — autonomous, no blocker. If it asks for a SHARED dep, hoist
+  to [workspace.dependencies].
+- Watch next: luftlift compiling against rcgen 0.13 (API churn risk) — if it thrashes
+  on the rcgen API >2 cycles, that's a real blocker worth a nudge with the exact API.
+--- (prior cycle notes below) ---
 Last updated: cycle 3 (election algo + airdrop handlers underway).
 - filin (gpt-5.5): all AWDL TLV parsers (action hdr, TLVs, sync-params, election-v2,
   channel-seq) green. Now into the ELECTION ALGORITHM ('elect higher metric master'
