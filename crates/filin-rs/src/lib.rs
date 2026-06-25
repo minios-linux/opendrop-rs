@@ -736,6 +736,31 @@ pub mod awdl {
             .expect("slice length matches mac address length"))
     }
 
+    /// Derive a peer's link-local IPv6 address from its MAC using the RFC 4291
+    /// modified EUI-64 method (the AWDL addressing scheme; see
+    /// docs/book/07-service-discovery-addressing.md and owl's
+    /// `rfc4291_addr`, owl/daemon/netutils.c:607-619). AWDL does NOT use NDP,
+    /// so filin must populate the system neighbor table with these mappings to
+    /// make unicast awdl0 connectivity work (the AirDrop HTTPS /Discover
+    /// handshake — FILIN_NEIGHBOR_TABLE.md).
+    ///
+    /// `fe80::(mac0 ^ 0x02):mac1:mac2:ff:fe:mac3:mac4:mac5`.
+    pub fn link_local_ipv6(mac: [u8; 6]) -> [u8; 16] {
+        let mut v6 = [0u8; 16];
+        v6[0] = 0xfe;
+        v6[1] = 0x80;
+        // bytes 2..8 stay zero (fe80::/64 prefix)
+        v6[8] = mac[0] ^ 0x02; // flip the Universal/Local bit
+        v6[9] = mac[1];
+        v6[10] = mac[2];
+        v6[11] = 0xff; // EUI-64 middle marker
+        v6[12] = 0xfe;
+        v6[13] = mac[3];
+        v6[14] = mac[4];
+        v6[15] = mac[5];
+        v6
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
