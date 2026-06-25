@@ -1137,6 +1137,36 @@ pub mod cli {
     }
 }
 
+pub mod runtime {
+    use std::fs::File;
+
+    use crate::{iface::Config, os};
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Error {
+        Tap,
+        Netdev,
+        Packet,
+    }
+
+    pub struct Links {
+        pub tap: File,
+        pub packet: os::packet::PacketSocket,
+    }
+
+    pub fn open_links(config: &Config) -> Result<Links, Error> {
+        let tap = os::tun::open_tap(&config.host_iface).map_err(|_| Error::Tap)?;
+        let monitor_addr = os::netdev::get_hwaddr(&config.monitor_iface).map_err(|_| Error::Netdev)?;
+        os::netdev::set_hwaddr(&config.host_iface, monitor_addr).map_err(|_| Error::Netdev)?;
+        os::netdev::set_mtu(&config.host_iface, 1450).map_err(|_| Error::Netdev)?;
+        os::netdev::set_up(&config.host_iface).map_err(|_| Error::Netdev)?;
+        let packet =
+            os::packet::PacketSocket::open_bound(&config.monitor_iface).map_err(|_| Error::Packet)?;
+
+        Ok(Links { tap, packet })
+    }
+}
+
 pub mod os {
     pub mod tun {
         use std::fs::{File, OpenOptions};
