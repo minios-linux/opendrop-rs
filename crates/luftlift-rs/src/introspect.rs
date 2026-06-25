@@ -311,6 +311,67 @@ pub struct StatusSnapshot {
     pub last_peer: String,
 }
 
+/// A produced introspection HTTP response: status, JSON body, content-type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntrospectResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl IntrospectResponse {
+    pub fn json(status: u16, value: &impl serde::Serialize) -> Self {
+        Self {
+            status,
+            body: serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec()),
+        }
+    }
+
+    pub fn empty(status: u16) -> Self {
+        Self { status, body: Vec::new() }
+    }
+}
+
+/// Default introspection listen address (loopback only, port 9931).
+pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:9931";
+
+/// Pure route dispatcher for the introspection API. Takes the request
+/// method, the full request target (path + "?" + query), and the body, and
+/// returns a JSON response. No I/O — fully unit-testable.
+///
+/// Routes:
+/// - `GET /status` → 200 with [`StatusSnapshot`] as JSON.
+/// - `GET /trace?n=300` → 200 with last N [`TraceEvent`]s as a JSON array
+///   (default/missing `n` = 300; `n=0` = all; `n` capped at the ring cap).
+/// - `POST /trace` with `{"level":"off|debug|trace"}` → 200, updates the
+///   level gate. 400 on malformed JSON / missing `level` key.
+/// - Anything else → 404.
+pub fn route_introspect(
+    _state: &IntrospectState,
+    _method: &str,
+    _target: &str,
+    _body: &[u8],
+) -> IntrospectResponse {
+    todo!()
+}
+
+/// Default value used for `GET /trace` when no `n` query param is supplied.
+pub const DEFAULT_TRACE_N: usize = 300;
+
+/// Parse the `n` query param from a request target. Returns the parsed
+/// value, or `None` if the param is absent. A non-numeric value parses to
+/// `Some(0)` to mirror the ring-buffer semantics (`n=0` ⇒ all). Pure.
+pub fn parse_trace_n(target: &str) -> Option<usize> {
+    let q = target.split_once('?').map(|(_, q)| q)?;
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.eq_ignore_ascii_case("n") {
+                return Some(v.parse().unwrap_or(0));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +645,139 @@ mod tests {
             "target was {:?}, expected to contain 'introspect'",
             events[0].target
         );
+    }
+
+    // ---- route_introspect: pure HTTP dispatch ----
+
+    #[test]
+    fn route_get_status_returns_snapshot_json() {
+        let st = IntrospectState::new();
+        st.record_announce("luftlift".into(), 8771);
+        st.bump_discover();
+        let resp = route_introspect(&st, "GET", "/status", b"");
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["receiver_name"], serde_json::json!("luftlift"));
+        assert_eq!(v["https_port"], serde_json::json!(8771));
+        assert_eq!(v["discover_count"], serde_json::json!(1));
+        assert_eq!(v["mdns_announced"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn route_get_trace_returns_array_with_default_n_when_no_param() {
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        for i in 0..400 {
+            st.push_trace(ev(&format!("e{i}")));
+        }
+        // No n= param: default returns DEFAULT_TRACE_N (300) events, newest.
+        let resp = route_introspect(&st, "GET", "/trace", b"");
+        assert_eq!(resp.status, 200);
+        let arr: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), DEFAULT_TRACE_N);
+        // Last (newest) is e399; first (oldest kept) is e100.
+        assert_eq!(arr.last().unwrap()["msg"], serde_json::json!("e399"));
+        assert_eq!(arr.first().unwrap()["msg"], serde_json::json!("e100"));
+    }
+
+    #[test]
+    fn route_get_trace_respects_n_query_param() {
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        for i in 0..10 {
+            st.push_trace(ev(&format!("e{i}")));
+        }
+        let resp = route_introspect(&st, "GET", "/trace?n=3", b"");
+        assert_eq!(resp.status, 200);
+        let arr: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["msg"], serde_json::json!("e7"));
+        assert_eq!(arr[2]["msg"], serde_json::json!("e9"));
+    }
+
+    #[test]
+    fn route_get_trace_n_zero_returns_all() {
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        for i in 0..5 {
+            st.push_trace(ev(&format!("e{i}")));
+        }
+        let resp = route_introspect(&st, "GET", "/trace?n=0", b"");
+        assert_eq!(resp.status, 200);
+        let arr: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn route_post_trace_debug_enables_ring() {
+        let st = IntrospectState::new();
+        assert!(!st.trace_enabled());
+        let resp = route_introspect(&st, "POST", "/trace", br#"{"level":"debug"}"#);
+        assert_eq!(resp.status, 200);
+        assert!(st.trace_enabled());
+        assert_eq!(st.trace_level(), "debug");
+    }
+
+    #[test]
+    fn route_post_trace_off_disables_ring() {
+        let st = IntrospectState::new();
+        st.set_trace_level("debug");
+        let resp = route_introspect(&st, "POST", "/trace", br#"{"level":"off"}"#);
+        assert_eq!(resp.status, 200);
+        assert!(!st.trace_enabled());
+    }
+
+    #[test]
+    fn route_post_trace_bad_json_returns_400() {
+        let st = IntrospectState::new();
+        let resp = route_introspect(&st, "POST", "/trace", b"not json");
+        assert_eq!(resp.status, 400);
+        // Level must NOT have changed.
+        assert_eq!(st.trace_level(), "off");
+    }
+
+    #[test]
+    fn route_post_trace_missing_level_key_returns_400() {
+        let st = IntrospectState::new();
+        let resp = route_introspect(&st, "POST", "/trace", br#"{"foo":"bar"}"#);
+        assert_eq!(resp.status, 400);
+        assert!(!st.trace_enabled());
+    }
+
+    #[test]
+    fn route_unknown_path_returns_404() {
+        let st = IntrospectState::new();
+        let resp = route_introspect(&st, "GET", "/nope", b"");
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn route_wrong_method_on_status_returns_404() {
+        let st = IntrospectState::new();
+        let resp = route_introspect(&st, "POST", "/status", b"");
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn parse_trace_n_returns_value_for_valid_n() {
+        assert_eq!(parse_trace_n("/trace?n=10"), Some(10));
+        assert_eq!(parse_trace_n("/trace?n=0"), Some(0));
+        assert_eq!(parse_trace_n("/trace?foo=1&n=42"), Some(42));
+        assert_eq!(parse_trace_n("/trace?n=300&other=1"), Some(300));
+    }
+
+    #[test]
+    fn parse_trace_n_returns_none_when_absent() {
+        assert_eq!(parse_trace_n("/trace"), None);
+        assert_eq!(parse_trace_n("/trace?foo=1"), None);
+    }
+
+    #[test]
+    fn parse_trace_n_garbage_value_parses_to_zero() {
+        // Match ring-buffer semantics: n=0 returns all. Non-numeric values
+        // also parse to 0 to fail safe (broad rather than narrow capture).
+        assert_eq!(parse_trace_n("/trace?n=abc"), Some(0));
     }
 }
