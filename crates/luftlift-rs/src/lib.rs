@@ -12,3 +12,4 @@ pub mod dvzip;
 pub mod handlers;
 pub mod http;
 pub mod plist_impl;
+pub mod tls;
