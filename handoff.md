@@ -90,6 +90,23 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 21 (AUTONOMOUS — both GLM audits progressing well; tree green).
+- filin (pty-5): CHANNEL HOPPING DONE — a4f99a7 adopt master chanseq + switching,
+  eb7f579 channel hopping + AW-gated data TX, 3fa3c69 A-MSDU. Now on per-peer
+  same-channel unicast TX gating + sync-params TLV field correctness, then final
+  FILIN_AUDIT RESULT notes. Tests 66 green, clippy clean. ⚠️ context ~223K (FULL) —
+  still coherent/committing but if it stalls or loses thread next cycle, re-nudge via
+  a *.md file with the remaining tasks (don't paste long prompts).
+- luftlift (pty-3): LUFTLIFT_AUDIT.md written (15.5KB). Real interop fixes landing:
+  614818e Expect:100-continue deadlock (Apple sender would hang). Remaining TODO:
+  mDNS flags 1->0x06 (flagged "may block discovery" — potentially important!),
+  SenderID in Ask builder, ReceiverMediaCapabilities JSON whitespace, 406 response.
+  Tests 68 green, clippy clean. Healthy context (~94K).
+- Tree: filin 66 + luftlift 68 tests green, both clippy --all-targets clean.
+- No hardware test this cycle: Apple AWDL idle (human asleep, nothing to trigger it)
+  + pty-5 mid-build. Resume live tests when channel hopping fully lands AND Apple AWDL
+  is active on air.
+--- PRIOR cycle-20 below ---
 Last updated: cycle 20 (AUTONOMOUS — human ASLEEP; two parallel GLM audits running; "make it work well").
 - HUMAN ASLEEP, fully autonomous, wants MOST COMPLETE/FAITHFUL impl possible. Don't
   rely on Mac-initiated sends (intermittent + nobody to tap). Keep tree green, commit,
