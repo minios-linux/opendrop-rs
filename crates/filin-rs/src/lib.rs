@@ -709,3 +709,21 @@ pub mod sync {
         }
     }
 }
+
+pub mod channel {
+    pub fn channel_to_frequency_mhz(_channel: u16) -> Option<u16> {
+        unimplemented!("RED: channel conversion not implemented yet")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn converts_common_awdl_channels_to_frequency() {
+            assert_eq!(channel_to_frequency_mhz(6), Some(2437));
+            assert_eq!(channel_to_frequency_mhz(44), Some(5220));
+            assert_eq!(channel_to_frequency_mhz(149), Some(5745));
+        }
+    }
+}
