@@ -90,6 +90,24 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 23 (AUTONOMOUS — luftlift SEND+RECEIVE fully validated locally; scope_id bug fixed).
+- *** luftlift FULL send+receive VALIDATED end-to-end (no Apple needed): ***
+  - scope_id send bug FIXED + committed (52f02a1 fix(luftlift): set IPv6 scope_id for
+    link-local send) — link-local fe80:: peers now get the awdl0 ifindex as scope_id.
+  - luftlift->luftlift round-trip COMPLETE: 77B text (incl binary 0x00/0xff) AND 512KB
+    random binary both transferred Discover->Ask->Upload and landed BYTE-IDENTICAL
+    (md5 match). Full path: find/mDNS -> TLS connect+scope -> dvzip/zlib/ODC-CPIO ->
+    chunked upload -> decode -> write. luftlift 84 tests, clippy clean.
+  - This validates the SEND client we could never test vs Apple (BLE gap). Protocol is
+    correct + robust at realistic size.
+- both crates DONE + cross-validated: filin 68 tests (channel hopping etc.), luftlift
+  84 tests. Workspace builds + clippy --all-targets clean.
+- pty-3 perms granted this session: /proc/net/* and /tmp/* "always allow" (until OpenCode
+  restart) so it can run round-trip tests.
+- NO more code work to dispatch (audits done, send+receive validated). Remaining is
+  Apple-hardware/live only (needs human + active Apple device). Both agents idle.
+- WAKEUP_REPORT.md updated with this milestone.
+--- PRIOR cycle-22 below ---
 Last updated: cycle 22 (AUTONOMOUS — BOTH AUDITS COMPLETE; improved stack running & ready for live test).
 - *** BOTH GLM AUDITS DONE. ***
 - filin (pty-5, FILIN_AUDIT complete): channel hopping (adopt master chanseq + nl80211

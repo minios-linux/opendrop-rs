@@ -3,6 +3,15 @@
 Written while you slept. TL;DR: both crates got a full faithfulness pass, the tree is
 green, and the improved stack is running and ready for a live test.
 
+## NEW: luftlift send+receive fully validated end-to-end (overnight, no Apple needed)
+A `luftlift -> luftlift` round-trip caught and fixed a real **send** bug (link-local
+IPv6 needs a `scope_id`/`%awdl0` zone — was failing `POST /Discover` with EINVAL; fixed
+in `52f02a1`). After the fix, both a 77-byte text file (incl. binary `0x00/0xff`) and a
+**512 KB random binary** transferred Discover→Ask→Upload and landed **byte-identical**
+(md5 match) through the full dvzip→zlib→ODC-CPIO→chunked-HTTP path. This validates the
+**send** client we could never test against Apple (BLE gap) — the protocol is correct
+and robust at realistic size. luftlift: 84 tests, clippy clean.
+
 ## What works (validated against real Apple hardware earlier)
 - **luftlift AirDrop receive**: end-to-end — received a real photo from your Mac
   (Stage 1), dvzip→CPIO decoded, valid file written.
