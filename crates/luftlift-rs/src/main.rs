@@ -186,9 +186,25 @@ fn send(interface: &str, recipient: &str, file: PathBuf) -> Result<()> {
     let port = peer.port;
     tracing::info!(peer = %peer.name, %addr, port, "receiver found");
 
-    let _ = interface; // binding to the interface is implicit via the route table
+    // The peer's address is IPv6 link-local on awdl0 (fe80::/10). Connecting
+    // to a link-local address REQUIRES a scope_id (the interface zone), else
+    // TcpStream::connect fails with EINVAL (os error 22). mDNS discovery
+    // returns the address but not the zone, so we attach the scope from the
+    // operator's `-i <interface>`. See LUFTLIFT_SEND_BUG.md.
+    let scope_id = netutil::if_index_for(interface);
+    let needs_scope = matches!(addr, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local());
+    if needs_scope && scope_id.is_none() {
+        tracing::warn!(
+            interface,
+            "link-local peer but interface index could not be resolved; \
+             connect will likely fail with EINVAL (os error 22)"
+        );
+    } else if needs_scope {
+        tracing::info!(interface, scope_id = scope_id, "attaching IPv6 scope_id for link-local peer");
+    }
+    let peer_addr = netutil::connect_addr_with_scope(*addr, port, scope_id);
+
     let tls_config = Arc::new(tls::build_client_config()?);
-    let peer_addr = std::net::SocketAddr::new(*addr, port);
     let mut transport = RustlsTransport::new(tls_config, peer_addr);
 
     let sender = SenderConfig::new(hostname(), "MacBookPro", "com.luftlift.app");

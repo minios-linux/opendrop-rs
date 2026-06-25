@@ -21,6 +21,9 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
+# libc::if_nametoindex to resolve `-i awdl0` -> interface index for IPv6
+# link-local scope_id on the send path.
+libc.workspace = true
 # zlib (de)compression for the dvzip framed-zlib format. Pure-Rust default
 # backend (miniz_oxide); no system zlib needed. Local dep — ask Claude to hoist
 # into [workspace.dependencies] if other crates want it too.
