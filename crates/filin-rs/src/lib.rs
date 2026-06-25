@@ -3563,6 +3563,38 @@ pub mod pcap {
 pub mod rx {
     use crate::{awdl, ieee80211, radiotap, sync::TsftBridge};
 
+    /// owl `RSSI_THRESHOLD_DEFAULT` (owl/src/state.h:32). Unknown peers must
+    /// meet this to be discovered.
+    pub const RSSI_THRESHOLD_DEFAULT: i8 = -65;
+
+    /// owl `RSSI_GRACE_DEFAULT` (owl/src/state.h:33). Once known, a peer is
+    /// admitted down to `threshold + grace` (-65 + -5 = -70) — the hysteresis
+    /// that prevents master flapping (FILIN_AUDIT_FIXES.md #1, book ch.5).
+    pub const RSSI_GRACE_DEFAULT: i8 = -5;
+
+    /// Pure RSSI admission decision (owl `rx.c:273-278`). Returns `true` if
+    /// the frame should be ADMITTED (peer updated / election run), `false` if
+    /// it should be dropped as too weak.
+    ///
+    /// - Unknown peer: admit iff `rssi >= threshold` (-65).
+    /// - Known peer: admit iff `rssi >= threshold + grace` (-70). The grace
+    ///   gives the current master / peers slack so transient fading doesn't
+    ///   cause them to drop out and trigger re-election thrash.
+    /// - No RSSI: always admit (can't decide).
+    pub fn rssi_admits(rssi: Option<i8>, peer_known: bool, threshold: i8, grace: i8) -> bool {
+        let rssi = match rssi {
+            Some(r) => r,
+            None => return true,
+        };
+        let effective_threshold = if peer_known {
+            threshold.saturating_add(grace)
+        } else {
+            threshold
+        };
+        rssi >= effective_threshold
+    }
+
+
     #[derive(Debug, PartialEq, Eq)]
     pub struct ParsedActionFrame<'a> {
         pub rx_time_us: u64,
