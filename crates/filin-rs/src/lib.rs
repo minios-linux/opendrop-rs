@@ -5914,6 +5914,137 @@ pub mod introspect {
         pub peer_count: usize,
     }
 
+    /// Capacity of the trace ring buffer (FILIN_HTTP_INTROSPECT.md: ~2000).
+    pub const TRACE_RING_CAP: usize = 2000;
+
+    /// One captured `tracing` event, serialized for `GET /trace`.
+    #[derive(Debug, Clone, Serialize, PartialEq)]
+    pub struct TraceEvent {
+        /// Wall-clock milliseconds since UNIX_EPOCH (jq-friendly).
+        pub ts: u64,
+        /// `ERROR`/`WARN`/`INFO`/`DEBUG`/`TRACE`.
+        pub level: String,
+        /// `tracing` target (usually the module path).
+        pub target: String,
+        /// The event's format-string message.
+        pub msg: String,
+        /// Structured fields collected via `tracing::field::Visit`.
+        pub fields: serde_json::Map<String, serde_json::Value>,
+    }
+
+    /// Fixed-capacity ring buffer of [`TraceEvent`]s. `push` is O(1); the
+    /// mutex is held only briefly. Drained only by the HTTP thread.
+    pub struct TraceRing {
+        cap: usize,
+        buf: std::sync::Mutex<std::collections::VecDeque<TraceEvent>>,
+    }
+
+    impl TraceRing {
+        pub fn new(cap: usize) -> Self {
+            Self {
+                cap,
+                buf: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(cap)),
+            }
+        }
+
+        pub fn push(&self, ev: TraceEvent) {
+            if let Ok(mut buf) = self.buf.lock() {
+                if buf.len() >= self.cap {
+                    buf.pop_front();
+                }
+                buf.push_back(ev);
+            }
+        }
+
+        /// Last `n` events in insertion order (oldest-first). `n == 0` → empty.
+        pub fn last_n(&self, n: usize) -> Vec<TraceEvent> {
+            if n == 0 {
+                return Vec::new();
+            }
+            let buf = match self.buf.lock() {
+                Ok(b) => b,
+                Err(e) => e.into_inner(),
+            };
+            let len = buf.len();
+            let start = len.saturating_sub(n);
+            buf.iter().skip(start).cloned().collect()
+        }
+
+        pub fn len(&self) -> usize {
+            self.buf
+                .lock()
+                .map(|b| b.len())
+                .unwrap_or_else(|e| e.into_inner().len())
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+    }
+
+    /// User-facing capture level set via `POST /trace {"level": ...}`. The
+    /// encoding matches `tracing`'s `Level::as_usize()` so the gate check is a
+    /// single `>=` against an event's level number.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GateLevel {
+        Off,
+        Debug,
+        Trace,
+    }
+
+    impl GateLevel {
+        /// `Off=0`, `Debug=4` (== `tracing::Level::DEBUG`), `Trace=5`.
+        pub fn as_u8(self) -> u8 {
+            match self {
+                GateLevel::Off => 0,
+                GateLevel::Debug => 4,
+                GateLevel::Trace => 5,
+            }
+        }
+
+        /// Parse the strings accepted by `POST /trace {"level": ...}`.
+        /// Case-sensitive per the spec (`off|debug|trace`).
+        pub fn from_request_str(s: &str) -> Option<Self> {
+            match s {
+                "off" => Some(Self::Off),
+                "debug" => Some(Self::Debug),
+                "trace" => Some(Self::Trace),
+                _ => None,
+            }
+        }
+    }
+
+    /// Atomic gate read on every tracing event (hot path). The cost when
+    /// disabled is a single `Relaxed` atomic load + compare.
+    pub struct TraceGate(std::sync::atomic::AtomicU8);
+
+    impl TraceGate {
+        pub const fn new() -> Self {
+            Self(std::sync::atomic::AtomicU8::new(0))
+        }
+
+        pub fn level_u8(&self) -> u8 {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        pub fn set(&self, level: GateLevel) {
+            self.0.store(level.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// `event_level_num` is `tracing::Level::as_usize()` (ERROR=1 … TRACE=5).
+        /// Returns true iff capture is enabled and the event is verbose enough.
+        pub fn allows(&self, event_level_num: u8) -> bool {
+            let g = self.0.load(std::sync::atomic::Ordering::Relaxed);
+            g != 0 && event_level_num != 0 && g >= event_level_num
+        }
+    }
+
+    impl Default for TraceGate {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     /// Aggregate introspection state, shared (via `Arc`) between the AF_PACKET
     /// hot loop, the optional `TraceLayer`, and the HTTP server thread.
     pub struct Introspection {
