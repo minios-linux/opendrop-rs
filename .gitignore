@@ -1,0 +1,21 @@
+# Rust
+/target
+**/target
+Cargo.lock
+
+# C reference build artifacts (owl, rtw88-patch are vendored references, not built here)
+owl/build/
+owl/googletest/
+owl/radiotap/
+rtw88-patch/*.o
+rtw88-patch/*.ko
+rtw88-patch/*.mod
+rtw88-patch/*.mod.c
+rtw88-patch/.*.cmd
+rtw88-patch/modules.order
+rtw88-patch/Module.symvers
+
+# scratch
+/tmp-*
+*.pcapng
+*.log

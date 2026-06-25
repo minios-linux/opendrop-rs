@@ -1,0 +1,70 @@
+# PORT.md — `airdrop-rs` (port of opendrop)  — owner: GLM-5.2
+
+Goal: a Rust port of SEEMOO's **opendrop** (the AirDrop application layer). It
+runs over the `awdl0` interface (brought up by the separate `awdl-rs` crate) and
+interoperates with **real Apple devices** — we have verified the patched Python
+opendrop receiving a photo from an iPhone 15 Pro Max on **iOS 18.6.2**.
+
+**You don't touch awdl-rs.** Your contract is: bind sockets to `awdl0` (an IPv6
+link-local netdev). For pure-logic dev/tests you don't even need hardware.
+
+Reference: `../../opendrop-patch/` — the patched Python `server.py` (read it; it
+already contains the iOS-18 fixes) and `dvzip.py` (the format decoder). Port that
+behavior to Rust.
+
+## Subcommands (match opendrop)
+`airdrop-rs -i awdl0 receive`
+`airdrop-rs -i awdl0 find`
+`airdrop-rs -i awdl0 send -r <id> -f <file>`
+
+## Components to port
+1. **mDNS over awdl0**: announce `_airdrop._tcp` (for `receive`) and browse it
+   (for `find`/`send`). IPv6 link-local, port 8771. Apple devices appear/announce
+   only while their sharing pane is open — document that.
+2. **TLS**: an HTTPS server + client. opendrop uses a self-signed cert; Apple's
+   cert chain validation is lenient for AirDrop. Use rustls.
+3. **HTTP handlers** (`/Discover`, `/Ask`, `/Upload`) — the AirDrop protocol:
+   - **iOS-18 quirk**: `/Discover` and `/Ask` POSTs use **chunked** transfer
+     encoding with **no `Content-Length`**. A naive `int(Content-Length)` crashes
+     (this was opendrop's bug #1). Read chunked bodies.
+   - `/Discover` → respond with our record (ReceiverComputerName, media caps) so
+     we appear in the sender's picker.
+   - `/Ask` → the request plist describes the file(s); auto-accept (200) with our
+     receiver info. **Links** arrive as a `.webloc` file described here (no special
+     URL field — surface the link by parsing the eventual webloc/CPIO).
+   - `/Upload` → the file payload.
+4. **Payload formats** (the part with real reverse-engineering — see
+   `../../docs/airdrop-protocol.md`):
+   - Content-Type **`application/x-cpio`** (older) OR **`application/x-dvzip`** (iOS 18).
+   - **dvzip**: a sequence of framed zlib blocks `[u32 big-endian length][zlib
+     stream]`; inflate+concatenate → an **ODC CPIO** archive (magic `070707`)
+     containing the file(s). Reference decoder: `../../opendrop-patch/dvzip.py`.
+     **Fixture available:** a real captured dvzip at `/tmp/upload.bin` (317 KB,
+     contains FullSizeRender.jpg) — copy it to `tests/fixtures/` and assert your
+     decoder extracts the JPEG byte-for-byte.
+   - CPIO (ODC) extraction; gzip for the legacy path.
+5. **plist**: parse/emit Apple binary + XML plists (Discover/Ask request+response).
+
+## TDD order (great because the formats are pure functions with real fixtures)
+1. **dvzip decoder** — RED: test that `dvzip_to_cpio(fixture)` yields bytes whose
+   magic is `070707` and length matches; GREEN: implement the framed-zlib loop.
+   Then: extract the JPEG and assert it's a valid JPEG of the known size (317435 B).
+2. **CPIO (ODC) reader** — extract entries (name + bytes) from the decoded archive.
+3. **chunked body reader** — RED with a hand-built chunked body (incl. the
+   no-Content-Length case); GREEN.
+4. **plist** Discover/Ask request parse + response emit (use captured plists; we
+   have a real Ask plist structure documented in docs/airdrop-protocol.md).
+5. Wire mDNS + TLS + HTTP handlers; integration-test `receive` against the Python
+   opendrop or a real Apple device over awdl0.
+
+## Debuggability (primary goal — better than opendrop)
+`tracing` structured events: `mdns_announce`/`mdns_discovered` { name, addr },
+`http_request` { peer, method, path, status }, `ask` { sender, files }, `upload`
+{ bytes, mbps }, `link_received` { url }. A `find` should clearly list discovered
+peers; a `receive` should narrate the Discover→Ask→Upload phases. The Python
+stack hid all this at debug level — surface it.
+
+## Workflow
+Follow `../../WORKFLOW.md`: branch `feat/airdrop-rs`, TDD with red/green/review
+commits, keep all code under `crates/airdrop-rs/`. Coordinate dep additions with
+Claude.

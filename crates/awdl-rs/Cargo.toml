@@ -1,0 +1,20 @@
+[package]
+name = "awdl-rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# A Rust port of SEEMOO's owl (Apple Wireless Direct Link daemon).
+# Brings up the awdl0 interface; everything above it (mDNS/HTTPS/AirDrop) is in airdrop-rs.
+
+[[bin]]
+name = "awdl-rs"
+path = "src/main.rs"
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+# Add as needed: libc, nix, pcap, neli/nl80211, tokio, etc. (coordinate big additions)
