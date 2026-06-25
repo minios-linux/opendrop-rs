@@ -886,15 +886,32 @@ pub mod rx {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum ParseError {
-        Unsupported,
+        Radiotap,
+        Ieee80211,
+        Awdl,
+        MissingTsft,
     }
 
     pub fn parse_action_frame<'a>(
-        _frame: &'a [u8],
-        _host_now_us: u64,
-        _bridge: &mut TsftBridge,
+        frame: &'a [u8],
+        host_now_us: u64,
+        bridge: &mut TsftBridge,
     ) -> Result<ParsedActionFrame<'a>, ParseError> {
-        Err(ParseError::Unsupported)
+        let radiotap = radiotap::parse_header(frame).map_err(|_| ParseError::Radiotap)?;
+        let hw_tsft = radiotap.tsft.ok_or(ParseError::MissingTsft)?;
+        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(|_| ParseError::Ieee80211)?;
+        let action = awdl::parse_action_frame(mac.body).map_err(|_| ParseError::Awdl)?;
+        let tlvs = awdl::parse_tlvs(action.tlvs).map_err(|_| ParseError::Awdl)?;
+        let rx_time_us = bridge.timestamp_rx(hw_tsft, host_now_us);
+
+        Ok(ParsedActionFrame {
+            rx_time_us,
+            rssi_dbm: radiotap.antenna_signal_dbm,
+            source: mac.source,
+            destination: mac.destination,
+            action,
+            tlvs,
+        })
     }
 
     #[cfg(test)]
