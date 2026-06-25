@@ -1064,6 +1064,67 @@ pub mod awdl {
                 ]
             );
         }
+
+        // --- RFC 4291 modified EUI-64 link-local IPv6 derivation
+        //     (FILIN_NEIGHBOR_TABLE.md: owl rfc4291_addr, netutils.c:607). ---
+
+        #[test]
+        fn link_local_ipv6_known_vector_mac_to_ipv6() {
+            // RFC 4291 Appendix A example: MAC 00:90:27:3a:db:32 →
+            // fe80::290:27ff:fe3a:db32. The modified EUI-64 flips the U/L bit
+            // (bit 1 of byte 0): 0x00 ^ 0x02 = 0x02.
+            let v6 = link_local_ipv6([0x00, 0x90, 0x27, 0x3a, 0xdb, 0x32]);
+            assert_eq!(
+                v6,
+                [
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x90, 0x27, 0xff, 0xfe,
+                    0x3a, 0xdb, 0x32
+                ]
+            );
+        }
+
+        #[test]
+        fn link_local_ipv6_flips_universal_local_bit() {
+            // The only transformation is flipping bit 1 of byte 0 (U/L bit).
+            // A MAC with that bit already set (locally administered) has it
+            // cleared: 0x02 ^ 0x02 = 0x00.
+            let v6 = link_local_ipv6([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            assert_eq!(
+                v6,
+                [
+                    0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0xff, 0xfe,
+                    0xcc, 0xdd, 0xee
+                ]
+            );
+        }
+
+        #[test]
+        fn link_local_ipv6_round_trips_arbitrary_macs() {
+            for mac in [
+                [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                [0xdc, 0x56, 0xe7, 0xc1, 0x9a, 0x3b],
+                [0xa4, 0x83, 0xe7, 0x44, 0xc1, 0x82],
+            ] {
+                let v6 = link_local_ipv6(mac);
+                // Prefix is always fe80::/64.
+                assert_eq!(v6[0], 0xfe);
+                assert_eq!(v6[1], 0x80);
+                assert!(v6[2..8].iter().all(|&b| b == 0));
+                // Byte 8 = mac[0] ^ 0x02 (U/L bit flipped).
+                assert_eq!(v6[8], mac[0] ^ 0x02);
+                // Bytes 9-10 = mac[1-2] verbatim.
+                assert_eq!(v6[9], mac[1]);
+                assert_eq!(v6[10], mac[2]);
+                // Bytes 11-12 = ff:fe (the EUI-64 middle marker).
+                assert_eq!(v6[11], 0xff);
+                assert_eq!(v6[12], 0xfe);
+                // Bytes 13-15 = mac[3-5] verbatim.
+                assert_eq!(v6[13], mac[3]);
+                assert_eq!(v6[14], mac[4]);
+                assert_eq!(v6[15], mac[5]);
+            }
+        }
     }
 }
 
