@@ -90,6 +90,24 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 10 (luftlift RECEIVE+FIND complete; filin awdl0 bringup wired; both finishing).
+- luftlift (GLM-5.2): FEATURE-COMPLETE receive path — tls/mdns(announce+browse)/
+  server(serve_forever + tested handle_one_connection)/netutil(/proc/net/if_inet6)/
+  main CLI (receive -o | find -d | send). `find` VERIFIED working (browses 5s, prints
+  peers). All deps crate-local (flate2, plist, rcgen 0.13, rustls 0.23 ring,
+  rustls-pemfile, mdns-sd). I nudged it to implement the `send` CLIENT (TLS client +
+  POST /Discover//Ask//Upload as x-dvzip) so it's a full peer like opendrop — TDD,
+  autonomous. Known non-blockers it flagged: real-fixture test needs /tmp/upload.bin
+  (absent here); TLS integration test needs threaded harness; receive needs real
+  awdl0+IPv6 (hardware pass).
+- filin (gpt-5.5): awdl0 bringup fully wired into binary — nl80211 channel set, link
+  bringup, anchor channel, link poll loop; now Ethernet<->AWDL data encap (TX). Tests
+  25 pass + the usual in-flight RED. Self-committing via auto-reviewer.
+- ENDGAME getting close: when filin's TX encap + RX/TX loop land and luftlift's send
+  lands, do the full root build/test/clippy pass + binary --help sanity + success
+  report (run instr + awdl0/hardware-pass caveat). opendrop-rs CLI still ~empty —
+  decide if it needs a thin wrapper or if the two crate bins suffice (likely suffice).
+--- (prior cycle notes below) ---
 Last updated: cycle 9 (TREE GREEN 69 tests; filin syscall layer in TDD; luftlift main wiring).
 - filin (24 tests): syscall layer underway w/ good discipline — tap-iface-request,
   packet-socket-bind, netdev-ioctl-name all have TESTED planning fns + thin unsafe
