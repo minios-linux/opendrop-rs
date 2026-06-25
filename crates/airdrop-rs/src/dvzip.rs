@@ -14,14 +14,45 @@
 //! Concatenating the inflated output of every block yields an ODC CPIO
 //! archive (magic ASCII `070707`).
 
+use flate2::read::ZlibDecoder;
+use std::io::Read;
+use tracing::debug;
+
 /// Decode a dvzip payload into the underlying CPIO archive bytes.
 ///
 /// Matches `opendrop-patch/dvzip.py::dvzip_to_cpio`: walk framed zlib blocks,
 /// inflate each, and concatenate. Stops cleanly on a trailing short frame or
-/// a zero-length block (mirroring the Python loop guard).
-pub fn dvzip_to_cpio(_data: &[u8]) -> Vec<u8> {
-    // RED: unimplemented — the round-trip test below must fail first.
-    Vec::new()
+/// a zero-length block (mirroring the Python loop guard
+/// `block_len == 0 or pos + block_len > len(data)`).
+///
+/// Malformed zlib streams are skipped with a `debug!` log rather than a hard
+/// error: we want best-effort recovery out of a captured body and the CPIO
+/// magic check downstream will catch total garbage.
+pub fn dvzip_to_cpio(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= data.len() {
+        let block_len = u32::from_be_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+        ]) as usize;
+        pos += 4;
+        if block_len == 0 || pos + block_len > data.len() {
+            break;
+        }
+        let raw = &data[pos..pos + block_len];
+        pos += block_len;
+
+        let mut decoder = ZlibDecoder::new(raw);
+        let mut buf = Vec::new();
+        match decoder.read_to_end(&mut buf) {
+            Ok(_) => out.extend_from_slice(&buf),
+            Err(e) => debug!(block_len, pos, error = %e, "dvzip: skipping malformed zlib block"),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
