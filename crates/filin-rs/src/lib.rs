@@ -230,6 +230,9 @@ pub mod ieee80211 {
         pub source: [u8; 6],
         pub bssid: [u8; 6],
         pub sequence_control: u16,
+        /// QoS control field for QoS data frames (owl reads it at offset 24,
+        /// owl/src/rx.c:537). `None` for non-QoS frames.
+        pub qos_control: Option<u16>,
         pub body: &'a [u8],
     }
 
@@ -257,6 +260,11 @@ pub mod ieee80211 {
             source: read_addr(frame, 10)?,
             bssid: read_addr(frame, 16)?,
             sequence_control: u16::from_le_bytes([frame[22], frame[23]]),
+            qos_control: if is_qos_data(frame_control) {
+                Some(u16::from_le_bytes([frame[24], frame[25]]))
+            } else {
+                None
+            },
             body: &frame[body_offset..],
         })
     }
@@ -268,6 +276,9 @@ pub mod ieee80211 {
         const STYPE_QOS: u16 = 0x0080;
         (frame_control & (FTYPE_DATA | STYPE_QOS)) == (FTYPE_DATA | STYPE_QOS)
     }
+
+    /// owl `IEEE80211_QOS_CTL_A_MSDU_PRESENT` (owl/src/ieee80211.h:125).
+    pub const QOS_A_MSDU_PRESENT: u16 = 0x0080;
 
     pub fn build_management_action_frame(
         destination: [u8; 6],
@@ -600,6 +611,38 @@ pub mod awdl {
         Ok(EthernetFrame { bytes })
     }
 
+    /// owl `awdl_rx_data_amsdu` (owl/src/rx.c:391-418): iterates A-MSDU
+    /// subframes. Each subframe has a 14-byte Ethernet-like header
+    /// (dst, src, length-be), then `length` bytes of LLC/SNAP+AWDL-data, then
+    /// padding to a 4-byte boundary.
+    pub fn decapsulate_amsdu_data_frames(body: &[u8]) -> Result<Vec<EthernetFrame>, ParseError> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while offset < body.len() {
+            if offset + 14 > body.len() {
+                return Err(ParseError::TooShort);
+            }
+            let dst: [u8; 6] = body[offset..offset + 6].try_into().unwrap();
+            let src: [u8; 6] = body[offset + 6..offset + 12].try_into().unwrap();
+            let sub_len = u16::from_be_bytes([body[offset + 12], body[offset + 13]]) as usize;
+            offset += 14;
+            if offset + sub_len > body.len() {
+                return Err(ParseError::TooShort);
+            }
+            let sub_body = &body[offset..offset + sub_len];
+            offset += sub_len;
+            // strip padding to 4-byte boundary (owl/src/rx.c:413)
+            if offset < body.len() {
+                offset += (4 - ((14 + sub_len) % 4)) % 4;
+            }
+            match decapsulate_data_frame(sub_body, src, dst) {
+                Ok(frame) => out.push(frame),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn build_action_body(
         subtype: ActionSubtype,
         phy_tx: u32,
@@ -832,6 +875,47 @@ pub mod awdl {
                     0xdd, 0x60, 0x00, 0x00, 0x00,
                 ]
             );
+        }
+
+        #[test]
+        fn decapsulates_amsdu_with_two_subframes() {
+            // build two LLC/SNAP+AWDL-data subframes
+            let sub1 = vec![
+                0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00, // LLC/SNAP
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AWDL data header
+                0x86, 0xdd, // ethertype
+                0x60, 0x00, 0x00, 0x00, // payload
+            ];
+            let sub2 = vec![
+                0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x86, 0xdd,
+                0x60, 0x00, 0x00, 0x01,
+            ];
+            let dst1 = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01u8];
+            let src1 = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let dst2 = [0x33, 0x33, 0x00, 0x00, 0x00, 0x02];
+            let src2 = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xff];
+
+            // A-MSDU body = subframe1-header + sub1 + padding + subframe2-header + sub2
+            let mut body = Vec::new();
+            body.extend_from_slice(&dst1);
+            body.extend_from_slice(&src1);
+            body.extend_from_slice(&(sub1.len() as u16).to_be_bytes());
+            body.extend_from_slice(&sub1);
+            // pad to 4-byte boundary: (14 + sub1.len()) % 4
+            let pad1 = (4 - ((14 + sub1.len()) % 4)) % 4;
+            body.extend(std::iter::repeat_n(0u8, pad1));
+            body.extend_from_slice(&dst2);
+            body.extend_from_slice(&src2);
+            body.extend_from_slice(&(sub2.len() as u16).to_be_bytes());
+            body.extend_from_slice(&sub2);
+
+            let frames = decapsulate_amsdu_data_frames(&body).expect("valid A-MSDU");
+            assert_eq!(frames.len(), 2);
+            assert_eq!(&frames[0].bytes[0..6], &dst1);
+            assert_eq!(&frames[0].bytes[6..12], &src1);
+            assert_eq!(&frames[1].bytes[0..6], &dst2);
         }
 
         #[test]
@@ -2715,20 +2799,22 @@ pub mod runtime {
                                 );
                             }
                             Err(err) => match decapsulate_rx_data(&wlan_buf[..len]) {
-                                Ok((source, frame)) => {
+                                Ok((source, frames)) => {
                                     if awdl_state.peers.get(&source).is_none() {
                                         tracing::trace!(
                                             ?source,
                                             "drop data frame from non-peer"
                                         );
                                     } else {
-                                        links
-                                            .tap
-                                            .write_all(&frame.bytes)
-                                            .map_err(|_| Error::Io)?;
+                                        for frame in &frames {
+                                            links
+                                                .tap
+                                                .write_all(&frame.bytes)
+                                                .map_err(|_| Error::Io)?;
+                                        }
                                         tracing::trace!(
-                                            len = frame.bytes.len(),
-                                            "wrote ethernet frame to tap"
+                                            count = frames.len(),
+                                            "wrote ethernet frame(s) to tap"
                                         );
                                     }
                                 }
@@ -3151,16 +3237,28 @@ pub mod runtime {
         Awdl(awdl::ParseError),
     }
 
-    fn decapsulate_rx_data(frame: &[u8]) -> Result<([u8; 6], awdl::EthernetFrame), DataParseError> {
+    /// Returns the source MAC and one or more decapsulated Ethernet frames.
+    /// A-MSDU frames yield multiple Ethernet frames (owl awdl_rx_data_amsdu).
+    fn decapsulate_rx_data(frame: &[u8]) -> Result<([u8; 6], Vec<awdl::EthernetFrame>), DataParseError> {
         let radiotap = radiotap::parse_header(frame).map_err(DataParseError::Radiotap)?;
         let ieee80211_payload =
             rx::ieee80211_payload_without_fcs(&radiotap).map_err(DataParseError::Fcs)?;
         let mac =
             ieee80211::parse_mac_header(ieee80211_payload).map_err(DataParseError::Ieee80211)?;
-        let ethernet =
-            awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination)
-                .map_err(DataParseError::Awdl)?;
-        Ok((mac.source, ethernet))
+        // owl checks A-MSDU present bit in the QoS control field (rx.c:540).
+        let is_amsdu = mac
+            .qos_control
+            .map(|q| q & ieee80211::QOS_A_MSDU_PRESENT != 0)
+            .unwrap_or(false);
+        let frames = if is_amsdu {
+            awdl::decapsulate_amsdu_data_frames(mac.body).map_err(DataParseError::Awdl)?
+        } else {
+            vec![
+                awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination)
+                    .map_err(DataParseError::Awdl)?,
+            ]
+        };
+        Ok((mac.source, frames))
     }
 
     fn ieee80211_payload_preview(frame: &[u8]) -> String {
