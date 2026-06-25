@@ -1605,4 +1605,34 @@ pub mod os {
             }
         }
     }
+
+    pub mod nl80211 {
+        #[derive(Debug, PartialEq, Eq)]
+        pub struct ChannelRequest {
+            pub ifindex: libc::c_int,
+            pub frequency_mhz: u32,
+        }
+
+        pub fn plan_set_channel(_ifindex: libc::c_int, _frequency_mhz: u32) -> Result<ChannelRequest, Error> {
+            Err(Error::Invalid)
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum Error {
+            Invalid,
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn plans_set_channel_request() {
+                let request = plan_set_channel(9, 5220).expect("valid request");
+
+                assert_eq!(request.ifindex, 9);
+                assert_eq!(request.frequency_mhz, 5220);
+            }
+        }
+    }
 }
