@@ -173,6 +173,16 @@ pub mod ieee80211 {
         frame
     }
 
+    pub fn build_data_frame(
+        _destination: [u8; 6],
+        _source: [u8; 6],
+        _bssid: [u8; 6],
+        _sequence_control: u16,
+        _body: &[u8],
+    ) -> Vec<u8> {
+        unimplemented!("RED: 802.11 data frame builder not implemented yet")
+    }
+
     fn read_addr(frame: &[u8], offset: usize) -> Result<[u8; 6], ParseError> {
         Ok(frame
             .get(offset..offset + 6)
@@ -224,6 +234,22 @@ pub mod ieee80211 {
             assert_eq!(&frame[16..22], &[0x00, 0x25, 0x00, 0xff, 0x94, 0x73]);
             assert_eq!(&frame[22..24], &[0x10, 0x00]);
             assert_eq!(&frame[24..], &[0x7f, 0x00]);
+        }
+
+        #[test]
+        fn builds_three_address_data_frame() {
+            let frame = build_data_frame(
+                [0x33, 0x33, 0, 0, 0, 1],
+                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                [0x00, 0x25, 0x00, 0xff, 0x94, 0x73],
+                0x0020,
+                &[0xaa, 0xaa],
+            );
+
+            assert_eq!(&frame[0..2], &[0x08, 0x00]);
+            assert_eq!(&frame[4..10], &[0x33, 0x33, 0, 0, 0, 1]);
+            assert_eq!(&frame[22..24], &[0x20, 0x00]);
+            assert_eq!(&frame[24..], &[0xaa, 0xaa]);
         }
     }
 }
