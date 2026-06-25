@@ -3297,6 +3297,14 @@ pub mod iface {
         /// Localhost introspection HTTP bind address. `None` disables the
         /// server entirely (`--no-http`).
         pub http_addr: Option<std::net::SocketAddr>,
+        /// FILIN_SYNC_QUALITY.md pivot: single-channel "park" mode. When set,
+        /// filin stops hopping and stays fixed on ONE channel (the stable top
+        /// master's anchor), maximizing presence on the iPhone's primary
+        /// channel. The carl9170 is a dedicated monitor — it doesn't share a
+        /// radio with infra like a real Apple device, so hopping is only
+        /// needed to time-share, which we don't need to do. AW timing is kept
+        /// so announces still transmit during availability windows.
+        pub park: bool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -3338,6 +3346,7 @@ pub mod iface {
                 assume_monitor: true,
                 pcap_path: None,
                 http_addr: Some(default_http_addr()),
+                park: false,
             };
 
             assert_eq!(validate_config(config.clone()), Ok(config));
@@ -3649,6 +3658,10 @@ pub mod cli {
         /// Disable the introspection HTTP server entirely.
         #[arg(long = "no-http")]
         no_http: bool,
+        /// Single-channel park mode: stop hopping, stay fixed on the stable
+        /// top master's anchor channel. Opt-in — default is the hopping mode.
+        #[arg(long = "park")]
+        park: bool,
     }
 
     pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
@@ -3674,6 +3687,7 @@ pub mod cli {
             assume_monitor: args.assume_monitor,
             pcap_path: args.pcap_path.or_else(|| std::env::var("FILIN_PCAP").ok()),
             http_addr,
+            park: args.park,
         })
         .map_err(|_| CliError::Invalid)
     }
@@ -3697,6 +3711,7 @@ pub mod cli {
                     assume_monitor: true,
                     pcap_path: None,
                     http_addr: Some(iface::default_http_addr()),
+                    park: false,
                 }
             );
         }
