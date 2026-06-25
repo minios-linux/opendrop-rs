@@ -28,11 +28,17 @@ pub const DEFAULT_FLAGS: u32 = 0x06;
 /// incoming queries, but over a quiet/flaky AWDL link the Apple device's
 /// refresh queries (or our responses) don't always get through; once the
 /// 120s A/SRV TTL lapses with no refresh the device can no longer resolve
-/// the receiver and it drops from the AirDrop picker. Re-announcing every
-/// 60s (half the A/SRV TTL) keeps the records fresh on peers independent of
-/// query traffic, matching the symptom observed in live testing (receiver
+/// the receiver and it drops from the AirDrop picker.
+///
+/// Re-announcing every **10s** (well under the 120s A/SRV TTL) gives ~12
+/// chances to land in a peer's listen window before the records would
+/// expire — important because filin channel-hops across the AWDL channel
+/// sequence (6/44/149), so the receiver and the Apple device may not share
+/// a channel at any given moment. A short interval maximizes the odds that
+/// at least one announcement gets through during a coincident listen
+/// window. This matches the symptom observed in live testing (receiver
 /// disappeared from the Mac's picker ~2 min after starting `receive`).
-pub const REANNOUNCE_SECS: u64 = 60;
+pub const REANNOUNCE_SECS: u64 = 10;
 
 /// Tick rate of the re-announce loop. Short enough that shutdown (via the
 /// stop flag) is responsive, long enough that the loop is effectively idle
@@ -100,8 +106,8 @@ pub fn reannounce(daemon: &ServiceDaemon, info: &ServiceInfo) -> Result<()> {
 }
 
 /// Pure decision helper: has `REANNOUNCE_SECS` elapsed since `last`?
-/// Split out so the interval logic is unit-testable without sleeping for a
-/// full minute. Returns `true` when `now - last >= REANNOUNCE_SECS`.
+/// Split out so the interval logic is unit-testable without sleeping.
+/// Returns `true` when `now - last >= REANNOUNCE_SECS`.
 pub fn should_reannounce(last: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last) >= Duration::from_secs(REANNOUNCE_SECS)
 }
@@ -271,10 +277,9 @@ mod tests {
     #[allow(clippy::assertions_on_constants)] // intentional invariant guard on a const
     fn reannounce_interval_is_under_asrv_ttl() {
         // The A/SRV record TTL is 120s. REANNOUNCE_SECS must be comfortably
-        // under it so a refresh goes out before the records expire on a peer
-        // (a ~2x safety margin, matching common mDNS practice).
+        // under it so a refresh goes out before the records expire on a peer.
         assert!(REANNOUNCE_SECS < 120, "re-announce interval must be < 120s A/SRV TTL");
-        assert_eq!(REANNOUNCE_SECS, 60, "default is half the TTL (RFC-flavoured)");
+        assert_eq!(REANNOUNCE_SECS, 10, "10s gives ~12 chances to land in a peer listen window before TTL expiry");
     }
 
     #[test]
