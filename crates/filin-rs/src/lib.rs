@@ -722,8 +722,14 @@ pub mod channel {
         }
     }
 
-    pub fn channel_for_eaw(_sequence: &[u16], _current_eaw: u16) -> Option<u16> {
-        unimplemented!("RED: channel slot selection not implemented yet")
+    pub fn channel_for_eaw(sequence: &[u16], current_eaw: u16) -> Option<u16> {
+        if sequence.is_empty() {
+            return None;
+        }
+        sequence
+            .get(usize::from(current_eaw) % sequence.len())
+            .copied()
+            .filter(|channel| *channel != 0)
     }
 
     #[cfg(test)]
