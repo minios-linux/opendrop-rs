@@ -60,8 +60,17 @@ pub fn dvzip_to_cpio(data: &[u8]) -> Vec<u8> {
 /// ([`dvzip_to_cpio`) handles any number of blocks; one block is functionally
 /// correct and round-trips exactly. This is the AirDrop sender's `/Upload`
 /// body builder.
-pub fn cpio_to_dvzip(_cpio: &[u8]) -> Vec<u8> {
-    Vec::new()
+pub fn cpio_to_dvzip(cpio: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(cpio).expect("zlib encode cpio");
+    let compressed = encoder.finish().expect("zlib finish");
+    let mut out = Vec::with_capacity(4 + compressed.len());
+    out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    out.extend_from_slice(&compressed);
+    out
 }
 
 #[cfg(test)]
