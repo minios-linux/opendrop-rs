@@ -608,6 +608,27 @@ pub mod sync {
         tu * 1024
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TsftBridge {
+        offset_us: Option<i64>,
+        sanity_clamp_us: i64,
+    }
+
+    impl Default for TsftBridge {
+        fn default() -> Self {
+            Self {
+                offset_us: None,
+                sanity_clamp_us: 100_000,
+            }
+        }
+    }
+
+    impl TsftBridge {
+        pub fn timestamp_rx(&mut self, _hw_tsft_us: u64, _host_now_us: u64) -> u64 {
+            unimplemented!("RED: TSFT bridge not implemented yet")
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -620,6 +641,14 @@ pub mod sync {
 
             assert_eq!(sync.last_update_us, 2_000_000 - (64 - 20) * 1024);
             assert_eq!(sync.aw_counter, 16);
+        }
+
+        #[test]
+        fn bridges_tsft_to_monotonic_with_ema_offset() {
+            let mut bridge = TsftBridge::default();
+
+            assert_eq!(bridge.timestamp_rx(1_000, 101_000), 101_000);
+            assert_eq!(bridge.timestamp_rx(2_000, 104_000), 102_125);
         }
     }
 }
