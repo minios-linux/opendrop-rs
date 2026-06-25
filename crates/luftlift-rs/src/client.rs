@@ -284,31 +284,53 @@ impl AirDropTransport for RustlsTransport {
 
 /// Read a full HTTP response (status line + headers + Content-Length body)
 /// from a BufRead. Mirrors `server::read_full_request` but for responses.
+///
+/// Handles interim `1xx` responses per RFC 7231 §6.2: a client MUST be able
+/// to parse one or more 1xx responses received prior to a final response,
+/// even if it did not expect a 100-Continue. We skip any 1xx block and
+/// continue reading until the final (non-1xx) response arrives.
 fn read_full_response(reader: &mut impl std::io::BufRead) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
     loop {
-        let mut line = Vec::new();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            break;
+        let mut buf = Vec::new();
+        loop {
+            let mut line = Vec::new();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&line);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
         }
-        buf.extend_from_slice(&line);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
+        if buf.is_empty() {
+            anyhow::bail!("connection closed before response headers complete");
         }
+        // If this is an interim 1xx response (100 Continue, 102 Processing,
+        // …), discard it and read the next response block. RFC 7231 §6.2:
+        // "a client MUST be able to parse one or more 1xx responses received
+        // prior to a final response, even if the client does not expect a
+        // 100-Continue status message."
+        let head = std::str::from_utf8(&buf).unwrap_or("");
+        let status_line = head.lines().next().unwrap_or("");
+        let is_interim = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .map(|status| (100..200).contains(&status))
+            .unwrap_or(false);
+        if is_interim {
+            continue;
+        }
+        // Final response — read the Content-Length-delimited body.
+        if let Some(cl) = parse_header_value(head, "content-length") {
+            let len: usize = cl.parse().unwrap_or(0);
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body)?;
+            buf.extend_from_slice(&body);
+        }
+        return Ok(buf);
     }
-    if buf.is_empty() {
-        anyhow::bail!("connection closed before response headers complete");
-    }
-    // Read Content-Length-delimited body.
-    let head = std::str::from_utf8(&buf).unwrap_or("");
-    if let Some(cl) = parse_header_value(head, "content-length") {
-        let len: usize = cl.parse().unwrap_or(0);
-        let mut body = vec![0u8; len];
-        reader.read_exact(&mut body)?;
-        buf.extend_from_slice(&body);
-    }
-    Ok(buf)
 }
 
 fn parse_header_value(headers: &str, name: &str) -> Option<String> {
@@ -510,5 +532,51 @@ mod tests {
         // And our chunked decoder handles a hand-framed body (iOS-18 path).
         let chunked = b"3\r\nabc\r\n0\r\n\r\n";
         assert_eq!(decode_chunked(chunked).unwrap(), b"abc");
+    }
+
+    // ---- read_full_response: interim 1xx handling ----
+
+    #[test]
+    fn read_full_response_skips_interim_100_continue() {
+        // A receiver that sends 100 Continue before the final 200 (RFC 7231
+        // §6.2: client MUST parse one or more 1xx responses before the final).
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\n\
+                    HTTP/1.1 200 OK\r\n\
+                    Content-Type: application/x-apple-plist\r\n\
+                    Content-Length: 5\r\n\
+                    \r\n\
+                    hello";
+        let mut reader = std::io::Cursor::new(&raw[..]);
+        let bytes = read_full_response(&mut reader).unwrap();
+        let resp = crate::http::parse_response(&bytes).unwrap();
+        assert_eq!(resp.status, 200, "must skip the 100 Continue and return the final 200");
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[test]
+    fn read_full_response_skips_multiple_1xx_responses() {
+        // RFC 7231 allows multiple 1xx responses before the final one.
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\n\
+                    HTTP/1.1 102 Processing\r\n\r\n\
+                    HTTP/1.1 200 OK\r\n\
+                    Content-Length: 2\r\n\
+                    \r\n\
+                    ok";
+        let mut reader = std::io::Cursor::new(&raw[..]);
+        let bytes = read_full_response(&mut reader).unwrap();
+        let resp = crate::http::parse_response(&bytes).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok");
+    }
+
+    #[test]
+    fn read_full_response_no_interim_returns_directly() {
+        // No 1xx: just the final response, as before.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+        let mut reader = std::io::Cursor::new(&raw[..]);
+        let bytes = read_full_response(&mut reader).unwrap();
+        let resp = crate::http::parse_response(&bytes).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"abc");
     }
 }
