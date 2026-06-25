@@ -401,6 +401,34 @@ pub fn parse_trace_n(target: &str) -> Option<usize> {
     None
 }
 
+/// A bound introspection HTTP server. Drop the handle to let the thread wind
+/// down (or call `stop()`); the listener is closed when the handle is
+/// dropped.
+pub struct IntrospectServer {
+    pub local_addr: std::net::SocketAddr,
+    pub handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IntrospectServer {
+    /// Politely stop the server. Best-effort: closing the listener is the
+    /// real signal since `incoming()` errors out on a closed socket.
+    pub fn stop(mut self) {
+        self.handle.take(); // detach; thread ends on listener close
+    }
+}
+
+/// Spawn the loopback introspection HTTP server. Binds `addr` (use
+/// `DEFAULT_HTTP_ADDR` = `127.0.0.1:9931` for the production default, or
+/// `127.0.0.1:0` for an ephemeral port in tests). Refuses to bind anything
+/// that isn't loopback (defence in depth: even if a caller passes a public
+/// address we never expose the introspect API off-box).
+pub fn spawn_http_server(
+    _addr: &str,
+    _state: Arc<IntrospectState>,
+) -> std::io::Result<IntrospectServer> {
+    todo!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,5 +836,128 @@ mod tests {
         // Match ring-buffer semantics: n=0 returns all. Non-numeric values
         // also parse to 0 to fail safe (broad rather than narrow capture).
         assert_eq!(parse_trace_n("/trace?n=abc"), Some(0));
+    }
+
+    // ---- HTTP server (real loopback TCP integration) ----
+
+    #[test]
+    fn http_server_get_status_serves_snapshot_json() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let state = Arc::new(IntrospectState::new());
+        state.record_announce("luftlift".into(), 8771);
+        state.bump_discover();
+        let server = spawn_http_server("127.0.0.1:0", state.clone()).expect("bind");
+        assert!(server.local_addr.ip().is_loopback(), "must bind loopback only");
+
+        let mut s = TcpStream::connect(server.local_addr).expect("connect");
+        s.write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200"), "status line: {}", &resp[..40]);
+        assert!(resp.contains("Content-Type: application/json"));
+        let body_start = resp.find("\r\n\r\n").expect("header terminator") + 4;
+        let json: serde_json::Value =
+            serde_json::from_slice(&buf[body_start..]).expect("body is JSON");
+        assert_eq!(json["receiver_name"], serde_json::json!("luftlift"));
+        assert_eq!(json["https_port"], serde_json::json!(8771));
+        assert_eq!(json["discover_count"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn http_server_post_trace_enables_ring_and_get_trace_returns_events() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let state = Arc::new(IntrospectState::new());
+        let server = spawn_http_server("127.0.0.1:0", state.clone()).expect("bind");
+
+        // 1. POST /trace to enable.
+        let mut s = TcpStream::connect(server.local_addr).expect("connect");
+        let body = br#"{"level":"debug"}"#;
+        let req = format!(
+            "POST /trace HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).expect("write head");
+        s.write_all(body).expect("write body");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200"), "POST /trace response: {}", &resp[..40]);
+        assert!(state.trace_enabled(), "ring must be enabled after POST /trace");
+
+        // 2. Emit an event from inside the dispatcher thread so the layer
+        //    observes it.
+        use tracing_subscriber::layer::SubscriberExt;
+        let collector = TraceCollector::new(state.clone());
+        let subscriber = tracing_subscriber::FmtSubscriber::new().with(collector);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(peer = "10.0.0.1", "Discover request");
+        });
+
+        // 3. GET /trace and verify the event is in the response.
+        let mut s = TcpStream::connect(server.local_addr).expect("connect 2");
+        s.write_all(b"GET /trace HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write get");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read 2");
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200"));
+        let body_start = resp.find("\r\n\r\n").expect("hdr term") + 4;
+        let arr: serde_json::Value =
+            serde_json::from_slice(&buf[body_start..]).expect("trace body is JSON");
+        let events = arr.as_array().expect("trace body is array");
+        assert!(!events.is_empty(), "at least one event captured");
+        assert_eq!(events.last().unwrap()["msg"], serde_json::json!("Discover request"));
+    }
+
+    #[test]
+    fn http_server_unknown_path_returns_404() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let state = Arc::new(IntrospectState::new());
+        let server = spawn_http_server("127.0.0.1:0", state).expect("bind");
+        let mut s = TcpStream::connect(server.local_addr).expect("connect");
+        s.write_all(b"GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 404"), "got: {}", &resp[..40]);
+    }
+
+    #[test]
+    fn http_server_post_trace_bad_json_returns_400() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let state = Arc::new(IntrospectState::new());
+        let server = spawn_http_server("127.0.0.1:0", state).expect("bind");
+        let mut s = TcpStream::connect(server.local_addr).expect("connect");
+        let body = b"not json";
+        let req = format!(
+            "POST /trace HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).expect("write head");
+        s.write_all(body).expect("write body");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {}", &resp[..40]);
+    }
+
+    #[test]
+    fn http_server_refuses_non_loopback_bind() {
+        // Defence in depth: even if a caller asks for an off-box bind, we
+        // refuse — the introspect API must never be reachable over AWDL.
+        let state = Arc::new(IntrospectState::new());
+        let result = spawn_http_server("0.0.0.0:0", state);
+        assert!(result.is_err(), "must refuse to bind a non-loopback address");
     }
 }
