@@ -593,12 +593,19 @@ pub mod sync {
 
         pub fn update_from_master(
             &mut self,
-            _rx_hw_time_us: u64,
-            _time_to_next_aw_tu: u16,
-            _aw_counter: u16,
+            rx_hw_time_us: u64,
+            time_to_next_aw_tu: u16,
+            aw_counter: u16,
         ) {
-            unimplemented!("RED: sync update not implemented yet")
+            let eaw_period_tu = u64::from(self.presence_mode) * u64::from(self.aw_period_tu);
+            self.last_update_us =
+                rx_hw_time_us - tu_to_us(eaw_period_tu - u64::from(time_to_next_aw_tu));
+            self.aw_counter = aw_counter & 0xfffc;
         }
+    }
+
+    fn tu_to_us(tu: u64) -> u64 {
+        tu * 1024
     }
 
     #[cfg(test)]
