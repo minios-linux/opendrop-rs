@@ -4332,7 +4332,11 @@ pub mod runtime {
         })
     }
 
-    pub fn run(mut links: Links) -> Result<(), Error> {
+    pub fn run(
+        mut links: Links,
+        introspect: std::sync::Arc<crate::introspect::Introspection>,
+        http_addr: Option<std::net::SocketAddr>,
+    ) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
         let mut awdl_state = crate::state::AwdlState::new(
             links.self_addr,
@@ -4363,8 +4367,44 @@ pub mod runtime {
             crate::schedule::ANNOUNCE_CACHE_TTL_US,
         );
 
+        // --- localhost introspection HTTP server (FILIN_HTTP_INTROSPECT.md).
+        //     Runs on its own OS thread so it can never block the AF_PACKET
+        //     hot loop below; the hot loop only bumps atomics and (throttled)
+        //     refreshes an RwLock snapshot. ---
+        if let Some(addr) = http_addr {
+            match std::net::TcpListener::bind(addr) {
+                Ok(listener) => {
+                    tracing::info!(%addr, "introspection HTTP server listening");
+                    let _http_handle = crate::introspect::spawn(introspect.clone(), listener);
+                    // _http_handle dropped here intentionally: the thread runs
+                    // for the lifetime of the daemon (detached).
+                }
+                Err(err) => tracing::warn!(
+                    ?err,
+                    %addr,
+                    "introspection HTTP bind failed; continuing without the introspection server"
+                ),
+            }
+        }
+
+        // Hot-loop introspection state. last_injected_seq tracks the most
+        // recently injected AWDL sequence control for /status "master_seq".
+        let mut last_injected_seq: u16 = 0;
+        // Throttle status/peer snapshot refreshes to ~10 Hz so the RwLock
+        // write happens at most every 100 ms — cheap, never blocks the loop.
+        let mut last_refresh_us: u64 = 0;
+        const REFRESH_PERIOD_US: u64 = 100_000;
+
         loop {
             let now_us = host_time_us();
+
+            // --- throttled introspection snapshot refresh (~10 Hz) ---
+            if now_us.wrapping_sub(last_refresh_us) >= REFRESH_PERIOD_US {
+                introspect
+                    .set_status(build_status_snapshot(&awdl_state, last_injected_seq));
+                introspect.set_peers(build_peer_views(&awdl_state, now_us));
+                last_refresh_us = now_us;
+            }
 
             // --- channel switching (owl awdl_switch_channel, core.c:279) ---
             if announce.switch_due(&awdl_state.sync, now_us) {
@@ -4405,7 +4445,13 @@ pub mod runtime {
             //     distinct channel as filin hops through the master cycle
             //     (owl awdl_send_multicast, core.c:246-277, extended). ---
             if !mcast_spread.is_empty() {
-                drain_mcast_spread(&links, &awdl_state, &mut mcast_spread, now_us);
+                drain_mcast_spread(
+                    &links,
+                    &awdl_state,
+                    &mut mcast_spread,
+                    now_us,
+                    &introspect,
+                );
             }
 
             // --- Part A: re-broadcast the cached mDNS announce on every
@@ -4420,7 +4466,7 @@ pub mod runtime {
                 )
                 .is_none()
             {
-                rebroadcast_announce(&links, &awdl_state, &mut announce_cache, now_us);
+                rebroadcast_announce(&links, &awdl_state, &mut announce_cache, now_us, &introspect);
             }
 
             // --- action frame TX: PSF/MIF (owl awdl_send_psf/mif) ---
@@ -4428,7 +4474,10 @@ pub mod runtime {
                 let seq = awdl_state.next_data_seq();
                 let frame = build_announce_frame(subtype, &awdl_state, seq << 4, now_us);
                 match links.packet.send(&frame) {
-                    Ok(sent) => tracing::trace!(sent, ?subtype, "injected awdl announce frame"),
+                    Ok(sent) => {
+                        last_injected_seq = seq;
+                        tracing::trace!(sent, ?subtype, "injected awdl announce frame");
+                    }
                     Err(err) => tracing::trace!(?err, ?subtype, "packet announce send failed"),
                 }
             }
@@ -4437,7 +4486,7 @@ pub mod runtime {
             if pending_tx.is_some() {
                 if let Some(frame) = pending_tx.take() {
                     if try_send_data(&links, &awdl_state, now_us, &frame) {
-                        // sent successfully
+                        last_injected_seq = frame.seq;
                     } else {
                         // still can't send — keep it pending
                         pending_tx = Some(frame);
@@ -4500,6 +4549,20 @@ pub mod runtime {
                                         );
                                     } else {
                                         for frame in &frames {
+                                            // Count mDNS (UDP/5353) frames
+                                            // delivered to awdl0 by source —
+                                            // mdns_rx_other is the direct
+                                            // "are we hearing the iPhone?"
+                                            // signal.
+                                            if let Some(is_self) =
+                                                classify_mdns(&frame.bytes, links.self_addr)
+                                            {
+                                                if is_self {
+                                                    introspect.counters.inc_mdns_rx_self();
+                                                } else {
+                                                    introspect.counters.inc_mdns_rx_other();
+                                                }
+                                            }
                                             links
                                                 .tap
                                                 .write_all(&frame.bytes)
@@ -4553,6 +4616,11 @@ pub mod runtime {
                 if len >= 14 {
                     let dst = mac_from_slice(&tap_buf[0..6]);
                     let src = mac_from_slice(&tap_buf[6..12]);
+                    // Count outgoing mDNS announces from luftlift (self) so
+                    // /status can show our own announce cadence.
+                    if let Some(true) = classify_mdns(&tap_buf[..len], links.self_addr) {
+                        introspect.counters.inc_mdns_rx_self();
+                    }
                     match awdl::encapsulate_ethernet_payload(&tap_buf[..len], awdl_state.tx_seq) {
                         Ok(body) => {
                             let seq = awdl_state.next_data_seq();
@@ -4565,6 +4633,7 @@ pub mod runtime {
                                     &body,
                                 )),
                                 dst,
+                                seq,
                             };
                             // Multicast/broadcast frames (mDNS announce,
                             // NDP, broadcast) are spread across every
@@ -4595,6 +4664,7 @@ pub mod runtime {
                                         &awdl_state,
                                         &mut mcast_spread,
                                         host_time_us(),
+                                        &introspect,
                                     );
                                 }
                             } else if !try_send_data(
@@ -4608,6 +4678,8 @@ pub mod runtime {
                                     pending = true,
                                     "buffered data frame for later AW-gated TX"
                                 );
+                            } else {
+                                last_injected_seq = seq;
                             }
                         }
                         Err(err) => tracing::trace!(?err, len, "ignored host tap frame"),
@@ -4622,6 +4694,10 @@ pub mod runtime {
     struct PendingFrame {
         radiotap_frame: Vec<u8>,
         dst: [u8; 6],
+        /// AWDL sequence control used for this frame, tracked so the
+        /// introspection `/status master_seq` reflects the most recent
+        /// injection even after a buffered retry.
+        seq: u16,
     }
 
     /// owl `awdl_can_send_unicast_in` decision (owl/src/schedule.c:57-79):
@@ -4668,11 +4744,14 @@ pub mod runtime {
     /// are inside the guard, the frames stay queued and are retried on the
     /// next iteration (or the next hop onto that channel). The pure
     /// scheduling decision lives in [`crate::schedule::MulticastSpread`].
+    /// Each successful send bumps the per-channel `rebroadcast_counts` counter
+    /// so `/status` can show how often filin re-injects on each social channel.
     fn drain_mcast_spread(
         links: &Links,
         awdl_state: &crate::state::AwdlState,
         spread: &mut crate::schedule::MulticastSpread,
         now_us: u64,
+        introspect: &crate::introspect::Introspection,
     ) {
         let channel = awdl_state.current_channel;
         if channel == 0 {
@@ -4687,12 +4766,15 @@ pub mod runtime {
         }
         for frame in spread.drain_for_channel(channel, now_us) {
             match links.packet.send(&frame) {
-                Ok(sent) => tracing::trace!(
-                    sent,
-                    channel,
-                    pending = spread.len(),
-                    "injected spread multicast frame on hop channel"
-                ),
+                Ok(sent) => {
+                    introspect.counters.inc_rebroadcast(channel);
+                    tracing::trace!(
+                        sent,
+                        channel,
+                        pending = spread.len(),
+                        "injected spread multicast frame on hop channel"
+                    );
+                }
                 Err(err) => tracing::trace!(?err, channel, "spread multicast send failed"),
             }
         }
@@ -4701,11 +4783,13 @@ pub mod runtime {
     /// Part A: re-inject the cached mDNS announce on the current channel if
     /// the [`AnnounceCache`] permits it (social channel, rate-limit ok, not
     /// expired). Gated by the multicast guard interval like the spread path.
+    /// Each successful send bumps the per-channel `rebroadcast_counts` counter.
     fn rebroadcast_announce(
         links: &Links,
         awdl_state: &crate::state::AwdlState,
         cache: &mut crate::schedule::AnnounceCache,
         now_us: u64,
+        introspect: &crate::introspect::Introspection,
     ) {
         let channel = awdl_state.current_channel;
         if channel == 0 {
@@ -4720,11 +4804,14 @@ pub mod runtime {
         }
         if let Some(frame) = cache.rebroadcast(channel, now_us) {
             match links.packet.send(frame) {
-                Ok(sent) => tracing::debug!(
-                    sent,
-                    channel,
-                    "re-broadcast cached mDNS announce on social channel"
-                ),
+                Ok(sent) => {
+                    introspect.counters.inc_rebroadcast(channel);
+                    tracing::debug!(
+                        sent,
+                        channel,
+                        "re-broadcast cached mDNS announce on social channel"
+                    );
+                }
                 Err(err) => {
                     tracing::trace!(?err, channel, "announce re-broadcast send failed")
                 }
@@ -5113,7 +5200,6 @@ pub mod runtime {
     /// live AWDL state + the most-recently-injected frame's sequence control.
     /// The runtime calls this on a throttled cadence and feeds it to
     /// [`crate::introspect::Introspection::set_status`].
-    #[allow(dead_code)] // wired in the next integration commit
     fn build_status_snapshot(
         state: &crate::state::AwdlState,
         last_injected_seq: u16,
@@ -5131,7 +5217,6 @@ pub mod runtime {
     /// `AwdlState`. `decoded_chanseq` is each slot's channel number; the
     /// per-peer `current_channel` is filin's own (we hop co-channel with the
     /// peers we can hear).
-    #[allow(dead_code)] // wired in the next integration commit
     fn build_peer_views(
         state: &crate::state::AwdlState,
         now_us: u64,
@@ -5154,7 +5239,6 @@ pub mod runtime {
     /// Handles IPv4 (with the IHL-driven header length) and IPv6. Used by the
     /// hot loop to bump `mdns_rx_self` / `mdns_rx_other` on the introspection
     /// counters — directly answers "are we hearing the iPhone at all?".
-    #[allow(dead_code)] // wired in the next integration commit
     fn classify_mdns(frame: &[u8], self_addr: [u8; 6]) -> Option<bool> {
         const MDNS_PORT: u16 = 5353;
         const PROTO_UDP: u8 = 17;

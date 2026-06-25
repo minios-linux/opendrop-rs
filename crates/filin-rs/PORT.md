@@ -58,6 +58,27 @@ discovery?" agony — make it observable here.
 4. Validate: with a real Apple device active, `luftlift-rs` (other crate) should
    discover and receive a file over the awdl0 this brings up.
 
+## Localhost HTTP introspection API (`--http-addr`)
+A loopback-only HTTP/JSON server for live debugging — `curl | jq` instead of
+grepping `/tmp/fF.log`. See `FILIN_HTTP_INTROSPECT.md` for the full rationale.
+
+- **CLI**: `--http-addr 127.0.0.1:9930` (default), or `--no-http` to disable.
+  Non-loopback addresses are rejected at config time (`ConfigError::NonLoopbackHttpAddr`)
+  and the server additionally checks each connection's peer address.
+- **Threading**: the server runs on its own OS thread; the AF_PACKET hot loop
+  only bumps `AtomicU64` counters and (throttled ~10 Hz) refreshes an `RwLock`
+  snapshot — it never takes a lock on the hot path.
+- **Endpoints** (JSON):
+  - `GET /status` → `current_channel`, `master_mac`, `master_seq`,
+    `synced`, `peer_count`, `rebroadcast_counts: {"6":N,"44":N,"149":N}`,
+    `mdns_rx_self`, `mdns_rx_other`. The `mdns_rx_other` counter is the direct
+    "are we hearing the iPhone at all?" signal.
+  - `GET /peers` → array of `{ mac, last_seen_ms_ago, decoded_chanseq, current_channel }`.
+  - `GET /trace?n=300` → last N structured trace events from a 2000-cap ring.
+  - `POST /trace` with `{"level":"off|debug|trace"}` → flips the `AtomicU8` that
+    gates whether the custom `tracing` Layer pushes events into the ring (off
+    by default, so the hot path is one relaxed load + compare).
+
 Coordinate with Claude (orchestrator) for: workspace dep additions, the awdl0
 contract, and anything that would touch shared files. Keep all your code under
 `crates/filin-rs/`.
