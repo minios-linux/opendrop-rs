@@ -446,21 +446,24 @@ pub mod awdl {
     }
 
     pub fn parse_tlvs(bytes: &[u8]) -> Result<Vec<Tlv<'_>>, ParseError> {
+        // owl iterates TLVs with read_tlv (owl/src/wire.c:209-222) inside a
+        // `while ((len = read_tlv(..)) > 0)` loop (owl/src/rx.c:295): an
+        // incomplete *trailing* TLV makes read_tlv return OUT_OF_BOUNDS and the
+        // loop simply stops — the already-seen TLVs (and the peer, added
+        // earlier) are kept. Mirror that tolerance here: stop cleanly on a
+        // short trailing header or value rather than failing the whole frame.
         let mut offset = 0;
         let mut tlvs = Vec::new();
-
-        while offset < bytes.len() {
-            let header = bytes.get(offset..offset + 3).ok_or(ParseError::TooShort)?;
-            let kind = header[0];
-            let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+        while offset + 3 <= bytes.len() {
+            let kind = bytes[offset];
+            let len = u16::from_le_bytes([bytes[offset + 1], bytes[offset + 2]]) as usize;
             offset += 3;
-
-            let end = offset.checked_add(len).ok_or(ParseError::TooShort)?;
-            let value = bytes.get(offset..end).ok_or(ParseError::TooShort)?;
+            let Some(value) = bytes.get(offset..offset + len) else {
+                break; // incomplete trailing TLV value
+            };
             tlvs.push(Tlv { kind, value });
-            offset = end;
+            offset += len;
         }
-
         Ok(tlvs)
     }
 
@@ -639,6 +642,24 @@ pub mod awdl {
                     }
                 ]
             );
+        }
+
+        #[test]
+        fn parse_tlvs_stops_cleanly_on_incomplete_trailing_tlv() {
+            // Two good TLVs followed by an incomplete trailing value, then a
+            // short header fragment — owl's read_tlv loop exits on both.
+            let tlvs = [
+                0x04, 0x02, 0x00, 0xaa, 0xbb, // ok: sync params fragment
+                0x18, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04, // ok: election v2 fragment
+                0x07, 0x08, 0x00, 0xce, 0x11, // incomplete: claims len 8 but only 2 bytes
+                0xde, 0xad, // dangling header fragment (< 3 bytes)
+            ];
+
+            let parsed = parse_tlvs(&tlvs).expect("tolerant parse keeps leading TLVs");
+
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].kind, 0x04);
+            assert_eq!(parsed[1].kind, 0x18);
         }
 
         #[test]
