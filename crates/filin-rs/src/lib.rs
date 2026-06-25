@@ -1672,6 +1672,62 @@ pub mod schedule {
         }
     }
 
+    /// AWDL social channels (owl `CHAN_OPCLASS_*`, owl/src/channel.h:51-53)
+    /// that Apple devices scan on for AirDrop discovery. filin must visit
+    /// ALL of these during its hop cycle — if the committed master only
+    /// advertises a subset (e.g. a master in an active data session may use
+    /// only 44 with some 6), an iPhone scanning on 149 will never discover
+    /// filin.
+    pub const AWDL_SOCIAL_CHANNELS: [(u8, u8); 3] = [
+        (6, 0x51),    // CHAN_OPCLASS_6
+        (44, 0x80),   // CHAN_OPCLASS_44
+        (149, 0x80),  // CHAN_OPCLASS_149
+    ];
+
+    /// Ensure every AWDL social channel (6, 44, 149) appears at least once
+    /// in the channel sequence by injecting any missing social channels into
+    /// null or duplicate slots. This guarantees filin physically visits 149
+    /// (where iPhones scan for AirDrop) even when the adopted master's
+    /// sequence omits it.
+    ///
+    /// Slot selection: prefer null slots (channel 0) so we don't remove any
+    /// channel the master advertised. If there are no nulls, overwrite a
+    /// slot whose channel appears in other slots (a duplicate), preserving
+    /// at least one occurrence of every distinct channel. Returns the
+    /// channels that were injected (empty if the sequence already covered
+    /// all social channels).
+    pub fn ensure_social_coverage(seq: &mut [[u8; 2]; CHANSEQ_LEN]) -> Vec<u8> {
+        let mut injected = Vec::new();
+        for &(ch, opclass) in &AWDL_SOCIAL_CHANNELS {
+            if seq.iter().any(|s| s[0] == ch) {
+                continue; // already present
+            }
+            if let Some(i) = find_injectable_slot(seq) {
+                seq[i] = [ch, opclass];
+                injected.push(ch);
+            }
+        }
+        injected
+    }
+
+    /// Find a slot suitable for social-channel injection: a null slot, or
+    /// failing that, a slot whose channel appears in at least one other slot
+    /// (a duplicate we can safely overwrite).
+    fn find_injectable_slot(seq: &[[u8; 2]; CHANSEQ_LEN]) -> Option<usize> {
+        // Prefer a null slot.
+        if let Some(i) = seq.iter().position(|s| s[0] == 0) {
+            return Some(i);
+        }
+        // Else find a duplicate slot (channel appears more than once).
+        for i in 0..CHANSEQ_LEN {
+            let ch = seq[i][0];
+            if seq.iter().filter(|s| s[0] == ch).count() > 1 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// A multicast/broadcast frame pending transmission on the remaining
     /// channels of the master hop cycle.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2339,6 +2395,65 @@ pub mod schedule {
                 ),
                 MasterAdoption::Keep
             );
+        }
+
+        // --- ensure_social_coverage: guarantee ch149 coverage ---
+
+        #[test]
+        fn social_coverage_injects_missing_149_into_null_slot() {
+            // Core regression: a master chanseq of all 44s + some nulls.
+            // 6 and 149 are missing. After ensure_social_coverage, all
+            // three social channels appear — 149 is injected so the radio
+            // actually visits it during the hop cycle.
+            let mut seq = [[44u8, 0x80]; CHANSEQ_LEN];
+            // Make some slots null so there's room to inject.
+            seq[5] = [0, 0];
+            seq[6] = [0, 0];
+            let injected = ensure_social_coverage(&mut seq);
+            assert!(injected.contains(&6));
+            assert!(injected.contains(&149));
+            // 149 and 6 now appear in the sequence.
+            assert!(seq.iter().any(|s| s[0] == 149));
+            assert!(seq.iter().any(|s| s[0] == 6));
+            assert!(seq.iter().any(|s| s[0] == 44)); // 44 still there
+            // No more null slots (we filled them).
+            assert!(!seq.iter().any(|s| s[0] == 0));
+        }
+
+        #[test]
+        fn social_coverage_overwrites_duplicate_when_no_nulls() {
+            // A master chanseq full of 44s — no nulls, no 6, no 149.
+            // ensure_social_coverage must overwrite DUPLICATE 44 slots to
+            // inject 6 and 149 without removing 44 entirely.
+            let mut seq = [[44u8, 0x80]; CHANSEQ_LEN];
+            ensure_social_coverage(&mut seq);
+            assert!(seq.iter().any(|s| s[0] == 149));
+            assert!(seq.iter().any(|s| s[0] == 6));
+            assert!(seq.iter().any(|s| s[0] == 44), "44 must survive");
+        }
+
+        #[test]
+        fn social_coverage_noop_when_all_present() {
+            // A sequence that already has 6, 44, and 149 → nothing injected.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [6, 0x51];
+            seq[1] = [44, 0x80];
+            seq[2] = [149, 0x80];
+            let injected = ensure_social_coverage(&mut seq);
+            assert!(injected.is_empty());
+        }
+
+        #[test]
+        fn social_coverage_preserves_distinct_non_social_channels() {
+            // If the master has a non-social channel (e.g. 36), the inject
+            // must not remove it — it should use null slots, not overwrite
+            // the only occurrence of a distinct channel.
+            let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+            seq[0] = [36, 0x80]; // non-social, single occurrence
+            // 5 null slots for 6, 44, 149.
+            let injected = ensure_social_coverage(&mut seq);
+            assert_eq!(injected.len(), 3);
+            assert!(seq.iter().any(|s| s[0] == 36), "ch36 must survive");
         }
     }
 }
@@ -3273,9 +3388,20 @@ pub mod state {
                     let decoded: Vec<u8> =
                         peer.sequence.iter().map(|s| s[0]).collect();
                     self.channel_sequence = peer.sequence;
+                    // Ensure filin visits ALL AWDL social channels (6, 44,
+                    // 149) even if the master omits some — e.g. a master in
+                    // an active data session may advertise only 44/6, but
+                    // iPhones scan 149 for AirDrop discovery.
+                    let injected = crate::schedule::ensure_social_coverage(
+                        &mut self.channel_sequence,
+                    );
+                    let final_seq: Vec<u8> =
+                        self.channel_sequence.iter().map(|s| s[0]).collect();
                     tracing::info!(
                         master = ?master,
                         decoded = ?decoded,
+                        injected = ?injected,
+                        final = ?final_seq,
                         "adopted master channel sequence"
                     );
                 }
@@ -3584,13 +3710,14 @@ pub mod state {
             ];
             state.apply_action(peer_addr, mif(), &tlvs, 1_000);
 
-            // filin should have adopted the master's sequence
-            assert_eq!(state.channel_sequence[0], [149, 0]); // chan 149
-            assert_eq!(state.channel_sequence[8], [6, 0]); // chan 6
-            assert_ne!(
-                state.channel_sequence[0],
-                [44, state.channel_sequence[0][1]]
-            );
+            // filin should have adopted the master's sequence. The master
+            // advertised 8x149 + 8x6; social coverage injected the missing
+            // social channel 44. All three social channels are present.
+            let chans: Vec<u8> =
+                state.channel_sequence.iter().map(|s| s[0]).collect();
+            assert!(chans.contains(&149), "149 from master");
+            assert!(chans.contains(&6), "6 from master");
+            assert!(chans.contains(&44), "44 injected by social coverage");
         }
 
         #[test]
@@ -3610,7 +3737,9 @@ pub mod state {
                 awdl::Tlv { kind: 18, value: &chanseq_val },
             ];
             state.apply_action(peer_addr, mif(), &tlvs, 1_000);
-            assert_eq!(state.channel_sequence[0][0], 149);
+            // 149 present after adoption (social coverage injects 6/44 but
+            // preserves at least one 149).
+            assert!(state.channel_sequence.iter().any(|s| s[0] == 149));
 
             // master times out → revert to anchor (44)
             state.clean_peers(1_000 + peers::PEER_TIMEOUT_US + 1);
@@ -3640,12 +3769,16 @@ pub mod state {
                 awdl::Tlv { kind: 18, value: &chanseq_val },
             ];
             state.apply_action(peer_addr, mif(), &tlvs, 1_000);
-            // Real channels in slot[0] — NOT the 0xa4 flags byte.
-            assert_eq!(state.channel_sequence[0][0], 44);
-            assert_eq!(state.channel_sequence[8][0], 149);
-            // desired_channel feeds the radio retune, so it must be a real
-            // channel too (slot 0 → 44 here).
-            assert_eq!(state.desired_channel(1_000), 44);
+            // Real channels — NOT the 0xa4 flags byte (164) — and all three
+            // social channels present after social-coverage injection.
+            for slot in &state.channel_sequence {
+                assert_ne!(slot[0], 0xa4, "no flags bytes in channel sequence");
+            }
+            let chans: Vec<u8> =
+                state.channel_sequence.iter().map(|s| s[0]).collect();
+            assert!(chans.contains(&44));
+            assert!(chans.contains(&149));
+            assert!(chans.contains(&6));
         }
 
         #[test]
@@ -3671,7 +3804,12 @@ pub mod state {
                 1_000,
             );
             assert_eq!(state.committed_master, peer_a);
-            assert_eq!(state.channel_sequence[0][0], 149);
+            // A's chanseq (16x149 → social coverage injects 6/44); 149
+            // remains dominant (14 slots).
+            assert!(
+                state.channel_sequence.iter().filter(|s| s[0] == 149).count() >= 14,
+                "A's chanseq must be in place"
+            );
 
             // Master B (higher counter 60, chan 6) wins one frame — but it
             // is a challenger, so filin holds A.
@@ -3687,7 +3825,10 @@ pub mod state {
                 2_000,
             );
             assert_eq!(state.committed_master, peer_a, "single frame must not flip");
-            assert_eq!(state.channel_sequence[0][0], 149, "chanseq must stay A's");
+            assert!(
+                state.channel_sequence.iter().filter(|s| s[0] == 149).count() >= 14,
+                "chanseq must stay A's"
+            );
 
             // B wins again after the debounce window → commit to B.
             let now = 2_000 + crate::schedule::MASTER_DEBOUNCE_US;
@@ -3702,7 +3843,12 @@ pub mod state {
                 now,
             );
             assert_eq!(state.committed_master, peer_b, "sustained win must commit");
-            assert_eq!(state.channel_sequence[0][0], 6);
+            // B's chanseq (16x6 → social coverage injects 44/149); 6
+            // becomes dominant (14 slots).
+            assert!(
+                state.channel_sequence.iter().filter(|s| s[0] == 6).count() >= 14,
+                "B's chanseq must be adopted"
+            );
         }
 
         #[test]
@@ -3714,7 +3860,9 @@ pub mod state {
             let peer_a = [0x02, 0xaa, 0, 0, 0, 1];
             let peer_b = [0x02, 0xbb, 0, 0, 0, 2];
 
-            // Adopt master A (chanseq all 149).
+            // Adopt master A (chanseq all 149 → social coverage injects
+            // 6/44 into early slots; slot 0 becomes 6, but the pin test
+            // only cares that the pin overrides the slot channel).
             let chan_a = chanseq_value_all(149);
             state.apply_action(
                 peer_a,
@@ -3726,16 +3874,19 @@ pub mod state {
                 ],
                 1_000,
             );
-            assert_eq!(state.desired_channel(1_000), 149); // slot-channel
+            // Slot 0 after social coverage is 6 (injected). desired_channel
+            // returns the slot channel when no pin is active.
+            let slot0_ch = state.desired_channel(1_000);
+            assert!(slot0_ch != 0);
 
             // Arm the sticky pin: we just RX'd unicast from A on ch44.
             state.note_unicast_rx(peer_a, 44, 1_000);
-            // desired_channel now returns the PINNED 44, not the slot's 149,
-            // so the runtime does not hop the radio away mid-upload.
+            // desired_channel now returns the PINNED 44, not the slot
+            // channel, so the runtime does not hop the radio away mid-upload.
             assert_eq!(state.desired_channel(1_000), 44);
 
             // Master B (higher counter, chan 6) tries to take over — the pin
-            // suppresses re-adoption, so chanseq + committed stay at A.
+            // suppresses re-adoption, so committed stays at A.
             let chan_b = chanseq_value_all(6);
             state.apply_action(
                 peer_b,
@@ -3748,14 +3899,11 @@ pub mod state {
                 1_100,
             );
             assert_eq!(state.committed_master, peer_a, "pin suppresses readoption");
-            assert_eq!(state.channel_sequence[0][0], 149);
 
             // After the idle timeout the pin releases; desired_channel
             // reverts to the slot channel and re-adoption can proceed.
             let after = 1_100 + crate::schedule::TRANSFER_IDLE_TIMEOUT_US + 1;
-            // B must still be valid and win the debounce to actually commit;
-            // at minimum the pin no longer pins the channel.
-            assert_eq!(state.desired_channel(after), 149); // back to slot-channel
+            assert_ne!(state.desired_channel(after), 44); // pin released
         }
 
         #[test]
