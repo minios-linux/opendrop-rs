@@ -1139,9 +1139,13 @@ pub mod cli {
 
 pub mod os {
     pub mod tun {
+        use std::fs::{File, OpenOptions};
+        use std::os::fd::AsRawFd;
+
         #[derive(Debug, PartialEq, Eq)]
         pub enum Error {
             InvalidName,
+            Io(i32),
         }
 
         #[derive(Debug, PartialEq, Eq)]
@@ -1162,6 +1166,52 @@ pub mod os {
                 name: if_name,
                 flags: (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short,
             })
+        }
+
+        pub fn open_tap(name: &str) -> Result<File, Error> {
+            let plan = plan_tap_ifreq(name)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/net/tun")
+                .map_err(errno_from_io)?;
+            let mut request = TunIfReq::from_plan(&plan);
+
+            // SAFETY: request is a C-compatible ifreq prefix accepted by TUNSETIFF;
+            // the fd is an open /dev/net/tun file and the kernel writes only within it.
+            let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::TUNSETIFF, &mut request) };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+
+            Ok(file)
+        }
+
+        #[repr(C)]
+        struct TunIfReq {
+            name: [libc::c_char; libc::IFNAMSIZ],
+            flags: libc::c_short,
+        }
+
+        impl TunIfReq {
+            fn from_plan(plan: &IfReqPlan) -> Self {
+                let mut name = [0; libc::IFNAMSIZ];
+                for (dst, src) in name.iter_mut().zip(plan.name) {
+                    *dst = src as libc::c_char;
+                }
+                Self {
+                    name,
+                    flags: plan.flags,
+                }
+            }
+        }
+
+        fn errno_from_io(err: std::io::Error) -> Error {
+            Error::Io(err.raw_os_error().unwrap_or(libc::EIO))
+        }
+
+        fn last_errno() -> Error {
+            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
         }
 
         #[cfg(test)]
