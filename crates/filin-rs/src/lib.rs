@@ -1432,8 +1432,8 @@ pub mod sync {
             aw_counter: u16,
         ) {
             let eaw_period_tu = u64::from(self.presence_mode) * u64::from(self.aw_period_tu);
-            self.last_update_us =
-                rx_hw_time_us - tu_to_us(eaw_period_tu - u64::from(time_to_next_aw_tu));
+            self.last_update_us = rx_hw_time_us
+                .saturating_sub(tu_to_us(eaw_period_tu - u64::from(time_to_next_aw_tu)));
             self.aw_counter = aw_counter & 0xfffc;
         }
 
@@ -1446,7 +1446,7 @@ pub mod sync {
 
         pub fn next_aw_tu(&self, now_us: u64) -> u16 {
             let eaw_period_tu = u64::from(self.presence_mode) * u64::from(self.aw_period_tu);
-            let time_since_tu = us_to_tu(now_us - self.last_update_us);
+            let time_since_tu = us_to_tu(now_us.saturating_sub(self.last_update_us));
             (eaw_period_tu - (time_since_tu % eaw_period_tu)) as u16
         }
 
@@ -1462,7 +1462,7 @@ pub mod sync {
 
         pub fn current_aw(&self, now_us: u64) -> u16 {
             let eaw_period_tu = u64::from(self.presence_mode) * u64::from(self.aw_period_tu);
-            let time_since_tu = us_to_tu(now_us - self.last_update_us);
+            let time_since_tu = us_to_tu(now_us.saturating_sub(self.last_update_us));
             let current_aw = u64::from(self.aw_counter)
                 + (time_since_tu % eaw_period_tu) / u64::from(self.aw_period_tu)
                 + u64::from(self.presence_mode) * (time_since_tu / eaw_period_tu);
