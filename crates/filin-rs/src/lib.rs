@@ -4005,28 +4005,6 @@ pub mod state {
                 return;
             }
             let winner = self.election.sync_addr;
-            // FILIN_SYNC_QUALITY.md Part B: re-parent hysteresis keyed on
-            // master_addr stability. If the election winner is a DIFFERENT peer
-            // but reports the SAME cluster top master as our current committed
-            // parent (and that parent is still alive), do NOT re-parent — ride
-            // through the intra-cluster churn. Only re-sync when master_addr
-            // actually changes or the current parent goes stale (dropped from
-            // the peer table, so the lookup below yields None → not same-cluster).
-            if winner != self.committed_master
-                && winner != self.self_addr
-                && self.committed_master != self.self_addr
-            {
-                let same_cluster = self
-                    .peers
-                    .get(&self.committed_master)
-                    .map(|p| p.election.master_addr == self.election.master_addr)
-                    .unwrap_or(false);
-                if same_cluster {
-                    // Hold the current parent: its cluster is unchanged. Do not
-                    // touch pending tracking either — this isn't a challenge.
-                    return;
-                }
-            }
             // Bug B: debounce a challenger before committing — but only when
             // SWITCHING between two real external masters. The first adoption
             // (self → real master) and master loss (real master → self) are
@@ -4827,21 +4805,28 @@ pub mod state {
 
             // Peer B arrives (same cluster top, higher counter, slot0 = 6).
             // filin MUST re-adopt B's channel sequence (channel surfing) and
-            // B MUST be in the peer table.
-            state.apply_action(
-                peer_b,
-                mif(),
-                &[
-                    peer_with_cluster(peer_b, top, 60),
-                    version_tlv(0x34, 1),
-                    chanseq_tlv(6),
-                ],
-                2_000,
-            );
+            // B MUST be in the peer table. In the live environment frames
+            // arrive continuously (~160ms PSF interval); simulate by sending
+            // B twice past the Bug B debounce window (first frame starts the
+            // pending clock, second frame past debounce commits).
+            let b_t1 = 2_000;
+            let b_t2 = b_t1 + crate::schedule::MASTER_DEBOUNCE_US + 1;
+            for t in [b_t1, b_t2] {
+                state.apply_action(
+                    peer_b,
+                    mif(),
+                    &[
+                        peer_with_cluster(peer_b, top, 60),
+                        version_tlv(0x34, 1),
+                        chanseq_tlv(6),
+                    ],
+                    t,
+                );
+            }
             assert_eq!(state.peers.len(), 2, "both peers A and B retained");
             // Channel sequence re-adopted from B: 6 must DOMINATE (>=14 slots
-            // after social coverage), not 149. If the hysteresis froze A's
-            // sequence, 149 would dominate instead — that's the regression.
+            // after social coverage), not 149. If the sequence were frozen at
+            // A's, 149 would dominate instead — that's the regression.
             let count_6 = state.channel_sequence.iter().filter(|s| s[0] == 6).count();
             let count_149 = state.channel_sequence.iter().filter(|s| s[0] == 149).count();
             assert!(
