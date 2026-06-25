@@ -13,8 +13,8 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("filin starting (skeleton — see PORT.md)");
-    let config = filin_rs::cli::parse_config_from(std::env::args_os())
+    tracing::info!("filin starting");
+    let config = filin_rs::cli::parse_config_from_env()
         .map_err(|err| anyhow::anyhow!("invalid CLI arguments: {err:?}"))?;
     tracing::info!(
         monitor_iface = %config.monitor_iface,

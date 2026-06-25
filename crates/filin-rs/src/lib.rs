@@ -1161,6 +1161,8 @@ pub mod cli {
     #[derive(Debug, Parser)]
     #[command(name = "filin", disable_help_flag = true)]
     struct Args {
+        #[arg(long = "help", action = clap::ArgAction::Help, help = "Print help")]
+        _help: Option<bool>,
         #[arg(short = 'i')]
         monitor_iface: String,
         #[arg(short = 'c', default_value_t = 44)]
@@ -1171,12 +1173,21 @@ pub mod cli {
         assume_monitor: bool,
     }
 
+    pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
+        let args = Args::parse();
+        config_from_args(args)
+    }
+
     pub fn parse_config_from<I, S>(args: I) -> Result<iface::Config, CliError>
     where
         I: IntoIterator<Item = S>,
         S: Into<std::ffi::OsString> + Clone,
     {
         let args = Args::try_parse_from(args).map_err(|_| CliError::Invalid)?;
+        config_from_args(args)
+    }
+
+    fn config_from_args(args: Args) -> Result<iface::Config, CliError> {
         iface::validate_config(iface::Config {
             monitor_iface: args.monitor_iface,
             host_iface: args.host_iface,
@@ -1204,6 +1215,18 @@ pub mod cli {
                     assume_monitor: true,
                 }
             );
+        }
+
+        #[test]
+        fn supports_long_help_without_reclaiming_short_h() {
+            let err = Args::try_parse_from(["filin", "--help"]).expect_err("help exits parser");
+
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert!(err.to_string().contains("Usage:"));
+
+            let config = parse_config_from(["filin", "-i", "wlan0mon", "-h", "awdl-test"])
+                .expect("short -h remains host iface");
+            assert_eq!(config.host_iface, "awdl-test");
         }
     }
 }
