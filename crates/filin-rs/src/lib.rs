@@ -174,13 +174,21 @@ pub mod ieee80211 {
     }
 
     pub fn build_data_frame(
-        _destination: [u8; 6],
-        _source: [u8; 6],
-        _bssid: [u8; 6],
-        _sequence_control: u16,
-        _body: &[u8],
+        destination: [u8; 6],
+        source: [u8; 6],
+        bssid: [u8; 6],
+        sequence_control: u16,
+        body: &[u8],
     ) -> Vec<u8> {
-        unimplemented!("RED: 802.11 data frame builder not implemented yet")
+        let mut frame = Vec::with_capacity(24 + body.len());
+        frame.extend_from_slice(&0x0008u16.to_le_bytes());
+        frame.extend_from_slice(&0u16.to_le_bytes());
+        frame.extend_from_slice(&destination);
+        frame.extend_from_slice(&source);
+        frame.extend_from_slice(&bssid);
+        frame.extend_from_slice(&sequence_control.to_le_bytes());
+        frame.extend_from_slice(body);
+        frame
     }
 
     fn read_addr(frame: &[u8], offset: usize) -> Result<[u8; 6], ParseError> {
