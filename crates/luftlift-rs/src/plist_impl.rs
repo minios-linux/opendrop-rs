@@ -12,6 +12,8 @@
 //!   plus `Files: [{FileName,FileType,FileSize,FileBomPath}]`.
 //! - **Ask response**: `ReceiverComputerName`, `ReceiverModelName`.
 
+use plist::{Dictionary, Value};
+use std::io::Cursor;
 use thiserror::Error;
 
 /// Receiver identity/configuration used to build responses.
@@ -48,26 +50,92 @@ pub enum PlistError {
     #[error("plist parse failed: {0}")]
     Parse(String),
     #[error("missing required field: {0}")]
-    MissingField(&'static str),
+    MissingField(String),
     #[error("unexpected type for field {field}: expected {expected}")]
-    TypeError { field: &'static str, expected: &'static str },
+    TypeError { field: String, expected: &'static str },
 }
 
 // ---- RED stubs --------------------------------------------------------------
 
 /// Build a `/Discover` response plist (binary) for the given receiver.
-pub fn build_discover_response(_cfg: &ReceiverConfig) -> Vec<u8> {
-    Vec::new()
+///
+/// Mirrors `server.py.patched::handle_discover`: includes
+/// `ReceiverComputerName`, `ReceiverModelName`, `ReceiverMediaCapabilities`
+/// (a `{"Version":1}` JSON blob stored as raw data), and optionally
+/// `ReceiverRecordData`.
+pub fn build_discover_response(cfg: &ReceiverConfig) -> Vec<u8> {
+    let caps_json = br#"{"Version":1}"#;
+    let mut dict = Dictionary::new();
+    dict.insert("ReceiverMediaCapabilities".into(), Value::Data(caps_json.to_vec()));
+    dict.insert("ReceiverComputerName".into(), Value::String(cfg.computer_name.clone()));
+    dict.insert("ReceiverModelName".into(), Value::String(cfg.computer_model.clone()));
+    if let Some(rec) = &cfg.record_data {
+        dict.insert("ReceiverRecordData".into(), Value::Data(rec.clone()));
+    }
+    let mut buf = Vec::new();
+    Value::Dictionary(dict)
+        .to_writer_binary(&mut buf)
+        .expect("serialise discover response");
+    buf
 }
 
 /// Build an `/Ask` response plist (binary) for the given receiver.
-pub fn build_ask_response(_cfg: &ReceiverConfig) -> Vec<u8> {
-    Vec::new()
+pub fn build_ask_response(cfg: &ReceiverConfig) -> Vec<u8> {
+    let mut dict = Dictionary::new();
+    dict.insert("ReceiverModelName".into(), Value::String(cfg.computer_model.clone()));
+    dict.insert("ReceiverComputerName".into(), Value::String(cfg.computer_name.clone()));
+    let mut buf = Vec::new();
+    Value::Dictionary(dict)
+        .to_writer_binary(&mut buf)
+        .expect("serialise ask response");
+    buf
 }
 
 /// Parse a `/Ask` request body (binary or XML plist) into structured fields.
-pub fn parse_ask_request(_body: &[u8]) -> Result<AskRequest, PlistError> {
-    Err(PlistError::Parse("unimplemented".into()))
+pub fn parse_ask_request(body: &[u8]) -> Result<AskRequest, PlistError> {
+    let val = Value::from_reader(Cursor::new(body)).map_err(|e| PlistError::Parse(e.to_string()))?;
+    let dict = val
+        .as_dictionary()
+        .ok_or(PlistError::TypeError { field: "root".into(), expected: "dictionary" })?;
+
+    let transfer_id = get_string(dict, "TransferID")?;
+    let transfer_type = get_string(dict, "TransferType").unwrap_or_default();
+    let sender_computer_name = get_string(dict, "SenderComputerName").unwrap_or_default();
+    let sender_model_name = get_string(dict, "SenderModelName").unwrap_or_default();
+    let bundle_id = get_string(dict, "BundleID").unwrap_or_default();
+
+    let mut files = Vec::new();
+    if let Some(Value::Array(arr)) = dict.get("Files") {
+        for entry in arr {
+            if let Value::Dictionary(f) = entry {
+                files.push(AskFile {
+                    file_name: get_string(f, "FileName").unwrap_or_default(),
+                    file_type: get_string(f, "FileType").unwrap_or_default(),
+                    file_size: f
+                        .get("FileSize")
+                        .and_then(|v| v.as_signed_integer())
+                        .map(|i| i as u64)
+                        .unwrap_or(0),
+                    file_bom_path: get_string(f, "FileBomPath").unwrap_or_default(),
+                });
+            }
+        }
+    }
+
+    Ok(AskRequest {
+        transfer_id,
+        transfer_type,
+        sender_computer_name,
+        sender_model_name,
+        bundle_id,
+        files,
+    })
+}
+
+fn get_string(dict: &Dictionary, key: &str) -> Result<String, PlistError> {
+    dict.get(key)
+        .and_then(|v| v.as_string().map(|s| s.to_string()))
+        .ok_or_else(|| PlistError::MissingField(key.to_string()))
 }
 
 #[cfg(test)]
@@ -189,7 +257,7 @@ mod tests {
             f.insert("FileName".into(), Value::String(name.into()));
             f.insert("FileType".into(), Value::String("public.jpeg".into()));
             f.insert("FileSize".into(), Value::Integer(sz.into()));
-            f.insert("FileBomPath".into(), Value::String(format!("./{name}").into()));
+            f.insert("FileBomPath".into(), Value::String(format!("./{name}")));
             files.push(Value::Dictionary(f));
         }
         root.insert("Files".into(), Value::Array(files));
