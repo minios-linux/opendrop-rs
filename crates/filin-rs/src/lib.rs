@@ -101,29 +101,29 @@ pub mod radiotap {
         }
 
         let layout = match bit {
-            0 => FieldLayout { align: 8, size: 8 },  // TSFT
-            1 => FieldLayout { align: 1, size: 1 },  // flags
-            2 => FieldLayout { align: 1, size: 1 },  // rate
-            3 => FieldLayout { align: 2, size: 4 },  // channel
-            4 => FieldLayout { align: 2, size: 2 },  // FHSS
-            5 => FieldLayout { align: 1, size: 1 },  // dBm antenna signal
-            6 => FieldLayout { align: 1, size: 1 },  // dBm antenna noise
-            7 => FieldLayout { align: 2, size: 2 },  // lock quality
-            8 => FieldLayout { align: 2, size: 2 },  // TX attenuation
-            9 => FieldLayout { align: 2, size: 2 },  // dB TX attenuation
-            10 => FieldLayout { align: 1, size: 1 }, // dBm TX power
-            11 => FieldLayout { align: 1, size: 1 }, // antenna
-            12 => FieldLayout { align: 1, size: 1 }, // dB antenna signal
-            13 => FieldLayout { align: 1, size: 1 }, // dB antenna noise
-            14 => FieldLayout { align: 2, size: 2 }, // RX flags
-            15 => FieldLayout { align: 2, size: 2 }, // TX flags
-            16 => FieldLayout { align: 1, size: 1 }, // RTS retries
-            17 => FieldLayout { align: 1, size: 1 }, // data retries
-            19 => FieldLayout { align: 1, size: 3 }, // MCS
-            20 => FieldLayout { align: 4, size: 8 }, // A-MPDU status
+            0 => FieldLayout { align: 8, size: 8 },   // TSFT
+            1 => FieldLayout { align: 1, size: 1 },   // flags
+            2 => FieldLayout { align: 1, size: 1 },   // rate
+            3 => FieldLayout { align: 2, size: 4 },   // channel
+            4 => FieldLayout { align: 2, size: 2 },   // FHSS
+            5 => FieldLayout { align: 1, size: 1 },   // dBm antenna signal
+            6 => FieldLayout { align: 1, size: 1 },   // dBm antenna noise
+            7 => FieldLayout { align: 2, size: 2 },   // lock quality
+            8 => FieldLayout { align: 2, size: 2 },   // TX attenuation
+            9 => FieldLayout { align: 2, size: 2 },   // dB TX attenuation
+            10 => FieldLayout { align: 1, size: 1 },  // dBm TX power
+            11 => FieldLayout { align: 1, size: 1 },  // antenna
+            12 => FieldLayout { align: 1, size: 1 },  // dB antenna signal
+            13 => FieldLayout { align: 1, size: 1 },  // dB antenna noise
+            14 => FieldLayout { align: 2, size: 2 },  // RX flags
+            15 => FieldLayout { align: 2, size: 2 },  // TX flags
+            16 => FieldLayout { align: 1, size: 1 },  // RTS retries
+            17 => FieldLayout { align: 1, size: 1 },  // data retries
+            19 => FieldLayout { align: 1, size: 3 },  // MCS
+            20 => FieldLayout { align: 4, size: 8 },  // A-MPDU status
             21 => FieldLayout { align: 2, size: 12 }, // VHT
             22 => FieldLayout { align: 8, size: 12 }, // timestamp
-            29 | 30 => return None, // namespace switches are not data fields
+            29 | 30 => return None,                   // namespace switches are not data fields
             _ => return None,
         };
         Some(layout)
@@ -179,7 +179,8 @@ pub mod radiotap {
         fn parses_carl9170_header_with_extra_fields_and_no_tsft() {
             let frame = [
                 0x00, 0x00, 0x12, 0x00, // version, pad, length
-                0x2e, 0x48, 0x00, 0x00, // present: flags, rate, channel, signal, antenna, rx flags
+                0x2e, 0x48, 0x00,
+                0x00, // present: flags, rate, channel, signal, antenna, rx flags
                 0x10, // flags: frame includes FCS
                 0x0c, // rate
                 0x64, 0x14, 0x40, 0x01, // channel frequency 5220 + flags
@@ -453,9 +454,7 @@ pub mod awdl {
         })
     }
 
-    pub fn parse_election_parameters_v2(
-        value: &[u8],
-    ) -> Result<ElectionParametersV2, ParseError> {
+    pub fn parse_election_parameters_v2(value: &[u8]) -> Result<ElectionParametersV2, ParseError> {
         Ok(ElectionParametersV2 {
             master_addr: read_addr(value, 0)?,
             sync_addr: read_addr(value, 6)?,
@@ -706,25 +705,22 @@ pub mod awdl {
             assert_eq!(
                 frame.bytes,
                 vec![
-                    0x33, 0x33, 0x00, 0x00, 0x00, 0x01,
-                    0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-                    0x86, 0xdd,
-                    0x60, 0x00, 0x00, 0x00,
+                    0x33, 0x33, 0x00, 0x00, 0x00, 0x01, 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x86,
+                    0xdd, 0x60, 0x00, 0x00, 0x00,
                 ]
             );
         }
 
         #[test]
         fn builds_mif_vendor_action_body() {
-            let body = build_action_body(ActionSubtype::Mif, 0x1122_3344, 0x5566_7788, &[0x04, 0, 0]);
+            let body =
+                build_action_body(ActionSubtype::Mif, 0x1122_3344, 0x5566_7788, &[0x04, 0, 0]);
 
             assert_eq!(
                 body,
                 vec![
-                    0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10, 0x03, 0x00,
-                    0x44, 0x33, 0x22, 0x11,
-                    0x88, 0x77, 0x66, 0x55,
-                    0x04, 0x00, 0x00,
+                    0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10, 0x03, 0x00, 0x44, 0x33, 0x22, 0x11, 0x88,
+                    0x77, 0x66, 0x55, 0x04, 0x00, 0x00,
                 ]
             );
         }
@@ -732,9 +728,7 @@ pub mod awdl {
         #[test]
         fn encapsulates_ethernet_payload_as_awdl_data_body() {
             let ethernet = [
-                0x33, 0x33, 0x00, 0x00, 0x00, 0x01,
-                0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-                0x86, 0xdd,
+                0x33, 0x33, 0x00, 0x00, 0x00, 0x01, 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x86, 0xdd,
                 0x60, 0x00,
             ];
 
@@ -743,9 +737,8 @@ pub mod awdl {
             assert_eq!(
                 body,
                 vec![
-                    0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00,
-                    0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x86, 0xdd,
-                    0x60, 0x00,
+                    0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+                    0x00, 0x86, 0xdd, 0x60, 0x00,
                 ]
             );
         }
@@ -764,10 +757,7 @@ pub mod election {
         pub height: u32,
     }
 
-    pub fn choose_sync_master(
-        local: &ElectionState,
-        peers: &[ElectionState],
-    ) -> ElectionState {
+    pub fn choose_sync_master(local: &ElectionState, peers: &[ElectionState]) -> ElectionState {
         let mut selected = local.clone();
 
         for peer in peers {
@@ -877,12 +867,7 @@ pub mod sync {
             self.aw_counter = aw_counter & 0xfffc;
         }
 
-        pub fn sync_error_tu(
-            &self,
-            now_us: u64,
-            time_to_next_aw_tu: u16,
-            aw_counter: u16,
-        ) -> i64 {
+        pub fn sync_error_tu(&self, now_us: u64, time_to_next_aw_tu: u16, aw_counter: u16) -> i64 {
             let master_delta = (u64::from(aw_counter) / u64::from(self.presence_mode)) as i64
                 - i64::from(self.current_eaw(now_us));
             let aw_delta = i64::from(time_to_next_aw_tu) - i64::from(self.next_aw_tu(now_us));
@@ -1202,13 +1187,19 @@ pub mod pcap {
             assert_eq!(&bytes[0..4], &[0xd4, 0xc3, 0xb2, 0xa1]);
             assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
             assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
-            assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 65_535);
+            assert_eq!(
+                u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                65_535
+            );
             assert_eq!(
                 u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
                 DLT_IEEE802_11_RADIOTAP
             );
             assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 1);
-            assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 234_567);
+            assert_eq!(
+                u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+                234_567
+            );
             assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 5);
             assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 5);
             assert_eq!(&bytes[40..45], &[0x00, 0x00, 0x08, 0x00, 0xd0]);
@@ -1277,7 +1268,13 @@ pub mod rx {
         if flags & RADIOTAP_F_FCS != 0 {
             return radiotap
                 .payload
-                .get(..radiotap.payload.len().checked_sub(4).ok_or(ParseError::FcsTooShort)?)
+                .get(
+                    ..radiotap
+                        .payload
+                        .len()
+                        .checked_sub(4)
+                        .ok_or(ParseError::FcsTooShort)?,
+                )
                 .ok_or(ParseError::FcsTooShort);
         }
         Ok(radiotap.payload)
@@ -1392,15 +1389,13 @@ pub mod rx {
                 0x00, // pad to radiotap len
             ];
             frame.extend_from_slice(&[
-                0xd0, 0x00, 0x00, 0x00,
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-                0x00, 0x25, 0x00, 0xff, 0x94, 0x73,
-                0x00, 0x00,
+                0xd0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0xaa, 0xbb, 0xcc,
+                0xdd, 0xee, 0x00, 0x25, 0x00, 0xff, 0x94, 0x73, 0x00, 0x00,
             ]);
 
             let mut bridge = TsftBridge::default();
-            let err = parse_action_frame(&frame, 303_000, &mut bridge).expect_err("bad FCS rejected");
+            let err =
+                parse_action_frame(&frame, 303_000, &mut bridge).expect_err("bad FCS rejected");
 
             assert_eq!(err, ParseError::BadFcs);
         }
@@ -1464,8 +1459,9 @@ pub mod cli {
 
         #[test]
         fn parses_owl_compatible_interface_flags() {
-            let config = parse_config_from(["filin", "-i", "wlan0mon", "-c", "44", "-h", "awdl0", "-N"])
-                .expect("valid CLI args");
+            let config =
+                parse_config_from(["filin", "-i", "wlan0mon", "-c", "44", "-h", "awdl0", "-N"])
+                    .expect("valid CLI args");
 
             assert_eq!(
                 config,
@@ -1514,7 +1510,9 @@ pub mod runtime {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
 
-    use crate::{awdl, channel, ieee80211, iface::Config, os, pcap, radiotap, rx, sync::TsftBridge};
+    use crate::{
+        awdl, channel, ieee80211, iface::Config, os, pcap, radiotap, rx, sync::TsftBridge,
+    };
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Error {
@@ -1530,12 +1528,15 @@ pub mod runtime {
     pub struct Links {
         pub tap: File,
         pub packet: os::packet::PacketSocket,
+        self_addr: [u8; 6],
+        anchor_channel: u16,
         pcap: Option<pcap::Writer<File>>,
     }
 
     pub fn open_links(config: &Config) -> Result<Links, Error> {
         let tap = os::tun::open_tap(&config.host_iface).map_err(|_| Error::Tap)?;
-        let monitor_addr = os::netdev::get_hwaddr(&config.monitor_iface).map_err(|_| Error::Netdev)?;
+        let monitor_addr =
+            os::netdev::get_hwaddr(&config.monitor_iface).map_err(|_| Error::Netdev)?;
         os::netdev::set_hwaddr(&config.host_iface, monitor_addr).map_err(|_| Error::Netdev)?;
         os::netdev::set_mtu(&config.host_iface, 1450).map_err(|_| Error::Netdev)?;
         os::netdev::set_up(&config.host_iface).map_err(|_| Error::Netdev)?;
@@ -1543,25 +1544,53 @@ pub mod runtime {
             channel::channel_to_frequency_mhz(config.anchor_channel).ok_or(Error::Channel)?;
         os::nl80211::set_channel(&config.monitor_iface, u32::from(frequency_mhz))
             .map_err(|_| Error::Channel)?;
-        let packet =
-            os::packet::PacketSocket::open_bound(&config.monitor_iface).map_err(|_| Error::Packet)?;
+        let packet = os::packet::PacketSocket::open_bound(&config.monitor_iface)
+            .map_err(|_| Error::Packet)?;
         let pcap = config
             .pcap_path
             .as_deref()
-            .map(|path| File::create(path).and_then(pcap::Writer::new).map_err(|_| Error::Pcap))
+            .map(|path| {
+                File::create(path)
+                    .and_then(pcap::Writer::new)
+                    .map_err(|_| Error::Pcap)
+            })
             .transpose()?;
 
-        Ok(Links { tap, packet, pcap })
+        Ok(Links {
+            tap,
+            packet,
+            self_addr: monitor_addr,
+            anchor_channel: config.anchor_channel,
+            pcap,
+        })
     }
 
     pub fn run(mut links: Links) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
         let mut sync = crate::sync::SyncState::new(host_time_us());
         let mut tx_seq = 0u16;
+        let mut announce = AnnounceScheduler::new(host_time_us());
         let mut wlan_buf = vec![0u8; 4096];
         let mut tap_buf = vec![0u8; 2048];
 
         loop {
+            let now_us = host_time_us();
+            for subtype in announce.due(now_us) {
+                let frame = build_announce_frame(
+                    subtype,
+                    links.self_addr,
+                    tx_seq << 4,
+                    now_us,
+                    &sync,
+                    links.anchor_channel,
+                );
+                tx_seq = tx_seq.wrapping_add(1);
+                match links.packet.send(&frame) {
+                    Ok(sent) => tracing::trace!(sent, ?subtype, "injected awdl announce frame"),
+                    Err(err) => tracing::trace!(?err, ?subtype, "packet announce send failed"),
+                }
+            }
+
             let mut fds = [
                 libc::pollfd {
                     fd: links.packet.as_raw_fd(),
@@ -1574,8 +1603,10 @@ pub mod runtime {
                     revents: 0,
                 },
             ];
+            let poll_timeout_ms = announce.poll_timeout_ms(host_time_us());
             // SAFETY: fds points to two valid pollfd entries for the duration of the call.
-            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            let rc =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout_ms) };
             if rc < 0 {
                 return Err(Error::Poll);
             }
@@ -1599,15 +1630,24 @@ pub mod runtime {
                             Err(err) => match decapsulate_rx_data(&wlan_buf[..len]) {
                                 Ok(frame) => {
                                     links.tap.write_all(&frame.bytes).map_err(|_| Error::Io)?;
-                                    tracing::trace!(len = frame.bytes.len(), "wrote ethernet frame to tap");
+                                    tracing::trace!(
+                                        len = frame.bytes.len(),
+                                        "wrote ethernet frame to tap"
+                                    );
                                 }
                                 Err(data_err) => {
                                     if let Some(pcap) = links.pcap.as_mut() {
-                                        if let Err(err) = pcap.write_packet(now_us, &wlan_buf[..len]) {
-                                            tracing::trace!(?err, "pcap ignored-frame write failed");
+                                        if let Err(err) =
+                                            pcap.write_packet(now_us, &wlan_buf[..len])
+                                        {
+                                            tracing::trace!(
+                                                ?err,
+                                                "pcap ignored-frame write failed"
+                                            );
                                         }
                                     }
-                                    let ieee80211_preview = ieee80211_payload_preview(&wlan_buf[..len]);
+                                    let ieee80211_preview =
+                                        ieee80211_payload_preview(&wlan_buf[..len]);
                                     tracing::trace!(
                                         ?err,
                                         ?data_err,
@@ -1655,6 +1695,194 @@ pub mod runtime {
         mac
     }
 
+    const TU_US: u64 = 1024;
+    const PSF_INTERVAL_TU: u64 = 110;
+    const AWDL_BROADCAST: [u8; 6] = [0xff; 6];
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AnnounceScheduler {
+        next_psf_us: u64,
+        next_mif_us: u64,
+    }
+
+    impl AnnounceScheduler {
+        fn new(now_us: u64) -> Self {
+            Self {
+                next_psf_us: now_us + PSF_INTERVAL_TU * TU_US,
+                next_mif_us: now_us + 32 * TU_US,
+            }
+        }
+
+        fn poll_timeout_ms(&self, now_us: u64) -> i32 {
+            let next = self.next_psf_us.min(self.next_mif_us);
+            let delta_us = next.saturating_sub(now_us);
+            delta_us.div_ceil(1_000).min(i32::MAX as u64) as i32
+        }
+
+        fn due(&mut self, now_us: u64) -> Vec<awdl::ActionSubtype> {
+            let mut due = Vec::new();
+            let interval_us = PSF_INTERVAL_TU * TU_US;
+            if now_us >= self.next_mif_us {
+                due.push(awdl::ActionSubtype::Mif);
+                while self.next_mif_us <= now_us {
+                    self.next_mif_us += interval_us;
+                }
+            }
+            if now_us >= self.next_psf_us {
+                due.push(awdl::ActionSubtype::Psf);
+                while self.next_psf_us <= now_us {
+                    self.next_psf_us += interval_us;
+                }
+            }
+            due
+        }
+    }
+
+    fn build_announce_frame(
+        subtype: awdl::ActionSubtype,
+        self_addr: [u8; 6],
+        sequence_control: u16,
+        now_us: u64,
+        sync: &crate::sync::SyncState,
+        anchor_channel: u16,
+    ) -> Vec<u8> {
+        let tlvs = build_announce_tlvs(self_addr, now_us, sync, anchor_channel);
+        let action = awdl::build_action_body(subtype, now_us as u32, now_us as u32, &tlvs);
+        ieee80211::build_management_action_frame(
+            AWDL_BROADCAST,
+            self_addr,
+            self_addr,
+            sequence_control,
+            &action,
+        )
+    }
+
+    fn build_announce_tlvs(
+        self_addr: [u8; 6],
+        now_us: u64,
+        sync: &crate::sync::SyncState,
+        anchor_channel: u16,
+    ) -> Vec<u8> {
+        let mut tlvs = Vec::new();
+        push_tlv(
+            &mut tlvs,
+            4,
+            &build_sync_parameters_tlv_value(self_addr, now_us, sync, anchor_channel),
+        );
+        push_tlv(
+            &mut tlvs,
+            5,
+            &build_election_parameters_tlv_value(self_addr),
+        );
+        push_tlv(
+            &mut tlvs,
+            18,
+            &build_channel_sequence_tlv_value(anchor_channel),
+        );
+        push_tlv(
+            &mut tlvs,
+            24,
+            &build_election_parameters_v2_tlv_value(self_addr),
+        );
+        push_tlv(&mut tlvs, 6, &build_service_parameters_tlv_value());
+        tlvs
+    }
+
+    fn push_tlv(out: &mut Vec<u8>, kind: u8, value: &[u8]) {
+        out.push(kind);
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        out.extend_from_slice(value);
+    }
+
+    fn build_sync_parameters_tlv_value(
+        self_addr: [u8; 6],
+        now_us: u64,
+        sync: &crate::sync::SyncState,
+        anchor_channel: u16,
+    ) -> Vec<u8> {
+        let next_aw_tu = sync.next_aw_tu(now_us);
+        let aw_period = sync.aw_period_tu;
+        let presence_mode = sync.presence_mode as u8;
+        let eaw_len_tu = u16::from(presence_mode) * aw_period;
+        let elapsed_in_eaw_tu = eaw_len_tu.saturating_sub(next_aw_tu);
+        let remaining_aw_length = aw_period.saturating_sub(elapsed_in_eaw_tu);
+        let channel = anchor_channel as u8;
+        let mut value = Vec::with_capacity(73);
+        value.push(channel);
+        value.extend_from_slice(&next_aw_tu.to_le_bytes());
+        value.push(channel);
+        value.push(0);
+        value.extend_from_slice(&aw_period.to_le_bytes());
+        value.extend_from_slice(&(PSF_INTERVAL_TU as u16).to_le_bytes());
+        value.extend_from_slice(&0x1800u16.to_le_bytes());
+        value.extend_from_slice(&aw_period.to_le_bytes());
+        value.extend_from_slice(&aw_period.to_le_bytes());
+        value.extend_from_slice(&remaining_aw_length.to_le_bytes());
+        value.push(presence_mode - 1);
+        value.push(presence_mode - 1);
+        value.push(presence_mode - 1);
+        value.push(presence_mode - 1);
+        value.extend_from_slice(&self_addr);
+        value.push(presence_mode);
+        value.push(0);
+        value.extend_from_slice(&sync.current_aw(now_us).to_le_bytes());
+        value.extend_from_slice(&sync.current_aw(now_us).to_le_bytes());
+        value.extend_from_slice(&build_channel_sequence_value(anchor_channel));
+        value.extend_from_slice(&[0, 0]);
+        value
+    }
+
+    fn build_channel_sequence_tlv_value(anchor_channel: u16) -> Vec<u8> {
+        let mut value = build_channel_sequence_value(anchor_channel);
+        value.extend_from_slice(&[0, 0, 0]);
+        value
+    }
+
+    fn build_channel_sequence_value(anchor_channel: u16) -> Vec<u8> {
+        let mut value = Vec::with_capacity(38);
+        value.extend_from_slice(&[15, 2, 0, 3]);
+        value.extend_from_slice(&0xffffu16.to_le_bytes());
+        for _ in 0..16 {
+            value.extend_from_slice(&anchor_channel.to_le_bytes());
+        }
+        value
+    }
+
+    fn build_election_parameters_tlv_value(self_addr: [u8; 6]) -> Vec<u8> {
+        let mut value = Vec::with_capacity(21);
+        value.push(0);
+        value.extend_from_slice(&0u16.to_le_bytes());
+        value.push(0);
+        value.push(0);
+        value.extend_from_slice(&self_addr);
+        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
+        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
+        value.extend_from_slice(&[0, 0]);
+        value
+    }
+
+    fn build_election_parameters_v2_tlv_value(self_addr: [u8; 6]) -> Vec<u8> {
+        let mut value = Vec::with_capacity(40);
+        value.extend_from_slice(&self_addr);
+        value.extend_from_slice(&self_addr);
+        value.extend_from_slice(&1u32.to_le_bytes());
+        value.extend_from_slice(&0u32.to_le_bytes());
+        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
+        value.extend_from_slice(&self_metric(self_addr).to_le_bytes());
+        value.extend_from_slice(&0u32.to_le_bytes());
+        value.extend_from_slice(&0u32.to_le_bytes());
+        value.extend_from_slice(&1u32.to_le_bytes());
+        value
+    }
+
+    fn build_service_parameters_tlv_value() -> [u8; 9] {
+        [0; 9]
+    }
+
+    fn self_metric(self_addr: [u8; 6]) -> u32 {
+        0x8000_0000 | u32::from_be_bytes([self_addr[2], self_addr[3], self_addr[4], self_addr[5]])
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     enum DataParseError {
         Radiotap(radiotap::RadiotapError),
@@ -1665,8 +1893,10 @@ pub mod runtime {
 
     fn decapsulate_rx_data(frame: &[u8]) -> Result<awdl::EthernetFrame, DataParseError> {
         let radiotap = radiotap::parse_header(frame).map_err(DataParseError::Radiotap)?;
-        let ieee80211_payload = rx::ieee80211_payload_without_fcs(&radiotap).map_err(DataParseError::Fcs)?;
-        let mac = ieee80211::parse_mac_header(ieee80211_payload).map_err(DataParseError::Ieee80211)?;
+        let ieee80211_payload =
+            rx::ieee80211_payload_without_fcs(&radiotap).map_err(DataParseError::Fcs)?;
+        let mac =
+            ieee80211::parse_mac_header(ieee80211_payload).map_err(DataParseError::Ieee80211)?;
         awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination)
             .map_err(DataParseError::Awdl)
     }
@@ -1889,7 +2119,11 @@ pub mod os {
         }
 
         fn last_errno() -> Error {
-            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+            Error::Io(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
         }
 
         #[cfg(test)]
@@ -1902,7 +2136,10 @@ pub mod os {
 
                 assert_eq!(&plan.name[..5], b"awdl0");
                 assert_eq!(plan.name[5], 0);
-                assert_eq!(plan.flags, (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short);
+                assert_eq!(
+                    plan.flags,
+                    (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short
+                );
             }
         }
     }
@@ -2027,7 +2264,11 @@ pub mod os {
         }
 
         fn last_errno() -> Error {
-            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+            Error::Io(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
         }
 
         #[cfg(test)]
@@ -2155,7 +2396,8 @@ pub mod os {
 
         fn control_socket() -> Result<OwnedFd, Error> {
             // SAFETY: socket arguments open a datagram IPv4 control socket for ioctls.
-            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            let fd =
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
             if fd < 0 {
                 return Err(last_errno());
             }
@@ -2236,7 +2478,11 @@ pub mod os {
         }
 
         fn last_errno() -> Error {
-            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+            Error::Io(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
         }
 
         #[cfg(test)]
@@ -2249,7 +2495,10 @@ pub mod os {
 
                 assert_eq!(&name.bytes[..5], b"awdl0");
                 assert_eq!(name.bytes[5], 0);
-                assert_eq!(up_flags(0), (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
+                assert_eq!(
+                    up_flags(0),
+                    (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short
+                );
             }
         }
     }
@@ -2272,7 +2521,10 @@ pub mod os {
             pub frequency_mhz: u32,
         }
 
-        pub fn plan_set_channel(ifindex: libc::c_int, frequency_mhz: u32) -> Result<ChannelRequest, Error> {
+        pub fn plan_set_channel(
+            ifindex: libc::c_int,
+            frequency_mhz: u32,
+        ) -> Result<ChannelRequest, Error> {
             if ifindex <= 0 || frequency_mhz == 0 {
                 return Err(Error::Invalid);
             }
@@ -2307,7 +2559,11 @@ pub mod os {
             let mut payload = vec![NL80211_CMD_SET_CHANNEL, 1, 0, 0];
             push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, request.ifindex as u32);
             push_attr_u32(&mut payload, NL80211_ATTR_WIPHY_FREQ, request.frequency_mhz);
-            socket.request(family_id, libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16, &payload)?;
+            socket.request(
+                family_id,
+                libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16,
+                &payload,
+            )?;
             Ok(())
         }
 
@@ -2343,7 +2599,12 @@ pub mod os {
                 parse_family_id(&response).ok_or(Error::Protocol)
             }
 
-            fn request(&self, nlmsg_type: u16, flags: u16, payload: &[u8]) -> Result<Vec<u8>, Error> {
+            fn request(
+                &self,
+                nlmsg_type: u16,
+                flags: u16,
+                payload: &[u8],
+            ) -> Result<Vec<u8>, Error> {
                 let seq = self.seq.get();
                 self.seq.set(seq.wrapping_add(1));
                 let mut msg = Vec::with_capacity(16 + payload.len());
@@ -2399,7 +2660,11 @@ pub mod os {
                     return Err(Error::Protocol);
                 }
                 let code = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
-                return if code == 0 { Ok(Vec::new()) } else { Err(Error::Io(-code)) };
+                return if code == 0 {
+                    Ok(Vec::new())
+                } else {
+                    Err(Error::Io(-code))
+                };
             }
             Ok(buf[16..len].to_vec())
         }
@@ -2450,7 +2715,11 @@ pub mod os {
         }
 
         fn last_errno() -> Error {
-            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+            Error::Io(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
         }
 
         #[cfg(test)]
