@@ -130,15 +130,27 @@ fn receive(interface: &str, output: PathBuf, flags: u32, name: Option<String>) -
     let fullname = info.get_fullname().to_string();
     tracing::info!(service = %fullname, "mDNS announced — receiver visible in AirDrop picker");
 
+    // mdns-sd's A/SRV TTL is 120s; if no announcement or query-answer crosses
+    // the AWDL link within that window the receiver disappears from the Apple
+    // AirDrop picker (confirmed live). Spawn a background thread that
+    // proactively re-announces every REANNOUNCE_SECS (60) so the records stay
+    // fresh independent of query traffic.
+    let daemon = Arc::new(daemon);
+    let (reannounce_stop, _reannounce_handle) =
+        mdns::spawn_reannouncer(daemon.clone(), info);
+
     // Install a SIGINT/SIGTERM handler that sends the mDNS TTL=0 goodbye so
     // Apple devices remove us from their AirDrop picker immediately, instead
     // of leaving a ghost entry lingering after Ctrl+C. The PID-suffixed
     // instance name (set in build_airdrop_service_info) further lets you tell
-    // a fresh run from any stale ghost that survives a crash.
-    let goodbye_daemon = std::sync::Arc::new(daemon);
+    // a fresh run from any stale ghost that survives a crash. The stop flag
+    // lets the re-announcer thread wind down cleanly before exit.
+    let goodbye_daemon = daemon.clone();
     let goodbye_fullname = fullname.clone();
+    let goodbye_stop = reannounce_stop.clone();
     ctrlc::set_handler(move || {
         tracing::info!(service = %goodbye_fullname, "signal received — sending mDNS goodbye");
+        goodbye_stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = mdns::goodbye(&goodbye_daemon, &goodbye_fullname);
         std::process::exit(0);
     })?;
