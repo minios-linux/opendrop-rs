@@ -426,8 +426,20 @@ pub mod awdl {
         body
     }
 
-    pub fn encapsulate_ethernet_payload(_ethernet: &[u8], _seq: u16) -> Result<Vec<u8>, ParseError> {
-        Err(ParseError::TooShort)
+    pub fn encapsulate_ethernet_payload(ethernet: &[u8], seq: u16) -> Result<Vec<u8>, ParseError> {
+        if ethernet.len() < 14 {
+            return Err(ParseError::TooShort);
+        }
+        let ethertype = [ethernet[12], ethernet[13]];
+        let payload = &ethernet[14..];
+        let mut body = Vec::with_capacity(16 + payload.len());
+        body.extend_from_slice(&[0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00]);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&seq.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&ethertype);
+        body.extend_from_slice(payload);
+        Ok(body)
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
