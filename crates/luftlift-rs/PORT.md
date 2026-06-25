@@ -64,6 +64,36 @@ behavior to Rust.
 peers; a `receive` should narrate the Discover→Ask→Upload phases. The Python
 stack hid all this at debug level — surface it.
 
+## Loopback introspection API (`luftlift receive --http-addr`)
+While `receive` runs, a tiny **loopback-only** HTTP/JSON server exposes live
+receiver state so the orchestrator can `curl | jq` instead of grepping
+`/tmp/lrF.log`. It is SEPARATE from the AirDrop HTTPS listener on 8771 —
+different port, different server thread, never reachable off-box.
+
+- **Flag:** `--http-addr 127.0.0.1:9931` (default). Pass `--http-addr off` to
+  disable it entirely. The bind is hard-refused if the resolved IP isn't
+  loopback (defence in depth against an accidental off-box bind).
+- **Endpoints (JSON, `application/json`):**
+  - `GET /status` →
+    `{ receiver_name, mdns_announced, https_port, last_announce_ms_ago,
+       mdns_query_rx, discover_count, ask_count, upload_count, last_peer }`.
+    The Discover/Ask/Upload counters let you see how far the iPhone got
+    without tailing the log.
+  - `GET /trace?n=300` → last N structured trace events from a 2000-cap ring
+    buffer (default N=300; `n=0` returns all). Each event is
+    `{ ts, level, target, msg, fields }`.
+  - `POST /trace` with `{"level":"off|debug|trace"}` → toggles the atomic
+    gate that pushes events into the ring. **Off by default** (so the hot
+    path is just an atomic load). Anything other than `off` enables the
+    ring; `"off"` disables it but does NOT clear the buffer.
+
+Implementation lives in `src/introspect.rs`: `IntrospectState` holds the
+atomic counters + ring + gate, a custom `tracing`-subscriber `Layer`
+(`TraceCollector`) feeds events into the ring when enabled, and a small
+`std::net::TcpListener` server serves the three endpoints. The receiver
+bumps the counters in `server::bump_introspect_for_request` on every
+AirDrop POST.
+
 ## Workflow
 Follow `../../WORKFLOW.md`: work on `main`, **only under `crates/luftlift-rs/`**,
 TDD with red/green/review commits. Coordinate workspace `Cargo.toml` dep
