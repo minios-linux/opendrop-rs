@@ -1422,6 +1422,13 @@ pub mod sync {
             self.offset_us = Some(next_offset);
             (hw_tsft_us as i64 + next_offset) as u64
         }
+
+        /// The last filtered TSF→monotonic offset (microseconds), or `None` if
+        /// no frame has been timestamped yet. Exposed for the introspection
+        /// `/status tsf_offset_us` metric (FILIN_SYNC_QUALITY.md Part A).
+        pub fn offset_us(&self) -> Option<i64> {
+            self.offset_us
+        }
     }
 
     #[cfg(test)]
@@ -3826,6 +3833,10 @@ pub mod state {
         /// the decoded master sequence). Used to re-broadcast the cached
         /// announce AND bias dwell toward it. 0 when self-master or no master.
         pub master_anchor: u8,
+        /// Monotonic time (us) when the current committed master was adopted.
+        /// Drives `/status master_age_ms` (FILIN_SYNC_QUALITY.md Part A) and
+        /// is bumped on every real master switch.
+        pub master_adopted_at_us: u64,
     }
 
     impl AwdlState {
@@ -3854,6 +3865,7 @@ pub mod state {
                 pending_since_us: now_us,
                 transfer: None,
                 master_anchor: 0,
+                master_adopted_at_us: now_us,
             }
         }
 
@@ -4676,8 +4688,9 @@ pub mod runtime {
 
             // --- throttled introspection snapshot refresh (~10 Hz) ---
             if now_us.wrapping_sub(last_refresh_us) >= REFRESH_PERIOD_US {
+                let tsf_offset_us = bridge.offset_us().unwrap_or(0);
                 introspect
-                    .set_status(build_status_snapshot(&awdl_state, last_injected_seq));
+                    .set_status(build_status_snapshot(&awdl_state, last_injected_seq, tsf_offset_us, now_us));
                 introspect.set_peers(build_peer_views(&awdl_state, now_us));
                 last_refresh_us = now_us;
             }
@@ -5480,9 +5493,17 @@ pub mod runtime {
     /// live AWDL state + the most-recently-injected frame's sequence control.
     /// The runtime calls this on a throttled cadence and feeds it to
     /// [`crate::introspect::Introspection::set_status`].
+    /// Build an introspection [`crate::introspect::StatusSnapshot`] from the
+    /// live AWDL state + the most-recently-injected frame's sequence control.
+    /// The runtime calls this on a throttled cadence and feeds it to
+    /// [`crate::introspect::Introspection::set_status`]. `tsf_offset_us` is
+    /// sampled from the [`TsftBridge`] by the caller; `now_us` drives
+    /// `master_age_ms` (FILIN_SYNC_QUALITY.md Part A).
     fn build_status_snapshot(
         state: &crate::state::AwdlState,
         last_injected_seq: u16,
+        tsf_offset_us: i64,
+        now_us: u64,
     ) -> crate::introspect::StatusSnapshot {
         crate::introspect::StatusSnapshot {
             current_channel: state.current_channel,
@@ -5491,6 +5512,8 @@ pub mod runtime {
             synced: state.election.sync_addr != state.self_addr,
             peer_count: state.peers.len(),
             master_anchor: state.master_anchor,
+            tsf_offset_us,
+            master_age_ms: now_us.saturating_sub(state.master_adopted_at_us) / 1_000,
         }
     }
 
@@ -5717,7 +5740,7 @@ pub mod runtime {
             state.current_channel = 44;
             state.peers.touch([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee], 1_000_000);
 
-            let snapshot = build_status_snapshot(&state, 17);
+            let snapshot = build_status_snapshot(&state, 17, 500, 1_500_000);
 
             assert_eq!(snapshot.current_channel, 44);
             // self-master initially
@@ -5725,6 +5748,8 @@ pub mod runtime {
             assert_eq!(snapshot.master_seq, 17);
             assert!(!snapshot.synced);
             assert_eq!(snapshot.peer_count, 1);
+            assert_eq!(snapshot.tsf_offset_us, 500);
+            assert_eq!(snapshot.master_age_ms, 500); // (1.5M - 1M) / 1000
         }
 
         #[test]
@@ -5739,7 +5764,7 @@ pub mod runtime {
             state.election.sync_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
             state.election.master_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
 
-            let snapshot = build_status_snapshot(&state, 0);
+            let snapshot = build_status_snapshot(&state, 0, 0, 1_000_000);
 
             assert_eq!(snapshot.master_mac, "02:aa:bb:cc:dd:ee");
             assert!(snapshot.synced);
@@ -6639,6 +6664,13 @@ pub mod introspect {
         /// The adopted master's anchor channel (slot-0 / dominant). 0 when
         /// self-master or no master. Surfaced in /status for debugging.
         pub master_anchor: u8,
+        /// Last sampled offset between our TSF bridge and the adopted
+        /// master's (microseconds, magnitude). 0 if no master yet. The thing
+        /// that must stay small for tight AWDL sync (FILIN_SYNC_QUALITY.md).
+        pub tsf_offset_us: i64,
+        /// Milliseconds since the current master was adopted. Grows while we
+        /// hold one master; resets on each switch. Large + growing = stable.
+        pub master_age_ms: u64,
     }
 
     /// Capacity of the trace ring buffer (FILIN_HTTP_INTROSPECT.md: ~2000).
@@ -6976,6 +7008,12 @@ pub mod introspect {
             rebroadcast_counts: serde_json::Map<String, serde_json::Value>,
             mdns_rx_self: u64,
             mdns_rx_other: u64,
+            // FILIN_SYNC_QUALITY.md Part A: sync-quality metrics.
+            tsf_offset_us: u64,
+            master_age_ms: u64,
+            master_changes: u64,
+            aw_alignment_pct: u8,
+            last_master_macs: Vec<String>,
         }
         Response::json(
             200,
@@ -6989,6 +7027,11 @@ pub mod introspect {
                 rebroadcast_counts: rebroadcast,
                 mdns_rx_self: intro.counters.mdns_rx_self(),
                 mdns_rx_other: intro.counters.mdns_rx_other(),
+                tsf_offset_us: snapshot.tsf_offset_us.unsigned_abs(),
+                master_age_ms: snapshot.master_age_ms,
+                master_changes: intro.counters.master_changes(),
+                aw_alignment_pct: intro.counters.aw_alignment_pct(),
+                last_master_macs: intro.counters.last_master_macs(),
             },
         )
     }
@@ -7532,6 +7575,8 @@ pub mod introspect {
                 synced: false,
                 peer_count: 1,
                 master_anchor: 0,
+                tsf_offset_us: 0,
+                master_age_ms: 0,
             };
             intro.set_status(snapshot.clone());
 
@@ -7552,6 +7597,8 @@ pub mod introspect {
                 synced: true,
                 peer_count: 4,
                 master_anchor: 0,
+                tsf_offset_us: 0,
+                master_age_ms: 0,
             });
 
             assert_eq!(intro.counters.mdns_rx_other(), 1);
@@ -8022,6 +8069,8 @@ pub mod introspect {
                 synced: true,
                 peer_count: 1,
                 master_anchor: 0,
+                tsf_offset_us: 0,
+                master_age_ms: 0,
             });
             intro.counters.inc_mdns_rx_other();
             intro.counters.inc_rebroadcast(44);
