@@ -3436,6 +3436,10 @@ pub mod iface {
         /// needed to time-share, which we don't need to do. AW timing is kept
         /// so announces still transmit during availability windows.
         pub park: bool,
+        /// owl `-f`: disable the RSSI admission filter (accept all frames
+        /// regardless of signal strength). Useful for testing; defaults to
+        /// filtering ON (owl's default, FILIN_AUDIT_FIXES.md #1).
+        pub disable_rssi_filter: bool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -3478,6 +3482,7 @@ pub mod iface {
                 pcap_path: None,
                 http_addr: Some(default_http_addr()),
                 park: false,
+                disable_rssi_filter: false,
             };
 
             assert_eq!(validate_config(config.clone()), Ok(config));
@@ -3865,6 +3870,10 @@ pub mod cli {
         /// top master's anchor channel. Opt-in — default is the hopping mode.
         #[arg(long = "park")]
         park: bool,
+        /// Disable the RSSI admission filter (accept all frames regardless of
+        /// signal strength). Equivalent to owl's `-f`.
+        #[arg(short = 'f', long = "no-rssi-filter")]
+        disable_rssi_filter: bool,
     }
 
     pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
@@ -3891,6 +3900,7 @@ pub mod cli {
             pcap_path: args.pcap_path.or_else(|| std::env::var("FILIN_PCAP").ok()),
             http_addr,
             park: args.park,
+            disable_rssi_filter: args.disable_rssi_filter,
         })
         .map_err(|_| CliError::Invalid)
     }
@@ -3915,6 +3925,7 @@ pub mod cli {
                     pcap_path: None,
                     http_addr: Some(iface::default_http_addr()),
                     park: false,
+                disable_rssi_filter: false,
                 }
             );
         }
@@ -3990,6 +4001,7 @@ pub mod cli {
                 pcap_path: None,
                 http_addr: Some(non_loopback),
                 park: false,
+                disable_rssi_filter: false,
             };
             assert_eq!(
                 iface::validate_config(bad),
@@ -5261,6 +5273,7 @@ pub mod runtime {
         introspect: std::sync::Arc<crate::introspect::Introspection>,
         http_addr: Option<std::net::SocketAddr>,
         park: bool,
+        disable_rssi_filter: bool,
     ) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
         let mut awdl_state = crate::state::AwdlState::new(
@@ -5506,7 +5519,23 @@ pub mod runtime {
                                 let rx_time_us = frame.rx_time_us;
                                 let rssi_dbm = frame.rssi_dbm;
                                 let tlv_count = frame.tlvs.len();
-                                awdl_state.apply_action(src, subtype, &frame.tlvs, rx_time_us);
+                                // FILIN_AUDIT_FIXES.md #1: RSSI admission
+                                // filter (owl rx.c:273-278). Drop weak frames
+                                // BEFORE admitting/updating the peer — this is
+                                // the upstream cause of master flapping. A
+                                // known peer gets grace (-70); an unknown peer
+                                // must clear -65 to be discovered.
+                                let rssi_ok = disable_rssi_filter || {
+                                    let known = awdl_state.peers.get(&src).is_some();
+                                    rx::rssi_admits(
+                                        rssi_dbm,
+                                        known,
+                                        rx::RSSI_THRESHOLD_DEFAULT,
+                                        rx::RSSI_GRACE_DEFAULT,
+                                    )
+                                };
+                                if rssi_ok {
+                                    awdl_state.apply_action(src, subtype, &frame.tlvs, rx_time_us);
                                 // FILIN_NEIGHBOR_TABLE.md: install a static
                                 // neighbor entry for this peer so unicast
                                 // awdl0 connections work. AWDL does not use
@@ -5565,6 +5594,7 @@ pub mod runtime {
                                     channel = awdl_state.current_channel,
                                     "rx awdl action frame"
                                 );
+                                } // end rssi_ok
                             }
                             Err(err) => match decapsulate_rx_data(&wlan_buf[..len]) {
                                 Ok((source, frames)) => {

@@ -38,6 +38,6 @@ fn main() -> anyhow::Result<()> {
     let links = filin_rs::runtime::open_links(&config)
         .map_err(|err| anyhow::anyhow!("failed to open filin links: {err:?}"))?;
     tracing::info!("filin links are up");
-    filin_rs::runtime::run(links, introspect, config.http_addr, config.park)
+    filin_rs::runtime::run(links, introspect, config.http_addr, config.park, config.disable_rssi_filter)
         .map_err(|err| anyhow::anyhow!("filin runtime stopped: {err:?}"))
 }
