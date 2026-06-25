@@ -90,6 +90,17 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 38 (*** carl9170 WEDGED (USB -110, firmware upload failed) -> FULL REBOOT. See restart-handoff.md ***).
+- The carl9170 wedged at USB level: dmesg `usb 3-1: firmware upload failed (-110)` / `Failed to restart device`.
+  Tried software re-enumeration (echo 0/1 > /sys/bus/usb/devices/3-1/authorized) — did not recover. Human is
+  doing a FULL REBOOT of ayourtch-x280, which kills everything (orchestrator, agents, root shells, tttt PTYs).
+- *** AFTER REBOOT: read restart-handoff.md — it has the complete rebuild procedure (hardware bring-up, stack
+  launch cmds, tttt PTY/agent recreation + re-brief prompts, the loop). Code is committed (HEAD c6fec51) +
+  green; binaries on disk; this reboot is ONLY to un-wedge the radio. Resume live-discovery testing. ***
+- The cycle-37 discovery fixes (filin announce re-broadcast on social channels ~1s + denser-149 + luftlift 10s
+  re-announce) were VERIFIED on-wire but NOT yet confirmed end-to-end against the iPhone (card wedged before the
+  retry). That's the first thing to test after the radio is back.
+--- PRIOR cycle-37 below ---
 Last updated: cycle 37 (announce re-broadcast + denser-149 LIVE & verified on-wire; AWAITING human discovery retry).
 - COMMITS: e4873ac fix(filin) re-broadcast cached mDNS announce on each social-channel visit; a43bd3e fix(filin)
   denser social dwell (fill null slots round-robin). filin 113 tests green, clippy clean, release built.
