@@ -1109,6 +1109,7 @@ pub mod iface {
         pub host_iface: String,
         pub anchor_channel: u16,
         pub assume_monitor: bool,
+        pub pcap_path: Option<String>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1138,9 +1139,79 @@ pub mod iface {
                 host_iface: "awdl0".into(),
                 anchor_channel: 44,
                 assume_monitor: true,
+                pcap_path: None,
             };
 
             assert_eq!(validate_config(config.clone()), Ok(config));
+        }
+    }
+}
+
+pub mod pcap {
+    use std::io::{self, Write};
+
+    pub const DLT_IEEE802_11_RADIOTAP: u32 = 127;
+
+    pub struct Writer<W: Write> {
+        inner: W,
+    }
+
+    impl<W: Write> Writer<W> {
+        pub fn new(inner: W) -> io::Result<Self> {
+            let mut writer = Self { inner };
+            writer.write_global_header()?;
+            Ok(writer)
+        }
+
+        pub fn write_packet(&mut self, ts_us: u64, frame: &[u8]) -> io::Result<()> {
+            let ts_sec = (ts_us / 1_000_000) as u32;
+            let ts_usec = (ts_us % 1_000_000) as u32;
+            let len = frame.len() as u32;
+            self.inner.write_all(&ts_sec.to_le_bytes())?;
+            self.inner.write_all(&ts_usec.to_le_bytes())?;
+            self.inner.write_all(&len.to_le_bytes())?;
+            self.inner.write_all(&len.to_le_bytes())?;
+            self.inner.write_all(frame)
+        }
+
+        fn write_global_header(&mut self) -> io::Result<()> {
+            self.inner.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
+            self.inner.write_all(&2u16.to_le_bytes())?;
+            self.inner.write_all(&4u16.to_le_bytes())?;
+            self.inner.write_all(&0i32.to_le_bytes())?;
+            self.inner.write_all(&0u32.to_le_bytes())?;
+            self.inner.write_all(&65_535u32.to_le_bytes())?;
+            self.inner.write_all(&DLT_IEEE802_11_RADIOTAP.to_le_bytes())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn writes_little_endian_radiotap_pcap() {
+            let mut bytes = Vec::new();
+            {
+                let mut writer = Writer::new(&mut bytes).expect("global header written");
+                writer
+                    .write_packet(1_234_567, &[0x00, 0x00, 0x08, 0x00, 0xd0])
+                    .expect("packet written");
+            }
+
+            assert_eq!(&bytes[0..4], &[0xd4, 0xc3, 0xb2, 0xa1]);
+            assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
+            assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
+            assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 65_535);
+            assert_eq!(
+                u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+                DLT_IEEE802_11_RADIOTAP
+            );
+            assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 1);
+            assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 234_567);
+            assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 5);
+            assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 5);
+            assert_eq!(&bytes[40..45], &[0x00, 0x00, 0x08, 0x00, 0xd0]);
         }
     }
 }
@@ -1358,6 +1429,8 @@ pub mod cli {
         host_iface: String,
         #[arg(short = 'N')]
         assume_monitor: bool,
+        #[arg(long = "pcap")]
+        pcap_path: Option<String>,
     }
 
     pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
@@ -1380,6 +1453,7 @@ pub mod cli {
             host_iface: args.host_iface,
             anchor_channel: args.anchor_channel,
             assume_monitor: args.assume_monitor,
+            pcap_path: args.pcap_path.or_else(|| std::env::var("FILIN_PCAP").ok()),
         })
         .map_err(|_| CliError::Invalid)
     }
@@ -1400,8 +1474,25 @@ pub mod cli {
                     host_iface: "awdl0".into(),
                     anchor_channel: 44,
                     assume_monitor: true,
+                    pcap_path: None,
                 }
             );
+        }
+
+        #[test]
+        fn parses_ignored_frame_pcap_path() {
+            let config = parse_config_from([
+                "filin",
+                "-i",
+                "wlan0mon",
+                "-h",
+                "awdl0",
+                "--pcap",
+                "/tmp/filin-ignored.pcap",
+            ])
+            .expect("valid CLI args");
+
+            assert_eq!(config.pcap_path, Some("/tmp/filin-ignored.pcap".into()));
         }
 
         #[test]
@@ -1423,7 +1514,7 @@ pub mod runtime {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
 
-    use crate::{awdl, channel, ieee80211, iface::Config, os, radiotap, rx, sync::TsftBridge};
+    use crate::{awdl, channel, ieee80211, iface::Config, os, pcap, radiotap, rx, sync::TsftBridge};
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Error {
@@ -1433,11 +1524,13 @@ pub mod runtime {
         Channel,
         Poll,
         Io,
+        Pcap,
     }
 
     pub struct Links {
         pub tap: File,
         pub packet: os::packet::PacketSocket,
+        pcap: Option<pcap::Writer<File>>,
     }
 
     pub fn open_links(config: &Config) -> Result<Links, Error> {
@@ -1452,8 +1545,13 @@ pub mod runtime {
             .map_err(|_| Error::Channel)?;
         let packet =
             os::packet::PacketSocket::open_bound(&config.monitor_iface).map_err(|_| Error::Packet)?;
+        let pcap = config
+            .pcap_path
+            .as_deref()
+            .map(|path| File::create(path).and_then(pcap::Writer::new).map_err(|_| Error::Pcap))
+            .transpose()?;
 
-        Ok(Links { tap, packet })
+        Ok(Links { tap, packet, pcap })
     }
 
     pub fn run(mut links: Links) -> Result<(), Error> {
@@ -1504,6 +1602,11 @@ pub mod runtime {
                                     tracing::trace!(len = frame.bytes.len(), "wrote ethernet frame to tap");
                                 }
                                 Err(data_err) => {
+                                    if let Some(pcap) = links.pcap.as_mut() {
+                                        if let Err(err) = pcap.write_packet(now_us, &wlan_buf[..len]) {
+                                            tracing::trace!(?err, "pcap ignored-frame write failed");
+                                        }
+                                    }
                                     let ieee80211_preview = ieee80211_payload_preview(&wlan_buf[..len]);
                                     tracing::trace!(
                                         ?err,

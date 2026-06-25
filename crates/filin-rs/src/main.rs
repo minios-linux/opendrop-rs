@@ -21,6 +21,7 @@ fn main() -> anyhow::Result<()> {
         host_iface = %config.host_iface,
         anchor_channel = config.anchor_channel,
         assume_monitor = config.assume_monitor,
+        pcap_path = ?config.pcap_path,
         "validated filin configuration"
     );
     let links = filin_rs::runtime::open_links(&config)
