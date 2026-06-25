@@ -236,55 +236,9 @@ mod tests {
 
     #[test]
     fn handle_connection_upload_dvzip_returns_files() {
-        // Build a tiny dvzip payload.
-        use crate::cpio::read_odc_cpio; // just to verify types compile
-        let _ = read_odc_cpio;
-
-        // Minimal CPIO with one file, then zlib-frame it.
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write as IoWrite;
-        let mut cpio = Vec::new();
-        let name = "test.txt\0";
-        let data = b"hello";
-        let mut hdr = String::new();
-        hdr.push_str("070707");
-        hdr.push_str("000000"); // dev
-        hdr.push_str("000001"); // ino
-        hdr.push_str("100644"); // mode
-        hdr.push_str("000000"); // uid
-        hdr.push_str("000000"); // gid
-        hdr.push_str("000001"); // nlink
-        hdr.push_str("000000"); // rdev
-        hdr.push_str("00000000000"); // mtime
-        hdr.push_str(&format!("{:06o}", name.len())); // namesize
-        hdr.push_str(&format!("{:011o}", data.len())); // filesize
-        cpio.extend_from_slice(hdr.as_bytes());
-        cpio.extend_from_slice(name.as_bytes());
-        cpio.extend_from_slice(data);
-        // trailer
-        let trailer = "TRAILER!!!\0";
-        let mut hdr = String::new();
-        hdr.push_str("070707");
-        hdr.push_str("000000");
-        hdr.push_str("000000");
-        hdr.push_str("100644");
-        hdr.push_str("000000");
-        hdr.push_str("000000");
-        hdr.push_str("000001");
-        hdr.push_str("000000");
-        hdr.push_str("00000000000");
-        hdr.push_str(&format!("{:06o}", trailer.len()));
-        hdr.push_str("00000000000");
-        cpio.extend_from_slice(hdr.as_bytes());
-        cpio.extend_from_slice(trailer.as_bytes());
-
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&cpio).unwrap();
-        let compressed = enc.finish().unwrap();
-        let mut dvzip = Vec::new();
-        dvzip.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-        dvzip.extend_from_slice(&compressed);
+        // Build a dvzip payload via the public encoders (one file "test.txt").
+        use crate::{cpio::build_odc_cpio, dvzip::cpio_to_dvzip};
+        let dvzip = cpio_to_dvzip(&build_odc_cpio(&[("test.txt", b"hello")]));
 
         let request = format!(
             "POST /Upload HTTP/1.1\r\n\

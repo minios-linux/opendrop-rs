@@ -107,11 +107,9 @@ mod tests {
     use super::*;
     use crate::http::HttpRequest;
     use crate::plist_impl::ReceiverConfig;
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
+    use crate::{cpio::build_odc_cpio, dvzip::cpio_to_dvzip};
     use plist::{Dictionary, Value};
     use std::collections::HashMap;
-    use std::io::Write;
 
     fn cfg() -> ReceiverConfig {
         ReceiverConfig {
@@ -169,64 +167,15 @@ mod tests {
         );
     }
 
-    // ---- /Upload decode helpers ----
+    // ---- /Upload decode helpers (reuse the public encoders) ----
 
-    fn zlib_encode(data: &[u8]) -> Vec<u8> {
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(data).unwrap();
-        enc.finish().unwrap()
-    }
-
-    fn build_cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (i, &(name, data)) in entries.iter().enumerate() {
-            let name_nul = format!("{name}\0");
-            let mut hdr = String::new();
-            hdr.push_str("070707");
-            hdr.push_str("000000"); // dev
-            hdr.push_str(&format!("{:06o}", i + 1)); // ino
-            hdr.push_str("100644"); // mode
-            hdr.push_str("000000"); // uid
-            hdr.push_str("000000"); // gid
-            hdr.push_str("000001"); // nlink
-            hdr.push_str("000000"); // rdev
-            hdr.push_str("00000000000"); // mtime
-            hdr.push_str(&format!("{:06o}", name_nul.len())); // namesize
-            hdr.push_str(&format!("{:011o}", data.len())); // filesize
-            out.extend_from_slice(hdr.as_bytes());
-            out.extend_from_slice(name_nul.as_bytes());
-            out.extend_from_slice(data);
-        }
-        let trailer = "TRAILER!!!\0";
-        let mut hdr = String::new();
-        hdr.push_str("070707");
-        hdr.push_str("000000");
-        hdr.push_str("000000");
-        hdr.push_str("100644");
-        hdr.push_str("000000");
-        hdr.push_str("000000");
-        hdr.push_str("000001");
-        hdr.push_str("000000");
-        hdr.push_str("00000000000");
-        hdr.push_str(&format!("{:06o}", trailer.len()));
-        hdr.push_str("00000000000");
-        out.extend_from_slice(hdr.as_bytes());
-        out.extend_from_slice(trailer.as_bytes());
-        out
-    }
-
-    fn frame_dvzip(cpio: &[u8]) -> Vec<u8> {
-        let compressed = zlib_encode(cpio);
-        let mut out = Vec::new();
-        out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
-        out.extend_from_slice(&compressed);
-        out
+    fn make_dvzip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        cpio_to_dvzip(&build_odc_cpio(entries))
     }
 
     #[test]
     fn decode_upload_body_dvzip_extracts_files() {
-        let cpio = build_cpio(&[("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0])]);
-        let dvzip = frame_dvzip(&cpio);
+        let dvzip = make_dvzip(&[("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0])]);
         let files = decode_upload_body("application/x-dvzip", &dvzip);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "photo.jpg");
@@ -235,7 +184,7 @@ mod tests {
 
     #[test]
     fn decode_upload_body_cpio_extracts_files() {
-        let cpio = build_cpio(&[("hello.txt", b"world"), ("a.bin", &[0, 1, 2])]);
+        let cpio = build_odc_cpio(&[("hello.txt", b"world"), ("a.bin", &[0, 1, 2])]);
         let files = decode_upload_body("application/x-cpio", &cpio);
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].name, "hello.txt");
@@ -247,8 +196,7 @@ mod tests {
 
     #[test]
     fn handle_upload_dvzip_returns_200_and_received_files() {
-        let cpio = build_cpio(&[("doc.txt", b"hi")]);
-        let dvzip = frame_dvzip(&cpio);
+        let dvzip = make_dvzip(&[("doc.txt", b"hi")]);
         let req = post(
             "/Upload",
             vec![("Content-Type", "application/x-dvzip"), ("Transfer-Encoding", "chunked")],
