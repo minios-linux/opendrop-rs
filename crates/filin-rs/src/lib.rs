@@ -7487,6 +7487,8 @@ pub mod introspect {
                 synced: true,
                 peer_count: 2,
                 master_anchor: 52,
+                tsf_offset_us: 1200,
+                master_age_ms: 4500,
             };
 
             let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
@@ -7494,6 +7496,16 @@ pub mod introspect {
 
             assert_eq!(obj.get("current_channel").and_then(|v| v.as_u64()), Some(44));
             assert_eq!(obj.get("master_anchor").and_then(|v| v.as_u64()), Some(52));
+            assert_eq!(
+                obj.get("tsf_offset_us").and_then(|v| v.as_u64()),
+                Some(1200),
+                "tsf_offset_us must serialize"
+            );
+            assert_eq!(
+                obj.get("master_age_ms").and_then(|v| v.as_u64()),
+                Some(4500),
+                "master_age_ms must serialize"
+            );
             assert_eq!(
                 obj.get("master_mac").and_then(|v| v.as_str()),
                 Some("02:aa:bb:cc:dd:ee")
@@ -7770,6 +7782,8 @@ pub mod introspect {
                 synced: true,
                 peer_count: 2,
                 master_anchor: 0,
+                tsf_offset_us: 800,
+                master_age_ms: 3200,
             });
             intro.counters.inc_mdns_rx_self();
             intro.counters.inc_mdns_rx_self();
@@ -7777,6 +7791,14 @@ pub mod introspect {
             intro.counters.inc_rebroadcast(44);
             intro.counters.inc_rebroadcast(44);
             intro.counters.inc_rebroadcast(149);
+            // sync-quality counters
+            intro.counters.inc_master_change();
+            intro.counters.inc_master_change();
+            intro.counters.push_master_mac("02:aa:bb:cc:dd:ee".into());
+            intro.counters.push_master_mac("02:00:00:00:00:99".into());
+            intro.counters.record_aw_check(true);
+            intro.counters.record_aw_check(true);
+            intro.counters.record_aw_check(false);
 
             let resp = route(&intro, &req("GET", "/status"));
             assert_eq!(resp.status, 200);
@@ -7797,6 +7819,36 @@ pub mod introspect {
             assert!(!rbc.contains_key("6"), "ch6 never bumped");
             assert_eq!(rbc.get("44").and_then(|v| v.as_u64()), Some(2));
             assert_eq!(rbc.get("149").and_then(|v| v.as_u64()), Some(1));
+            // Snapshot-backed sync-quality fields.
+            assert_eq!(
+                obj.get("tsf_offset_us").and_then(|v| v.as_u64()),
+                Some(800),
+                "/status must expose tsf_offset_us"
+            );
+            assert_eq!(
+                obj.get("master_age_ms").and_then(|v| v.as_u64()),
+                Some(3200),
+                "/status must expose master_age_ms"
+            );
+            // Counter-backed sync-quality fields.
+            assert_eq!(
+                obj.get("master_changes").and_then(|v| v.as_u64()),
+                Some(2),
+                "/status must expose master_changes"
+            );
+            assert_eq!(
+                obj.get("aw_alignment_pct").and_then(|v| v.as_u64()),
+                Some(66),
+                "/status must expose aw_alignment_pct (2/3 aligned = 66%)"
+            );
+            let macs = obj
+                .get("last_master_macs")
+                .expect("/status must expose last_master_macs")
+                .as_array()
+                .unwrap();
+            assert_eq!(macs.len(), 2);
+            assert_eq!(macs[0].as_str(), Some("02:aa:bb:cc:dd:ee"));
+            assert_eq!(macs[1].as_str(), Some("02:00:00:00:00:99"));
         }
 
         #[test]
