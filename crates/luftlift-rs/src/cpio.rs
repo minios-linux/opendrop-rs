@@ -125,8 +125,20 @@ fn build_header(ino: u32, namesize: usize, filesize: usize) -> String {
 /// terminated by the `TRAILER!!!` entry. This is the inverse of
 /// [`read_odc_cpio`] and the inner payload the AirDrop sender frames as
 /// dvzip for `/Upload`.
-pub fn build_odc_cpio(_entries: &[(&str, &[u8])]) -> Vec<u8> {
-    Vec::new()
+pub fn build_odc_cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, &(name, data)) in entries.iter().enumerate() {
+        let name_with_nul = format!("{}\0", name);
+        let header = build_header((i + 1) as u32, name_with_nul.len(), data.len());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(name_with_nul.as_bytes());
+        out.extend_from_slice(data);
+    }
+    let trailer = "TRAILER!!!\0";
+    let header = build_header(0, trailer.len(), 0);
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(trailer.as_bytes());
+    out
 }
 
 #[cfg(test)]
