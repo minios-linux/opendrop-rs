@@ -6045,6 +6045,124 @@ pub mod introspect {
         }
     }
 
+    /// `tracing::field::Visit` impl that pulls an event's message + structured
+    /// fields out of the macro machinery. The special `"message"` field (set
+    /// by `tracing::info!("fmt", ...)` macros) is routed to `TraceEvent::msg`;
+    /// everything else lands in `fields` with type-aware JSON values.
+    #[derive(Default)]
+    struct FieldCollector {
+        message: Option<String>,
+        fields: serde_json::Map<String, serde_json::Value>,
+    }
+
+    impl FieldCollector {
+        fn route(&mut self, name: &str, value: serde_json::Value) {
+            if name == "message" {
+                if let serde_json::Value::String(s) = value {
+                    self.message = Some(s);
+                } else {
+                    self.message = Some(value.to_string());
+                }
+            } else {
+                self.fields.insert(name.to_string(), value);
+            }
+        }
+    }
+
+    impl tracing::field::Visit for FieldCollector {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            self.route(field.name(), serde_json::Value::String(format!("{value:?}")));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.route(field.name(), serde_json::Value::String(value.to_string()));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.route(field.name(), serde_json::json!(value));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.route(field.name(), serde_json::json!(value));
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.route(field.name(), serde_json::json!(value));
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            self.route(field.name(), serde_json::json!(value));
+        }
+    }
+
+    /// Wall-clock milliseconds since `UNIX_EPOCH` for `TraceEvent::ts`. Falls
+    /// back to 0 if the clock is before the epoch (won't happen in practice).
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Map a `tracing::Level` to its verbosity rank (ERROR=1 … TRACE=5), the
+    /// same encoding used by [`GateLevel`] and [`TraceGate`]. Kept explicit so
+    /// we don't depend on `LevelFilter::as_usize` (sealed in `tracing-core`).
+    fn level_to_u8(level: &tracing::Level) -> u8 {
+        match *level {
+            tracing::Level::ERROR => 1,
+            tracing::Level::WARN => 2,
+            tracing::Level::INFO => 3,
+            tracing::Level::DEBUG => 4,
+            tracing::Level::TRACE => 5,
+        }
+    }
+
+    /// A `tracing_subscriber::Layer` that, when the [`TraceGate`] permits,
+    /// serializes each event into the [`TraceRing`]. The cost when the gate is
+    /// off is a single relaxed atomic load + compare; the hot loop is
+    /// unaffected. `FieldCollector` is reused on the (rare) capture path.
+    pub struct TraceLayer {
+        ring: Arc<TraceRing>,
+        gate: Arc<TraceGate>,
+    }
+
+    impl TraceLayer {
+        pub fn new(ring: Arc<TraceRing>, gate: Arc<TraceGate>) -> Self {
+            Self { ring, gate }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for TraceLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let metadata = event.metadata();
+            let level_num = level_to_u8(metadata.level());
+            if !self.gate.allows(level_num) {
+                return;
+            }
+            let mut collector = FieldCollector::default();
+            event.record(&mut collector);
+            let ev = TraceEvent {
+                ts: now_ms(),
+                level: metadata.level().as_str().to_string(),
+                target: metadata.target().to_string(),
+                msg: collector.message.unwrap_or_default(),
+                fields: collector.fields,
+            };
+            self.ring.push(ev);
+        }
+    }
+
     /// Aggregate introspection state, shared (via `Arc`) between the AF_PACKET
     /// hot loop, the optional `TraceLayer`, and the HTTP server thread.
     pub struct Introspection {
@@ -6347,6 +6465,7 @@ pub mod introspect {
         }
 
         fn run_with_layer<F: FnOnce()>(gate: GateLevel, ring: Arc<TraceRing>, body: F) {
+            use tracing_subscriber::prelude::*;
             let gate_arc = Arc::new(TraceGate::new());
             gate_arc.set(gate);
             let layer = TraceLayer::new(ring, gate_arc);
@@ -6366,7 +6485,11 @@ pub mod introspect {
             assert_eq!(captured.len(), 1);
             let ev = &captured[0];
             assert_eq!(ev.level, "INFO");
-            assert_eq!(ev.target, "filin_rs::introspect");
+            assert!(
+                ev.target.starts_with("filin_rs::introspect"),
+                "target was {}",
+                ev.target
+            );
             assert_eq!(ev.msg, "injected awdl announce frame");
             assert_eq!(ev.fields.get("sent").and_then(|v| v.as_u64()), Some(1));
             assert_eq!(ev.fields.get("channel").and_then(|v| v.as_u64()), Some(44));
@@ -6408,7 +6531,8 @@ pub mod introspect {
                 tracing::debug!("debug captured");
             });
 
-            let msgs: Vec<&str> = ring.last_n(10).iter().map(|e| e.msg.as_str()).collect();
+            let captured = ring.last_n(10);
+            let msgs: Vec<&str> = captured.iter().map(|e| e.msg.as_str()).collect();
             assert_eq!(msgs, vec!["info captured", "debug captured"]);
         }
     }
