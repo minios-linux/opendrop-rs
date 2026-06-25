@@ -90,8 +90,33 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 15 (LIVE HARDWARE PASS in progress with human — carl9170 + real Apple peer).
+*** LIVE VALIDATION (human present, driving pty-7 root shell on ayourtch-x280) ***
+- HARDWARE: monitor iface = wlxbc05430d50a1 (carl9170, monitor mode ch44). awdl0
+  created by filin (or C-owl). Real Apple peer (iPad/Mac "Andrew's MacBook Pro").
+- ✅ luftlift (AirDrop) FULLY VALIDATED end-to-end over a C-owl AWDL link: received a
+  real photo IMG_0226.png (568137 B, valid PNG) via Discover->Ask->Upload. Found+fixed
+  a real interop bug live: /Ask has NO TransferID from real iOS -> made it optional
+  (commit 3539f53 fix(luftlift): accept /Ask without TransferID). Link/webloc sends
+  come as Ask file_count=0 + no Upload = KNOWN follow-up (not done).
+- 🔧 filin (our AWDL layer) live debugging (Stage 2, swap C-owl -> filin):
+  - awdl0 TAP create + MAC + MTU + IPv6 link-local + TX inject all WORK.
+  - BUG1 FIXED: radiotap parser only knew present bits 0/1/5, errored on real carl9170
+    headers (bits 1,2,3,5,11,14, no TSFT). gpt-5.5 fixed: skip-table + TSFT host-clock
+    fallback (commits red/green parse carl9170 radiotap + tsft fallback + tolerate
+    unknown fields). 1129->0 radiotap errors live.
+  - BUG2 IN PROGRESS: real frames now fail at 802.11 (err=Ieee x207) and AWDL
+    (err=Awdl x161) layers; no sync_error yet. gpt-5.5 adding detailed RX error logging
+    (specific variant + payload hex) so we fix precisely, then harden ieee80211+awdl
+    parsers for real frames. LOOP: gpt-5.5 fixes -> I rebuild+relaunch filin on pty-7
+    (RUST_LOG=filin_rs=trace) -> capture trace -> feed back.
+  - NOTE: gpt-5.5 hit usage limit once (~02:18), human reset it. Watch for re-limit.
+- Live test recipe: kill owl/luftlift/filin; filin -i wlxbc05430d50a1 -c 44 -h awdl0 -N;
+  then luftlift -i awdl0 receive -o /tmp/ldrop; human AirDrops a file; watch
+  /tmp/ldrop + luftlift log for Discover/Ask/Upload, filin trace for sync_error.
+--- earlier ---
 Last updated: cycle 14 (DONE — pure-software port complete, verified, reported to human).
-*** MISSION COMPLETE (pending live hardware pass). ***
+*** PRIOR: pure-software port complete, verified, reported. ***
 - FINAL VERIFICATION (all green):
   - cargo build --release: clean, both bins (target/release/filin, .../luftlift).
   - cargo test --workspace: 92 passing (filin 28 + luftlift 64).
