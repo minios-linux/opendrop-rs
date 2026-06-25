@@ -3837,6 +3837,11 @@ pub mod state {
         /// Drives `/status master_age_ms` (FILIN_SYNC_QUALITY.md Part A) and
         /// is bumped on every real master switch.
         pub master_adopted_at_us: u64,
+        /// Most recent sync error (TU) measured against the elected master's
+        /// sync TLV, or `None` if no sync update has been processed yet. Read
+        /// by the runtime to feed `/status aw_alignment_pct`
+        /// (FILIN_SYNC_QUALITY.md Part A).
+        pub last_sync_error_tu: Option<i64>,
     }
 
     impl AwdlState {
@@ -3866,6 +3871,7 @@ pub mod state {
                 transfer: None,
                 master_anchor: 0,
                 master_adopted_at_us: now_us,
+                last_sync_error_tu: None,
             }
         }
 
@@ -3909,6 +3915,7 @@ pub mod state {
                     let error_tu =
                         self.sync
                             .sync_error_tu(rx_time_us, time_to_next_aw_tu, aw_counter);
+                    self.last_sync_error_tu = Some(error_tu);
                     self.sync
                         .update_from_master(rx_time_us, time_to_next_aw_tu, aw_counter);
                     tracing::trace!(
@@ -3975,6 +3982,12 @@ pub mod state {
             };
             match decision {
                 crate::schedule::MasterAdoption::Adopt => {
+                    if self.committed_master != winner {
+                        // Real master switch: stamp the adoption time so
+                        // /status master_age_ms resets
+                        // (FILIN_SYNC_QUALITY.md Part A).
+                        self.master_adopted_at_us = now_us;
+                    }
                     self.committed_master = winner;
                     self.pending_master = winner;
                     self.pending_since_us = now_us;
