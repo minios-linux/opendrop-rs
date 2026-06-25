@@ -5869,6 +5869,17 @@ pub mod introspect {
     //! Snapshot reads on the HTTP path take a brief `RwLock::read`; snapshot
     //! writes on the hot path are throttled to ~10 Hz.
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, RwLock};
+
+    use serde::Serialize;
+
+    /// Format an AWDL MAC address as `xx:xx:xx:xx:xx:xx` for JSON consumers.
+    pub fn mac_string(addr: [u8; 6]) -> String {
+        format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+        )
+    }
 
     /// Hot-path counters for the introspection API. Every field is a plain
     /// `AtomicU64` so the AF_PACKET loop can bump them without taking a lock.
@@ -5886,6 +5897,55 @@ pub mod introspect {
     impl Default for Counters {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    /// Slowly-changing state exposed by `GET /status`. The fast counter-backed
+    /// fields (`mdns_rx_*`, `rebroadcast_counts`) live on [`Counters`] and are
+    /// merged into the JSON response at request time so the hot path never
+    /// takes a lock to update them.
+    #[derive(Debug, Clone, PartialEq, Serialize, Default)]
+    pub struct StatusSnapshot {
+        pub current_channel: u8,
+        pub master_mac: String,
+        /// The sequence control of the most-recently-injected AWDL frame.
+        pub master_seq: u16,
+        pub synced: bool,
+        pub peer_count: usize,
+    }
+
+    /// Aggregate introspection state, shared (via `Arc`) between the AF_PACKET
+    /// hot loop, the optional `TraceLayer`, and the HTTP server thread.
+    pub struct Introspection {
+        pub counters: Counters,
+        status: RwLock<StatusSnapshot>,
+    }
+
+    impl Introspection {
+        /// Construct a fresh introspection handle wrapped in an `Arc` — the
+        /// shape the runtime, TraceLayer, and HTTP thread all share.
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                counters: Counters::new(),
+                status: RwLock::new(StatusSnapshot::default()),
+            })
+        }
+
+        /// Replace the status snapshot. Called from the hot loop on a throttled
+        /// cadence; reads happen on the HTTP thread.
+        pub fn set_status(&self, snapshot: StatusSnapshot) {
+            if let Ok(mut guard) = self.status.write() {
+                *guard = snapshot;
+            }
+        }
+
+        /// Snapshot clone for serialization. Returns the default snapshot if the
+        /// lock is poisoned (the daemon keeps running).
+        pub fn status(&self) -> StatusSnapshot {
+            match self.status.read() {
+                Ok(guard) => guard.clone(),
+                Err(e) => e.into_inner().clone(),
+            }
         }
     }
 
