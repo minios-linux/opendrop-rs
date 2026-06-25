@@ -4568,6 +4568,33 @@ pub mod state {
             // advance to EAW slot 1: 64 TU later = 65536 us
             assert_eq!(state.desired_channel(65536), 0);
         }
+
+        // --- FILIN_SYNC_QUALITY.md: master_addr vs sync_addr transitions ---
+
+        #[test]
+        fn election_transitions_detect_sync_addr_reparent_without_master_addr_change() {
+            // The core churn diagnosis: sync_addr (parent) flips while
+            // master_addr (cluster top) stays stable. The transition detector
+            // must report sync_addr_changed but NOT master_addr_changed.
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            // First call seeds the baseline; no transition reported.
+            let t0 = state.note_election_transitions();
+            assert!(!t0.master_addr_changed && !t0.sync_addr_changed);
+
+            // Adopt the cluster top master via peer A.
+            state.election.master_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            state.election.sync_addr = [0x02, 0xcc, 0, 0, 0, 1]; // parent A
+            let t1 = state.note_election_transitions();
+            assert!(t1.master_addr_changed, "top master changed");
+            assert!(t1.sync_addr_changed, "parent changed");
+
+            // Re-parent to peer B (same top master): sync_addr flips,
+            // master_addr stable.
+            state.election.sync_addr = [0x02, 0xdd, 0, 0, 0, 2]; // parent B
+            let t2 = state.note_election_transitions();
+            assert!(!t2.master_addr_changed, "top master stable across re-parent");
+            assert!(t2.sync_addr_changed, "parent changed on re-parent");
+        }
     }
 }
 
