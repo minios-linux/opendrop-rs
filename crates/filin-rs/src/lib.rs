@@ -426,6 +426,10 @@ pub mod awdl {
         body
     }
 
+    pub fn encapsulate_ethernet_payload(_ethernet: &[u8], _seq: u16) -> Result<Vec<u8>, ParseError> {
+        Err(ParseError::TooShort)
+    }
+
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
         let field = bytes.get(offset..offset + 2).ok_or(ParseError::TooShort)?;
         Ok(u16::from_le_bytes([field[0], field[1]]))
@@ -597,6 +601,27 @@ pub mod awdl {
                     0x44, 0x33, 0x22, 0x11,
                     0x88, 0x77, 0x66, 0x55,
                     0x04, 0x00, 0x00,
+                ]
+            );
+        }
+
+        #[test]
+        fn encapsulates_ethernet_payload_as_awdl_data_body() {
+            let ethernet = [
+                0x33, 0x33, 0x00, 0x00, 0x00, 0x01,
+                0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+                0x86, 0xdd,
+                0x60, 0x00,
+            ];
+
+            let body = encapsulate_ethernet_payload(&ethernet, 7).expect("valid ethernet frame");
+
+            assert_eq!(
+                body,
+                vec![
+                    0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00,
+                    0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x86, 0xdd,
+                    0x60, 0x00,
                 ]
             );
         }
