@@ -1161,9 +1161,15 @@ pub mod rx {
     #[derive(Debug, PartialEq, Eq)]
     pub enum ParseError {
         Radiotap(radiotap::RadiotapError),
+        BadFcs,
+        FcsTooShort,
         Ieee80211(ieee80211::ParseError),
-        Awdl(awdl::ParseError),
+        AwdlAction(awdl::ParseError),
+        AwdlTlv(awdl::ParseError),
     }
+
+    const RADIOTAP_F_FCS: u8 = 0x10;
+    const RADIOTAP_F_BADFCS: u8 = 0x40;
 
     pub fn parse_action_frame<'a>(
         frame: &'a [u8],
@@ -1171,9 +1177,10 @@ pub mod rx {
         bridge: &mut TsftBridge,
     ) -> Result<ParsedActionFrame<'a>, ParseError> {
         let radiotap = radiotap::parse_header(frame).map_err(ParseError::Radiotap)?;
-        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(ParseError::Ieee80211)?;
-        let action = awdl::parse_action_frame(mac.body).map_err(ParseError::Awdl)?;
-        let tlvs = awdl::parse_tlvs(action.tlvs).map_err(ParseError::Awdl)?;
+        let ieee80211_payload = ieee80211_payload_without_fcs(&radiotap)?;
+        let mac = ieee80211::parse_mac_header(ieee80211_payload).map_err(ParseError::Ieee80211)?;
+        let action = awdl::parse_action_frame(mac.body).map_err(ParseError::AwdlAction)?;
+        let tlvs = awdl::parse_tlvs(action.tlvs).map_err(ParseError::AwdlTlv)?;
         let rx_time_us = radiotap
             .tsft
             .map(|hw_tsft| bridge.timestamp_rx(hw_tsft, host_now_us))
@@ -1187,6 +1194,22 @@ pub mod rx {
             action,
             tlvs,
         })
+    }
+
+    pub fn ieee80211_payload_without_fcs<'a>(
+        radiotap: &radiotap::RadiotapHeader<'a>,
+    ) -> Result<&'a [u8], ParseError> {
+        let flags = radiotap.flags.unwrap_or(0);
+        if flags & RADIOTAP_F_BADFCS != 0 {
+            return Err(ParseError::BadFcs);
+        }
+        if flags & RADIOTAP_F_FCS != 0 {
+            return radiotap
+                .payload
+                .get(..radiotap.payload.len().checked_sub(4).ok_or(ParseError::FcsTooShort)?)
+                .ok_or(ParseError::FcsTooShort);
+        }
+        Ok(radiotap.payload)
     }
 
     #[cfg(test)]
@@ -1532,20 +1555,25 @@ pub mod runtime {
     #[derive(Debug, PartialEq, Eq)]
     enum DataParseError {
         Radiotap(radiotap::RadiotapError),
+        Fcs(rx::ParseError),
         Ieee80211(ieee80211::ParseError),
         Awdl(awdl::ParseError),
     }
 
     fn decapsulate_rx_data(frame: &[u8]) -> Result<awdl::EthernetFrame, DataParseError> {
         let radiotap = radiotap::parse_header(frame).map_err(DataParseError::Radiotap)?;
-        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(DataParseError::Ieee80211)?;
+        let ieee80211_payload = rx::ieee80211_payload_without_fcs(&radiotap).map_err(DataParseError::Fcs)?;
+        let mac = ieee80211::parse_mac_header(ieee80211_payload).map_err(DataParseError::Ieee80211)?;
         awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination)
             .map_err(DataParseError::Awdl)
     }
 
     fn ieee80211_payload_preview(frame: &[u8]) -> String {
         match radiotap::parse_header(frame) {
-            Ok(header) => hex_preview(header.payload, 64),
+            Ok(header) => match rx::ieee80211_payload_without_fcs(&header) {
+                Ok(payload) => hex_preview(payload, 64),
+                Err(_) => hex_preview(header.payload, 64),
+            },
             Err(_) => hex_preview(frame, 64),
         }
     }
