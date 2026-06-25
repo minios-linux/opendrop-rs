@@ -1236,8 +1236,14 @@ pub mod os {
             pub protocol_be: u16,
         }
 
-        pub fn plan_bind(_ifindex: libc::c_int) -> Result<BindPlan, Error> {
-            Err(Error::InvalidIfIndex)
+        pub fn plan_bind(ifindex: libc::c_int) -> Result<BindPlan, Error> {
+            if ifindex <= 0 {
+                return Err(Error::InvalidIfIndex);
+            }
+            Ok(BindPlan {
+                ifindex,
+                protocol_be: (libc::ETH_P_ALL as u16).to_be(),
+            })
         }
 
         #[derive(Debug, PartialEq, Eq)]
