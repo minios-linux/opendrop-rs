@@ -14,6 +14,15 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("filin starting (skeleton — see PORT.md)");
-    // TODO(gpt-5.5): implement per PORT.md
+    let config = filin_rs::cli::parse_config_from(std::env::args_os())
+        .map_err(|err| anyhow::anyhow!("invalid CLI arguments: {err:?}"))?;
+    tracing::info!(
+        monitor_iface = %config.monitor_iface,
+        host_iface = %config.host_iface,
+        anchor_channel = config.anchor_channel,
+        assume_monitor = config.assume_monitor,
+        "validated filin configuration"
+    );
+    // TODO(gpt-5.5): open monitor iface and create awdl0 per PORT.md.
     Ok(())
 }
