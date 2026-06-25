@@ -7,6 +7,10 @@ license.workspace = true
 # A Rust port of SEEMOO's opendrop (the AirDrop application layer).
 # Runs over the awdl0 interface that awdl-rs brings up; talks to real Apple devices.
 
+[lib]
+name = "airdrop_rs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "airdrop-rs"
 path = "src/main.rs"
@@ -17,5 +21,8 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
-# Add as needed: rustls/tokio-rustls, hyper/axum, mdns/zeroconf, plist, flate2 (zlib),
-# cpio, etc. (coordinate big additions with Claude)
+# zlib (de)compression for the dvzip framed-zlib format. Pure-Rust default
+# backend (miniz_oxide); no system zlib needed. Local dep — ask Claude to hoist
+# into [workspace.dependencies] if other crates want it too.
+flate2 = "1"
+# Add as needed: rustls/tokio-rustls, hyper/axum, mdns/zeroconf, plist, cpio, etc.
