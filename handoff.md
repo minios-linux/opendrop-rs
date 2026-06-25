@@ -113,6 +113,14 @@ Last updated: cycle 22 (AUTONOMOUS — BOTH AUDITS COMPLETE; improved stack runn
     pkill -f target/release/filin; pkill -f target/release/luftlift; (then re-run both)
   Compare baseline = owl force-master (owl/src/election.h patched; `make -C owl/build owl`).
 - See WAKEUP_REPORT.md for the full overnight summary for the human.
+- AUTONOMOUS FIND (cycle 22): ran a luftlift->luftlift round-trip (send to the running
+  receiver) — exposed a REAL send bug: send to a link-local IPv6 (fe80::) fails
+  `POST /Discover -> Error: Invalid argument (os error 22)` because the client builds
+  SocketAddrV6 with scope_id=0 (missing the %awdl0 zone). Dispatched fix to pty-3 via
+  LUFTLIFT_SEND_BUG.md (set scope_id from -i iface via if_nametoindex). NEXT CYCLE:
+  verify fix builds + re-run round-trip (should complete Discover/Ask/Upload, file lands
+  in receiver dir) = full luftlift send+receive validated locally w/o Apple. The find +
+  mDNS discovery already work (round-trip discovered the receiver fine).
 --- PRIOR cycle-21 below ---
 Last updated: cycle 21 (AUTONOMOUS — both GLM audits progressing well; tree green).
 - filin (pty-5): CHANNEL HOPPING DONE — a4f99a7 adopt master chanseq + switching,
