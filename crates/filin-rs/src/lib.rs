@@ -711,8 +711,15 @@ pub mod sync {
 }
 
 pub mod channel {
-    pub fn channel_to_frequency_mhz(_channel: u16) -> Option<u16> {
-        unimplemented!("RED: channel conversion not implemented yet")
+    pub fn channel_to_frequency_mhz(channel: u16) -> Option<u16> {
+        match channel {
+            0 => None,
+            14 => Some(2484),
+            1..=13 => Some(2407 + channel * 5),
+            32..=181 => Some(5000 + channel * 5),
+            182..=196 => Some(4000 + channel * 5),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
