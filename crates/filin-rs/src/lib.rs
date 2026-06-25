@@ -843,8 +843,14 @@ pub mod iface {
         UnsupportedAnchorChannel(u16),
     }
 
-    pub fn validate_config(_config: Config) -> Result<Config, ConfigError> {
-        unimplemented!("RED: iface config validation not implemented yet")
+    pub fn validate_config(config: Config) -> Result<Config, ConfigError> {
+        if config.monitor_iface.is_empty() {
+            return Err(ConfigError::MissingMonitorInterface);
+        }
+        match config.anchor_channel {
+            6 | 44 | 149 => Ok(config),
+            other => Err(ConfigError::UnsupportedAnchorChannel(other)),
+        }
     }
 
     #[cfg(test)]
