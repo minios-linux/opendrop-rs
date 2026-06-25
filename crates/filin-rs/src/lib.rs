@@ -1836,6 +1836,89 @@ pub mod schedule {
         }
     }
 
+    // --- Part A: cached mDNS announce re-broadcast -------------------------
+
+    /// Minimum dwell between re-broadcasts of the cached announce on the
+    /// SAME social channel (~1 s). Prevents flooding while ensuring every
+    /// ~1 s of dwell on 149 the iPhone gets a fresh announce.
+    pub const ANNOUNCE_REBROADCAST_MIN_GAP_US: u64 = 1_000_000;
+
+    /// How long the cached announce stays valid after the last refresh from
+    /// the TAP. A few × the luftlift re-announce interval (~10 s): if no new
+    /// multicast arrives for 45 s, stop advertising a (probably dead)
+    /// receiver.
+    pub const ANNOUNCE_CACHE_TTL_US: u64 = 45_000_000;
+
+    /// Cache of the latest multicast mDNS announce read from the awdl0 TAP,
+    /// re-broadcast on every social-channel visit so discovery does not
+    /// depend on luftlift's ~10 s cadence aligning with a rare 149 hop.
+    ///
+    /// At most one frame is cached at a time (the latest); it is refreshed
+    /// whenever a new multicast frame arrives and expires if no refresh
+    /// arrives for [`ANNOUNCE_CACHE_TTL_US`]. Re-broadcasts are rate-limited
+    /// per-channel to [`ANNOUNCE_REBROADCAST_MIN_GAP_US`].
+    #[derive(Debug)]
+    pub struct AnnounceCache {
+        frame: Option<Vec<u8>>,
+        cached_at_us: u64,
+        /// Host time of the last re-broadcast per channel, for rate limiting.
+        last_sent: std::collections::BTreeMap<u8, u64>,
+        min_gap_us: u64,
+        ttl_us: u64,
+    }
+
+    impl AnnounceCache {
+        pub fn new(min_gap_us: u64, ttl_us: u64) -> Self {
+            Self {
+                frame: None,
+                cached_at_us: 0,
+                last_sent: std::collections::BTreeMap::new(),
+                min_gap_us,
+                ttl_us,
+            }
+        }
+
+        /// Refresh the cache with a new multicast frame from the TAP.
+        /// Always keeps just the latest frame (bounded).
+        pub fn refresh(&mut self, frame: Vec<u8>, now_us: u64) {
+            self.frame = Some(frame);
+            self.cached_at_us = now_us;
+        }
+
+        /// Returns the cached frame to re-broadcast on `channel` now, iff:
+        /// the cache is live (not expired), the channel is a social channel,
+        /// and we have not already re-broadcast on this channel within the
+        /// rate-limit window. Updates the per-channel rate-limit clock on a
+        /// hit. Returns `None` if suppressed/expired/empty.
+        pub fn rebroadcast(&mut self, channel: u8, now_us: u64) -> Option<&[u8]> {
+            // Expire stale cache so a dead receiver stops being advertised.
+            // Done before borrowing self.frame below to avoid a borrow conflict.
+            if self.frame.is_some()
+                && now_us.saturating_sub(self.cached_at_us) > self.ttl_us
+            {
+                self.frame = None;
+            }
+            let frame = self.frame.as_deref()?;
+            if !AWDL_SOCIAL_CHANNELS.iter().any(|(c, _)| *c == channel) {
+                return None; // re-broadcast only on social channels
+            }
+            if let Some(&last) = self.last_sent.get(&channel) {
+                if now_us.saturating_sub(last) < self.min_gap_us {
+                    return None; // rate-limited on this channel
+                }
+            }
+            self.last_sent.insert(channel, now_us);
+            Some(frame)
+        }
+
+        /// Whether the cache currently holds a non-expired frame.
+        pub fn is_live(&self, now_us: u64) -> bool {
+            self.frame
+                .is_some()
+                && now_us.saturating_sub(self.cached_at_us) <= self.ttl_us
+        }
+    }
+
     // --- Bug C: sticky transfer channel -------------------------------------
 
     /// Idle window after the last received unicast data frame from a peer
@@ -2454,6 +2537,88 @@ pub mod schedule {
             let injected = ensure_social_coverage(&mut seq);
             assert_eq!(injected.len(), 3);
             assert!(seq.iter().any(|s| s[0] == 36), "ch36 must survive");
+        }
+
+        // --- Part A: AnnounceCache cached mDNS re-broadcast ---
+
+        #[test]
+        fn announce_cache_rebroadcast_on_social_visit() {
+            // A TAP multicast frame is cached; visiting a social channel
+            // re-broadcasts it.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA, 0xBB], 1_000_000);
+            assert_eq!(cache.rebroadcast(149, 1_500_000), Some(&[0xAA, 0xBB][..]));
+        }
+
+        #[test]
+        fn announce_cache_rate_limits_within_window() {
+            // A second re-broadcast on the SAME channel within the window is
+            // suppressed; the rate-limit is per-channel.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA], 1_000_000);
+            assert!(cache.rebroadcast(149, 1_500_000).is_some());
+            assert!(
+                cache.rebroadcast(149, 1_900_000).is_none(),
+                "second send within window must be suppressed"
+            );
+            // Past the window it fires again.
+            assert!(cache.rebroadcast(149, 2_501_000).is_some());
+        }
+
+        #[test]
+        fn announce_cache_rate_limit_is_per_channel() {
+            // Re-broadcasting on ch6 must NOT rate-limit a subsequent ch149
+            // send — the limit is per-channel so a dwell on 149 is never
+            // blocked by a prior ch6 send.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA], 1_000_000);
+            assert!(cache.rebroadcast(6, 1_500_000).is_some());
+            assert!(
+                cache.rebroadcast(149, 1_500_001).is_some(),
+                "ch149 must not be rate-limited by a ch6 send"
+            );
+        }
+
+        #[test]
+        fn announce_cache_refresh_replaces_with_latest() {
+            // A new TAP frame replaces the cached one.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA], 1_000_000);
+            cache.refresh(vec![0xCC, 0xDD], 2_000_000);
+            assert_eq!(cache.rebroadcast(149, 2_500_000), Some(&[0xCC, 0xDD][..]));
+        }
+
+        #[test]
+        fn announce_cache_expires_when_stale() {
+            // If no refresh arrives for longer than the TTL, the cache
+            // stops re-broadcasting (dead receiver no longer advertised).
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA], 1_000_000);
+            let stale = 1_000_000 + ANNOUNCE_CACHE_TTL_US + 1;
+            assert!(cache.rebroadcast(149, stale).is_none());
+            assert!(!cache.is_live(stale));
+        }
+
+        #[test]
+        fn announce_cache_does_not_rebroadcast_on_non_social_channel() {
+            // Only social channels (6/44/149) trigger a re-broadcast.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            cache.refresh(vec![0xAA], 1_000_000);
+            assert!(cache.rebroadcast(36, 1_500_000).is_none());
+        }
+
+        #[test]
+        fn announce_cache_empty_returns_none() {
+            // With no frame cached, nothing is ever re-broadcast.
+            let mut cache =
+                AnnounceCache::new(ANNOUNCE_REBROADCAST_MIN_GAP_US, ANNOUNCE_CACHE_TTL_US);
+            assert!(cache.rebroadcast(149, 1_000_000).is_none());
         }
     }
 }
@@ -4017,6 +4182,13 @@ pub mod runtime {
             crate::schedule::MULTICAST_SPREAD_CAP,
             crate::schedule::HOP_CYCLE_US,
         );
+        // Part A: cache of the latest multicast mDNS announce from the TAP,
+        // re-broadcast on every social-channel visit so discovery does not
+        // depend on luftlift's ~10s cadence aligning with a 149 hop.
+        let mut announce_cache = crate::schedule::AnnounceCache::new(
+            crate::schedule::ANNOUNCE_REBROADCAST_MIN_GAP_US,
+            crate::schedule::ANNOUNCE_CACHE_TTL_US,
+        );
 
         loop {
             let now_us = host_time_us();
@@ -4061,6 +4233,21 @@ pub mod runtime {
             //     (owl awdl_send_multicast, core.c:246-277, extended). ---
             if !mcast_spread.is_empty() {
                 drain_mcast_spread(&links, &awdl_state, &mut mcast_spread, now_us);
+            }
+
+            // --- Part A: re-broadcast the cached mDNS announce on every
+            //     social-channel visit (rate-limited ~1s/channel). Decouples
+            //     discovery from luftlift's 10s cadence. Suppressed while a
+            //     unicast transfer is pinned (Bug C). ---
+            if announce_cache.is_live(now_us)
+                && crate::schedule::transfer_active(
+                    awdl_state.transfer.as_ref(),
+                    now_us,
+                    crate::schedule::TRANSFER_IDLE_TIMEOUT_US,
+                )
+                .is_none()
+            {
+                rebroadcast_announce(&links, &awdl_state, &mut announce_cache, now_us);
             }
 
             // --- action frame TX: PSF/MIF (owl awdl_send_psf/mif) ---
@@ -4212,6 +4399,12 @@ pub mod runtime {
                             // peer listening on any channel hears them.
                             // Unicast keeps owl's AW-gated single-send path.
                             if frame.dst[0] & 0x01 == 1 {
+                                // Part A: cache the latest multicast mDNS
+                                // frame for periodic re-broadcast on social
+                                // channels, decoupling discovery from
+                                // luftlift's 10s cadence.
+                                announce_cache
+                                    .refresh(frame.radiotap_frame.clone(), host_time_us());
                                 if mcast_spread.enqueue(
                                     frame.radiotap_frame,
                                     &awdl_state.channel_sequence,
@@ -4328,6 +4521,40 @@ pub mod runtime {
                     "injected spread multicast frame on hop channel"
                 ),
                 Err(err) => tracing::trace!(?err, channel, "spread multicast send failed"),
+            }
+        }
+    }
+
+    /// Part A: re-inject the cached mDNS announce on the current channel if
+    /// the [`AnnounceCache`] permits it (social channel, rate-limit ok, not
+    /// expired). Gated by the multicast guard interval like the spread path.
+    fn rebroadcast_announce(
+        links: &Links,
+        awdl_state: &crate::state::AwdlState,
+        cache: &mut crate::schedule::AnnounceCache,
+        now_us: u64,
+    ) {
+        let channel = awdl_state.current_channel;
+        if channel == 0 {
+            return;
+        }
+        if crate::schedule::can_send_in(
+            &awdl_state.sync,
+            now_us,
+            crate::schedule::MULTICAST_GUARD_TU,
+        ) != 0 {
+            return; // inside multicast guard; retry next iteration
+        }
+        if let Some(frame) = cache.rebroadcast(channel, now_us) {
+            match links.packet.send(frame) {
+                Ok(sent) => tracing::debug!(
+                    sent,
+                    channel,
+                    "re-broadcast cached mDNS announce on social channel"
+                ),
+                Err(err) => {
+                    tracing::trace!(?err, channel, "announce re-broadcast send failed")
+                }
             }
         }
     }
