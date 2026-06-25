@@ -90,6 +90,15 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 2 (notify-1 watcher woke me on a pty-2 approval; both agents flying).
+- filin (gpt-5.5): action header + AWDL TLVs + sync-params TLV all green; now on
+  election-v2 TLV (RED just committed). Steady RED/green pairs, no blockers.
+- luftlift (GLM-5.2): M3 chunked-body + M4 plist Discover/Ask done (green). Working
+  M4 GREEN plist handlers + M5 (HTTP request parser, TLS rcgen, mDNS, handlers,
+  receive loop) per its own todo list. Autonomous, no blockers.
+- Tree carries a transient RED failure whenever an agent just committed a red stage;
+  that's expected — confirm the matching green lands next cycle.
+--- (prior cycle notes below) ---
 Last updated: cycle 1 (fixed loop protocol: ScheduleWakeup, NOT self_inject).
 - git log so far (newest first):
   - `82ec662 chore(handoff): orchestrator self-clear context (cycle 0)`
