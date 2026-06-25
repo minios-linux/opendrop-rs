@@ -1210,10 +1210,10 @@ pub mod cli {
 
 pub mod runtime {
     use std::fs::File;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
 
-    use crate::{awdl, channel, ieee80211, iface::Config, os, rx, sync::TsftBridge};
+    use crate::{awdl, channel, ieee80211, iface::Config, os, radiotap, rx, sync::TsftBridge};
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Error {
@@ -1282,7 +1282,15 @@ pub mod runtime {
                                 tlv_count = frame.tlvs.len(),
                                 "rx awdl action frame"
                             ),
-                            Err(err) => tracing::trace!(?err, "ignored wlan frame"),
+                            Err(err) => match decapsulate_rx_data(&wlan_buf[..len]) {
+                                Ok(frame) => {
+                                    links.tap.write_all(&frame.bytes).map_err(|_| Error::Io)?;
+                                    tracing::trace!(len = frame.bytes.len(), "wrote ethernet frame to tap");
+                                }
+                                Err(data_err) => {
+                                    tracing::trace!(?err, ?data_err, "ignored wlan frame");
+                                }
+                            },
                         }
                     }
                     Err(err) => tracing::trace!(?err, "packet recv failed"),
@@ -1320,6 +1328,12 @@ pub mod runtime {
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&bytes[..6]);
         mac
+    }
+
+    fn decapsulate_rx_data(frame: &[u8]) -> Result<awdl::EthernetFrame, ()> {
+        let radiotap = radiotap::parse_header(frame).map_err(|_| ())?;
+        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(|_| ())?;
+        awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination).map_err(|_| ())
     }
 
     fn host_time_us() -> u64 {
