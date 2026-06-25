@@ -407,6 +407,15 @@ pub mod awdl {
         pub self_counter: u32,
     }
 
+    /// owl `awdl_handle_election_params_tlv` fields (owl/src/rx.c:111-131).
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ElectionParameters {
+        pub height: u8,
+        pub master_addr: [u8; 6],
+        pub master_metric: u32,
+        pub self_metric: u32,
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     pub struct ChannelSequence {
         pub encoding: u8,
@@ -486,6 +495,18 @@ pub mod awdl {
             master_metric: read_le32(value, 20)?,
             self_metric: read_le32(value, 24)?,
             self_counter: read_le32(value, 36)?,
+        })
+    }
+
+    /// owl `awdl_handle_election_params_tlv` reads (owl/src/rx.c:120-125):
+    /// distance_to_master @3 (u8), master_addr @5, master_metric @11 (le32),
+    /// self_metric @15 (le32).
+    pub fn parse_election_parameters(value: &[u8]) -> Result<ElectionParameters, ParseError> {
+        Ok(ElectionParameters {
+            height: *value.get(3).ok_or(ParseError::TooShort)?,
+            master_addr: read_addr(value, 5)?,
+            master_metric: read_le32(value, 11)?,
+            self_metric: read_le32(value, 15)?,
         })
     }
 
@@ -703,6 +724,30 @@ pub mod awdl {
                     master_metric: 900,
                     self_metric: 800,
                     self_counter: 7,
+                }
+            );
+        }
+
+        #[test]
+        fn parses_election_parameters_v1_tlv() {
+            // layout per owl/src/rx.c:120-125: flags@0, id@1-2, distancetop@3,
+            // unknown@4, master_addr@5, master_metric@11, self_metric@15, pad@19
+            let mut value = [0u8; 21];
+            value[3] = 4; // distance_to_master -> height
+            value[5..11].copy_from_slice(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            value[11..15].copy_from_slice(&900u32.to_le_bytes());
+            value[15..19].copy_from_slice(&800u32.to_le_bytes());
+
+            let parsed =
+                parse_election_parameters(&value).expect("valid election parameters v1 TLV");
+
+            assert_eq!(
+                parsed,
+                ElectionParameters {
+                    height: 4,
+                    master_addr: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                    master_metric: 900,
+                    self_metric: 800,
                 }
             );
         }
@@ -1920,6 +1965,301 @@ pub mod cli {
             let config = parse_config_from(["filin", "-i", "wlan0mon", "-h", "awdl-test"])
                 .expect("short -h remains host iface");
             assert_eq!(config.host_iface, "awdl-test");
+        }
+    }
+}
+
+pub mod state {
+    //! Faithful port of owl `state.c` / `state.h`: aggregates the node's
+    //! election, sync, channel, and peer-table state and applies received
+    //! action-frame TLVs the way owl's `awdl_rx_action` does.
+    use crate::{
+        awdl,
+        election::ElectionState,
+        peers::{self, Peer, PeerTable, CHANSEQ_LEN},
+        sync::SyncState,
+    };
+
+    /// owl `awdl_version(3, 4)` (owl/src/state.c:34).
+    pub const AWDL_VERSION: u8 = 0x34;
+    /// owl `AWDL_DEVCLASS_MACOS` (owl/src/version.h:34).
+    pub const AWDL_DEVCLASS_MACOS: u8 = 1;
+
+    /// owl `struct awdl_state` (owl/src/state.h:50-85), minus I/O callbacks.
+    pub struct AwdlState {
+        pub self_addr: [u8; 6],
+        pub name: String,
+        pub version: u8,
+        pub dev_class: u8,
+        pub election: ElectionState,
+        pub sync: SyncState,
+        pub peers: PeerTable,
+        pub anchor_channel: u16,
+        /// Own channel sequence as `(chan_num, opclass)` pairs. owl fills this
+        /// with the master channel via `awdl_chanseq_init_static`.
+        pub channel_sequence: [[u8; 2]; CHANSEQ_LEN],
+        pub tx_seq: u16,
+    }
+
+    impl AwdlState {
+        /// owl `awdl_init_state` (owl/src/state.c:30-67).
+        pub fn new(
+            self_addr: [u8; 6],
+            name: String,
+            anchor_channel: u16,
+            now_us: u64,
+        ) -> Self {
+            let opclass = chan_opclass(anchor_channel);
+            Self {
+                self_addr,
+                name,
+                version: AWDL_VERSION,
+                dev_class: AWDL_DEVCLASS_MACOS,
+                election: ElectionState::new(self_addr),
+                sync: SyncState::new(now_us),
+                peers: PeerTable::new(),
+                anchor_channel,
+                channel_sequence: [[anchor_channel as u8, opclass]; CHANSEQ_LEN],
+                tx_seq: 0,
+            }
+        }
+
+        /// Apply a received action frame: register/update the originating peer,
+        /// fold every TLV into that peer's state (election, chanseq, version,
+        /// …), mark MIF, gate sync to the elected master, then re-run election.
+        /// Mirrors owl `awdl_rx_action` (owl/src/rx.c:253-320) and
+        /// `awdl_handle_*_tlv`.
+        pub fn apply_action(
+            &mut self,
+            src: [u8; 6],
+            subtype: awdl::ActionSubtype,
+            tlvs: &[awdl::Tlv<'_>],
+            rx_time_us: u64,
+        ) {
+            self.peers.touch(src, rx_time_us);
+            let mut sync_update: Option<(u16, u16)> = None;
+            if let Some(peer) = self.peers.get_mut(&src) {
+                for tlv in tlvs {
+                    match tlv.kind {
+                        4 => {
+                            if let Ok(p) = awdl::parse_sync_parameters(tlv.value) {
+                                sync_update = Some((p.time_to_next_aw_tu, p.aw_counter));
+                            }
+                        }
+                        5 if !peer.supports_v2 => apply_election_v1(peer, tlv.value),
+                        18 => apply_chanseq(peer, tlv.value),
+                        24 => apply_election_v2(peer, tlv.value),
+                        16 => apply_arpa(peer, tlv.value),
+                        21 => apply_version(peer, tlv.value),
+                        _ => {}
+                    }
+                }
+                if subtype == awdl::ActionSubtype::Mif {
+                    peer.sent_mif = true;
+                }
+            }
+            // owl only adopts sync from the elected sync master (rx.c:39).
+            if let Some((time_to_next_aw_tu, aw_counter)) = sync_update {
+                if self.election.is_sync_master(&src) {
+                    let error_tu =
+                        self.sync
+                            .sync_error_tu(rx_time_us, time_to_next_aw_tu, aw_counter);
+                    self.sync
+                        .update_from_master(rx_time_us, time_to_next_aw_tu, aw_counter);
+                    tracing::trace!(
+                        error_tu,
+                        aw_counter,
+                        time_to_next_aw_tu,
+                        "sync_error"
+                    );
+                }
+            }
+            // recompute validity (owl awdl_peer_add after TLVs, rx.c:317) and
+            // run election (owl awdl_clean_peers, core.c:333).
+            self.peers.touch(src, rx_time_us);
+            self.election.run(&self.peers.election_views());
+        }
+
+        /// owl `awdl_clean_peers` (owl/daemon/core.c:320-336): drop stale peers
+        /// then re-run election.
+        pub fn clean_peers(&mut self, now_us: u64) {
+            let cutoff = now_us.saturating_sub(peers::PEER_TIMEOUT_US);
+            self.peers.remove_stale(cutoff);
+            self.election.run(&self.peers.election_views());
+        }
+
+        /// owl `awdl_state_next_sequence_number` (owl/src/state.c:79-81).
+        pub fn next_data_seq(&mut self) -> u16 {
+            let s = self.tx_seq;
+            self.tx_seq = self.tx_seq.wrapping_add(1);
+            s
+        }
+    }
+
+    /// owl `awdl_handle_election_params_tlv` (owl/src/rx.c:111-131).
+    fn apply_election_v1(peer: &mut Peer, value: &[u8]) {
+        if let Ok(e) = awdl::parse_election_parameters(value) {
+            peer.election.height = u32::from(e.height);
+            peer.election.master_addr = e.master_addr;
+            peer.election.master_metric = e.master_metric;
+            peer.election.self_metric = e.self_metric;
+        }
+    }
+
+    /// owl `awdl_handle_election_params_v2_tlv` (owl/src/rx.c:133-149).
+    fn apply_election_v2(peer: &mut Peer, value: &[u8]) {
+        if let Ok(e) = awdl::parse_election_parameters_v2(value) {
+            peer.election.master_addr = e.master_addr;
+            peer.election.sync_addr = e.sync_addr;
+            peer.election.master_counter = e.master_counter;
+            peer.election.height = e.distance_to_master;
+            peer.election.master_metric = e.master_metric;
+            peer.election.self_metric = e.self_metric;
+            peer.election.self_counter = e.self_counter;
+            peer.supports_v2 = true;
+        }
+    }
+
+    /// owl `awdl_handle_chanseq_tlv` (owl/src/rx.c:60-109): store the peer's
+    /// 16-slot channel sequence (as raw `(chan_num, opclass)` bytes).
+    fn apply_chanseq(peer: &mut Peer, value: &[u8]) {
+        if let Ok(seq) = awdl::parse_channel_sequence(value) {
+            for (slot, ch) in seq.channels.iter().take(CHANSEQ_LEN).enumerate() {
+                peer.sequence[slot] = ch.to_le_bytes();
+            }
+        }
+    }
+
+    /// owl `awdl_handle_arpa_tlv` (owl/src/rx.c:151-158).
+    fn apply_arpa(peer: &mut Peer, value: &[u8]) {
+        if value.len() >= 2 {
+            let name_len = usize::from(value[1]);
+            let end = 2 + name_len;
+            if end <= value.len() {
+                peer.name = String::from_utf8_lossy(&value[2..end]).into_owned();
+            }
+        }
+    }
+
+    /// owl `awdl_handle_version_tlv` (owl/src/rx.c:196-206).
+    fn apply_version(peer: &mut Peer, value: &[u8]) {
+        if let (Some(v), Some(d)) = (value.first(), value.get(1)) {
+            peer.version = *v;
+            peer.devclass = *d;
+        }
+    }
+
+    /// opclass byte for an AWDL social channel (owl `CHAN_OPCLASS_*`,
+    /// owl/src/channel.h:51-53).
+    pub fn chan_opclass(channel: u16) -> u8 {
+        match channel {
+            6 => 0x51,
+            44 | 149 => 0x80,
+            _ => 0x80,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn mif() -> awdl::ActionSubtype {
+            awdl::ActionSubtype::Mif
+        }
+
+        fn version_tlv(version: u8, devclass: u8) -> awdl::Tlv<'static> {
+            awdl::Tlv {
+                kind: 21,
+                value: Box::leak(vec![version, devclass].into_boxed_slice()),
+            }
+        }
+
+        fn election_v2_tlv(master_counter: u32, metric: u32) -> awdl::Tlv<'static> {
+            let mut value = vec![0u8; 40];
+            value[0..6].copy_from_slice(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]); // master
+            value[6..12].copy_from_slice(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]); // sync (self)
+            value[12..16].copy_from_slice(&master_counter.to_le_bytes());
+            value[16..20].copy_from_slice(&0u32.to_le_bytes()); // distance
+            value[20..24].copy_from_slice(&metric.to_le_bytes());
+            value[24..28].copy_from_slice(&metric.to_le_bytes());
+            value[36..40].copy_from_slice(&0u32.to_le_bytes());
+            awdl::Tlv { kind: 24, value: value.leak() }
+        }
+
+        #[test]
+        fn state_inits_self_master_and_static_chanseq() {
+            let state = AwdlState::new([0x02, 1, 2, 3, 4, 5], "filin".into(), 44, 0);
+            assert_eq!(state.election.master_addr, [0x02, 1, 2, 3, 4, 5]);
+            assert_eq!(state.election.master_metric, ElectionState::new([0; 6]).master_metric);
+            assert_eq!(state.channel_sequence[0], [44, 0x80]);
+            assert_eq!(state.version, AWDL_VERSION);
+            assert_eq!(state.dev_class, AWDL_DEVCLASS_MACOS);
+        }
+
+        #[test]
+        fn apply_action_registers_peer_and_adopts_master() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 1_000_000);
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            // peer advertises a high master counter; needs version+devclass+mif
+            // to become valid before election will adopt it.
+            let tlvs = vec![
+                election_v2_tlv(50, 200),
+                version_tlv(0x34, 1),
+            ];
+            state.apply_action(peer_addr, mif(), &tlvs, 1_100_000);
+
+            let peer = state.peers.get(&peer_addr).unwrap();
+            assert!(peer.is_valid);
+            assert!(peer.sent_mif);
+            assert_eq!(peer.version, 0x34);
+            // election should have adopted the peer as master
+            assert_eq!(state.election.sync_addr, peer_addr);
+            assert_eq!(state.election.master_counter, 50);
+            assert_eq!(state.election.height, 1);
+        }
+
+        #[test]
+        fn sync_only_adopted_from_elected_master() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 1_000_000);
+            let master_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let other_addr = [0x02, 0, 0, 0, 0, 9];
+
+            // make master_addr the elected master first
+            state.apply_action(
+                master_addr,
+                mif(),
+                &[election_v2_tlv(50, 200), version_tlv(0x34, 1)],
+                1_100_000,
+            );
+            assert!(state.election.is_sync_master(&master_addr));
+            let aw_counter_before = state.sync.aw_counter;
+
+            // a sync TLV from a non-master must NOT move our clock
+            let mut sync_val = vec![0u8; 31];
+            sync_val[1..3].copy_from_slice(&10u16.to_le_bytes());
+            sync_val[29..31].copy_from_slice(&16u16.to_le_bytes());
+            let non_master_tlv = awdl::Tlv { kind: 4, value: sync_val.leak() };
+            state.apply_action(other_addr, mif(), std::slice::from_ref(&non_master_tlv), 1_200_000);
+            assert_eq!(state.sync.aw_counter, aw_counter_before, "non-master must not move sync");
+        }
+
+        #[test]
+        fn clean_peers_evicts_stale_and_reruns_election() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            state.apply_action(
+                peer_addr,
+                mif(),
+                &[election_v2_tlv(50, 200), version_tlv(0x34, 1)],
+                1_000,
+            );
+            assert_eq!(state.election.sync_addr, peer_addr);
+
+            // after the timeout with no further updates the peer is gone and we
+            // fall back to being our own master
+            state.clean_peers(1_000 + peers::PEER_TIMEOUT_US + 1);
+            assert!(state.peers.get(&peer_addr).is_none());
+            assert_eq!(state.election.sync_addr, state.election.self_addr);
         }
     }
 }
