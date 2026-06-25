@@ -155,6 +155,16 @@ pub mod ieee80211 {
         })
     }
 
+    pub fn build_management_action_frame(
+        _destination: [u8; 6],
+        _source: [u8; 6],
+        _bssid: [u8; 6],
+        _sequence_control: u16,
+        _body: &[u8],
+    ) -> Vec<u8> {
+        unimplemented!("RED: 802.11 action frame builder not implemented yet")
+    }
+
     fn read_addr(frame: &[u8], offset: usize) -> Result<[u8; 6], ParseError> {
         Ok(frame
             .get(offset..offset + 6)
@@ -188,6 +198,24 @@ pub mod ieee80211 {
             assert_eq!(parsed.bssid, [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
             assert_eq!(parsed.sequence_control, 0x0010);
             assert_eq!(parsed.body, &[0x7f, 0x50]);
+        }
+
+        #[test]
+        fn builds_three_address_management_action_frame() {
+            let frame = build_management_action_frame(
+                [0xff; 6],
+                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                [0x00, 0x25, 0x00, 0xff, 0x94, 0x73],
+                0x0010,
+                &[0x7f, 0x00],
+            );
+
+            assert_eq!(&frame[0..2], &[0xd0, 0x00]);
+            assert_eq!(&frame[4..10], &[0xff; 6]);
+            assert_eq!(&frame[10..16], &[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            assert_eq!(&frame[16..22], &[0x00, 0x25, 0x00, 0xff, 0x94, 0x73]);
+            assert_eq!(&frame[22..24], &[0x10, 0x00]);
+            assert_eq!(&frame[24..], &[0x7f, 0x00]);
         }
     }
 }
