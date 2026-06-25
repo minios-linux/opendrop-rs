@@ -4005,6 +4005,28 @@ pub mod state {
                 return;
             }
             let winner = self.election.sync_addr;
+            // FILIN_SYNC_QUALITY.md Part B: re-parent hysteresis keyed on
+            // master_addr stability. If the election winner is a DIFFERENT peer
+            // but reports the SAME cluster top master as our current committed
+            // parent (and that parent is still alive), do NOT re-parent — ride
+            // through the intra-cluster churn. Only re-sync when master_addr
+            // actually changes or the current parent goes stale (dropped from
+            // the peer table, so the lookup below yields None → not same-cluster).
+            if winner != self.committed_master
+                && winner != self.self_addr
+                && self.committed_master != self.self_addr
+            {
+                let same_cluster = self
+                    .peers
+                    .get(&self.committed_master)
+                    .map(|p| p.election.master_addr == self.election.master_addr)
+                    .unwrap_or(false);
+                if same_cluster {
+                    // Hold the current parent: its cluster is unchanged. Do not
+                    // touch pending tracking either — this isn't a challenge.
+                    return;
+                }
+            }
             // Bug B: debounce a challenger before committing — but only when
             // SWITCHING between two real external masters. The first adoption
             // (self → real master) and master loss (real master → self) are
@@ -4756,7 +4778,7 @@ pub mod state {
         //     master_addr stability — do NOT re-adopt the channel sequence
         //     when re-parenting among peers sharing the same top master. ---
 
-        fn peer_with_cluster(addr: [u8; 6], top: [u8; 6], slot0: u8, counter: u32) -> awdl::Tlv<'static> {
+        fn peer_with_cluster(addr: [u8; 6], top: [u8; 6], counter: u32) -> awdl::Tlv<'static> {
             // election v2 TLV: master_addr=top, sync_addr=addr(self), counter.
             let mut v = vec![0u8; 40];
             v[0..6].copy_from_slice(&top);
@@ -4795,7 +4817,7 @@ pub mod state {
                 peer_a,
                 mif(),
                 &[
-                    peer_with_cluster(peer_a, top, 149, 50),
+                    peer_with_cluster(peer_a, top, 50),
                     version_tlv(0x34, 1),
                     chanseq_tlv(149),
                 ],
@@ -4811,7 +4833,7 @@ pub mod state {
                 peer_b,
                 mif(),
                 &[
-                    peer_with_cluster(peer_b, top, 6, 60),
+                    peer_with_cluster(peer_b, top, 60),
                     version_tlv(0x34, 1),
                     chanseq_tlv(6),
                 ],
@@ -4825,7 +4847,7 @@ pub mod state {
                 peer_b,
                 mif(),
                 &[
-                    peer_with_cluster(peer_b, top, 6, 60),
+                    peer_with_cluster(peer_b, top, 60),
                     version_tlv(0x34, 1),
                     chanseq_tlv(6),
                 ],
