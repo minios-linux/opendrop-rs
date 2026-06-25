@@ -1553,6 +1553,44 @@ pub mod sync {
 
             assert_eq!(sync.sync_error_tu(2_000_000, 20, 18), 0);
         }
+
+        #[test]
+        fn update_from_master_does_not_underflow_on_small_rx_time() {
+            // Regression (FILIN_AUDIT_FIXES.md #2): early after start, or
+            // after a TsftBridge re-lock, rx_hw_time_us can be smaller than
+            // tu_to_us(eaw_period - time_to_next_aw). The unchecked `-` would
+            // wrap to a huge u64 and corrupt last_update_us. Saturating to 0
+            // is safe (the next real frame corrects it).
+            let mut sync = SyncState::new(0);
+            // rx_hw_time_us=100, time_to_next_aw_tu=20 → subtract (64-20)*1024
+            // = 45056us. 100 < 45056 → would underflow without saturating_sub.
+            sync.update_from_master(100, 20, 18);
+            assert_eq!(
+                sync.last_update_us, 0,
+                "must saturate to 0, not wrap to u64::MAX-..."
+            );
+            // Normal operation still works after recovery.
+            sync.update_from_master(2_000_000, 20, 18);
+            assert_eq!(sync.last_update_us, 2_000_000 - (64 - 20) * 1024);
+        }
+
+        #[test]
+        fn next_aw_tu_does_not_underflow_when_now_before_last_update() {
+            // If now_us < last_update_us (clock step / TSF re-lock), the old
+            // code would wrap. Saturating keeps the function sane.
+            let sync = SyncState::new(1_000_000); // last_update_us = 1_000_000
+            let result = sync.next_aw_tu(500_000); // now < last_update
+            // Should NOT panic or return garbage; the result is a valid u16.
+            assert!(result > 0, "next_aw_tu must return a positive value");
+        }
+
+        #[test]
+        fn current_aw_does_not_underflow_when_now_before_last_update() {
+            let sync = SyncState::new(1_000_000);
+            let result = sync.current_aw(500_000);
+            // Should NOT panic or wrap to a huge value.
+            assert!(result < 1000, "current_aw must stay reasonable");
+        }
     }
 }
 
