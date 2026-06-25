@@ -6591,17 +6591,31 @@ pub mod introspect {
         )
     }
 
+    /// Capacity of the `last_master_macs` ring in [`Counters`] — small enough
+    /// to be cheap, large enough to see cluster churn at a glance
+    /// (FILIN_SYNC_QUALITY.md Part A).
+    pub const LAST_MASTER_MACS_CAP: usize = 8;
+
     /// Hot-path counters for the introspection API. `mdns_rx_*` are plain
     /// `AtomicU64` (bumped per-packet on the AF_PACKET loop). `rebroadcast`
-    /// is a `Mutex<BTreeMap>` — only bumped a few times per second on actual
-    /// re-broadcasts (rate-limited), so the lock is uncontended. Using a map
-    /// makes it adaptive: any channel (including a non-social master anchor
-    /// like 52) is tracked without hardcoding.
+    /// and `last_master_macs` are `Mutex`-guarded — only touched a few times
+    /// per second (rate-limited re-broadcasts / master changes), so the locks
+    /// are uncontended. `aw_alignment` is a pair of atomics.
     #[derive(Debug)]
     pub struct Counters {
         mdns_rx_self: AtomicU64,
         mdns_rx_other: AtomicU64,
         rebroadcast: std::sync::Mutex<std::collections::BTreeMap<u8, u64>>,
+        /// FILIN_SYNC_QUALITY.md Part A: how many times the committed master
+        /// MAC changed. Bumped once per real switch.
+        master_changes: AtomicU64,
+        /// Availability-window alignment samples: aligned vs total. Bumped on
+        /// each sync update from the elected master; `pct = aligned/total`.
+        aw_aligned: AtomicU64,
+        aw_total: AtomicU64,
+        /// Ring of recent master MACs (cap [`LAST_MASTER_MACS_CAP`]) to
+        /// visualize cluster churn in `/status`.
+        last_master_macs: std::sync::Mutex<std::collections::VecDeque<String>>,
     }
 
     impl Default for Counters {
@@ -7246,6 +7260,10 @@ pub mod introspect {
                 mdns_rx_self: AtomicU64::new(0),
                 mdns_rx_other: AtomicU64::new(0),
                 rebroadcast: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                master_changes: AtomicU64::new(0),
+                aw_aligned: AtomicU64::new(0),
+                aw_total: AtomicU64::new(0),
+                last_master_macs: std::sync::Mutex::new(std::collections::VecDeque::new()),
             }
         }
 
@@ -7284,6 +7302,55 @@ pub mod introspect {
                 .lock()
                 .map(|map| map.iter().map(|(&ch, &count)| (ch, count)).collect())
                 .unwrap_or_default()
+        }
+
+        /// Bump the master-change counter (called once when the committed
+        /// master MAC actually changes).
+        pub fn inc_master_change(&self) {
+            self.master_changes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn master_changes(&self) -> u64 {
+            self.master_changes.load(Ordering::Relaxed)
+        }
+
+        /// Append a master MAC string to the recent-masters ring; the oldest
+        /// is dropped once the cap is exceeded.
+        pub fn push_master_mac(&self, mac: String) {
+            if let Ok(mut ring) = self.last_master_macs.lock() {
+                if ring.len() >= LAST_MASTER_MACS_CAP {
+                    ring.pop_front();
+                }
+                ring.push_back(mac);
+            }
+        }
+
+        pub fn last_master_macs(&self) -> Vec<String> {
+            self.last_master_macs
+                .lock()
+                .map(|ring| ring.iter().cloned().collect())
+                .unwrap_or_default()
+        }
+
+        /// Record one availability-window alignment sample. `aligned` true iff
+        /// the sync error was within the acceptable bound this round.
+        pub fn record_aw_check(&self, aligned: bool) {
+            self.aw_total.fetch_add(1, Ordering::Relaxed);
+            if aligned {
+                self.aw_aligned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Percentage of AW samples that were aligned (0..=100). 0 when no
+        /// samples have been recorded yet.
+        pub fn aw_alignment_pct(&self) -> u8 {
+            let total = self.aw_total.load(Ordering::Relaxed);
+            if total == 0 {
+                return 0;
+            }
+            let aligned = self.aw_aligned.load(Ordering::Relaxed);
+            let pct = aligned.saturating_mul(100) / total;
+            pct.min(100) as u8
         }
     }
 
