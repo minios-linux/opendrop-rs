@@ -1160,10 +1160,9 @@ pub mod rx {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum ParseError {
-        Radiotap,
-        Ieee80211,
-        Awdl,
-        MissingTsft,
+        Radiotap(radiotap::RadiotapError),
+        Ieee80211(ieee80211::ParseError),
+        Awdl(awdl::ParseError),
     }
 
     pub fn parse_action_frame<'a>(
@@ -1171,10 +1170,10 @@ pub mod rx {
         host_now_us: u64,
         bridge: &mut TsftBridge,
     ) -> Result<ParsedActionFrame<'a>, ParseError> {
-        let radiotap = radiotap::parse_header(frame).map_err(|_| ParseError::Radiotap)?;
-        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(|_| ParseError::Ieee80211)?;
-        let action = awdl::parse_action_frame(mac.body).map_err(|_| ParseError::Awdl)?;
-        let tlvs = awdl::parse_tlvs(action.tlvs).map_err(|_| ParseError::Awdl)?;
+        let radiotap = radiotap::parse_header(frame).map_err(ParseError::Radiotap)?;
+        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(ParseError::Ieee80211)?;
+        let action = awdl::parse_action_frame(mac.body).map_err(ParseError::Awdl)?;
+        let tlvs = awdl::parse_tlvs(action.tlvs).map_err(ParseError::Awdl)?;
         let rx_time_us = radiotap
             .tsft
             .map(|hw_tsft| bridge.timestamp_rx(hw_tsft, host_now_us))
@@ -1430,7 +1429,13 @@ pub mod runtime {
                                     tracing::trace!(len = frame.bytes.len(), "wrote ethernet frame to tap");
                                 }
                                 Err(data_err) => {
-                                    tracing::trace!(?err, ?data_err, "ignored wlan frame");
+                                    let ieee80211_preview = ieee80211_payload_preview(&wlan_buf[..len]);
+                                    tracing::trace!(
+                                        ?err,
+                                        ?data_err,
+                                        %ieee80211_preview,
+                                        "ignored wlan frame"
+                                    );
                                 }
                             },
                         }
@@ -1472,10 +1477,39 @@ pub mod runtime {
         mac
     }
 
-    fn decapsulate_rx_data(frame: &[u8]) -> Result<awdl::EthernetFrame, ()> {
-        let radiotap = radiotap::parse_header(frame).map_err(|_| ())?;
-        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(|_| ())?;
-        awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination).map_err(|_| ())
+    #[derive(Debug, PartialEq, Eq)]
+    enum DataParseError {
+        Radiotap(radiotap::RadiotapError),
+        Ieee80211(ieee80211::ParseError),
+        Awdl(awdl::ParseError),
+    }
+
+    fn decapsulate_rx_data(frame: &[u8]) -> Result<awdl::EthernetFrame, DataParseError> {
+        let radiotap = radiotap::parse_header(frame).map_err(DataParseError::Radiotap)?;
+        let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(DataParseError::Ieee80211)?;
+        awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination)
+            .map_err(DataParseError::Awdl)
+    }
+
+    fn ieee80211_payload_preview(frame: &[u8]) -> String {
+        match radiotap::parse_header(frame) {
+            Ok(header) => hex_preview(header.payload, 16),
+            Err(_) => hex_preview(frame, 16),
+        }
+    }
+
+    fn hex_preview(bytes: &[u8], limit: usize) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let len = bytes.len().min(limit);
+        let mut out = String::with_capacity(len.saturating_mul(3).saturating_sub(1));
+        for (index, byte) in bytes.iter().copied().take(limit).enumerate() {
+            if index > 0 {
+                out.push(' ');
+            }
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
     }
 
     fn handle_action_tlv(tlv: &awdl::Tlv<'_>, rx_time_us: u64, sync: &mut crate::sync::SyncState) {
@@ -1534,6 +1568,27 @@ pub mod runtime {
             return 0;
         }
         (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn formats_hex_preview_with_limit() {
+            assert_eq!(hex_preview(&[0xde, 0xad, 0xbe, 0xef], 3), "de ad be");
+        }
+
+        #[test]
+        fn previews_payload_after_radiotap_header() {
+            let frame = [
+                0x00, 0x00, 0x08, 0x00, // radiotap version, pad, len
+                0x00, 0x00, 0x00, 0x00, // no present fields
+                0xd0, 0x00, 0xff, 0xff,
+            ];
+
+            assert_eq!(ieee80211_payload_preview(&frame), "d0 00 ff ff");
+        }
     }
 }
 
