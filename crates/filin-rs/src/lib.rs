@@ -242,16 +242,31 @@ pub mod ieee80211 {
         if frame.len() < 24 {
             return Err(ParseError::TooShort);
         }
+        let frame_control = u16::from_le_bytes([frame[0], frame[1]]);
+        // QoS data subtypes carry a 2-byte QoS control field after the
+        // sequence control; owl strips it before the frame body (owl/src/rx.c:536-541).
+        let body_offset = if is_qos_data(frame_control) { 26 } else { 24 };
+        if frame.len() < body_offset {
+            return Err(ParseError::TooShort);
+        }
 
         Ok(MacHeader {
-            frame_control: u16::from_le_bytes([frame[0], frame[1]]),
+            frame_control,
             duration_id: u16::from_le_bytes([frame[2], frame[3]]),
             destination: read_addr(frame, 4)?,
             source: read_addr(frame, 10)?,
             bssid: read_addr(frame, 16)?,
             sequence_control: u16::from_le_bytes([frame[22], frame[23]]),
-            body: &frame[24..],
+            body: &frame[body_offset..],
         })
+    }
+
+    /// True for data frames whose subtype carries a QoS control field
+    /// (802.11 STYPE_QOS_DATA bit, owl/src/rx.c:536).
+    pub fn is_qos_data(frame_control: u16) -> bool {
+        const FTYPE_DATA: u16 = 0x0008;
+        const STYPE_QOS: u16 = 0x0080;
+        (frame_control & (FTYPE_DATA | STYPE_QOS)) == (FTYPE_DATA | STYPE_QOS)
     }
 
     pub fn build_management_action_frame(
@@ -323,6 +338,28 @@ pub mod ieee80211 {
             assert_eq!(parsed.bssid, [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
             assert_eq!(parsed.sequence_control, 0x0010);
             assert_eq!(parsed.body, &[0x7f, 0x50]);
+        }
+
+        #[test]
+        fn parses_qos_data_body_after_two_byte_qos_control() {
+            // fc = 0x0888 (data + QoS data subtype). owl strips the 2-byte QoS
+            // control so the LLC body starts at offset 26, not 24.
+            let frame = [
+                0x88, 0x08, // frame control (QoS data)
+                0x00, 0x00, // duration
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // destination
+                0x02, 0x11, 0x22, 0x33, 0x44, 0x55, // source
+                0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, // bssid
+                0x10, 0x00, // sequence control
+                0x00, 0x00, // QoS control (stripped from body)
+                0xaa, 0xaa, 0x03, // LLC/SNAP start
+            ];
+
+            let parsed = parse_mac_header(&frame).expect("valid QoS data header");
+
+            assert_eq!(parsed.frame_control, 0x0888);
+            assert!(is_qos_data(parsed.frame_control));
+            assert_eq!(parsed.body, &[0xaa, 0xaa, 0x03]);
         }
 
         #[test]
@@ -2487,12 +2524,24 @@ pub mod runtime {
                                 );
                             }
                             Err(err) => match decapsulate_rx_data(&wlan_buf[..len]) {
-                                Ok(frame) => {
-                                    links.tap.write_all(&frame.bytes).map_err(|_| Error::Io)?;
-                                    tracing::trace!(
-                                        len = frame.bytes.len(),
-                                        "wrote ethernet frame to tap"
-                                    );
+                                Ok((source, frame)) => {
+                                    // owl only accepts data from a known peer
+                                    // (owl/src/rx.c:361) to limit the attack surface.
+                                    if awdl_state.peers.get(&source).is_none() {
+                                        tracing::trace!(
+                                            ?source,
+                                            "drop data frame from non-peer"
+                                        );
+                                    } else {
+                                        links
+                                            .tap
+                                            .write_all(&frame.bytes)
+                                            .map_err(|_| Error::Io)?;
+                                        tracing::trace!(
+                                            len = frame.bytes.len(),
+                                            "wrote ethernet frame to tap"
+                                        );
+                                    }
                                 }
                                 Err(data_err) => {
                                     if let Some(pcap) = links.pcap.as_mut() {
@@ -2845,14 +2894,16 @@ pub mod runtime {
         Awdl(awdl::ParseError),
     }
 
-    fn decapsulate_rx_data(frame: &[u8]) -> Result<awdl::EthernetFrame, DataParseError> {
+    fn decapsulate_rx_data(frame: &[u8]) -> Result<([u8; 6], awdl::EthernetFrame), DataParseError> {
         let radiotap = radiotap::parse_header(frame).map_err(DataParseError::Radiotap)?;
         let ieee80211_payload =
             rx::ieee80211_payload_without_fcs(&radiotap).map_err(DataParseError::Fcs)?;
         let mac =
             ieee80211::parse_mac_header(ieee80211_payload).map_err(DataParseError::Ieee80211)?;
-        awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination)
-            .map_err(DataParseError::Awdl)
+        let ethernet =
+            awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination)
+                .map_err(DataParseError::Awdl)?;
+        Ok((mac.source, ethernet))
     }
 
     fn ieee80211_payload_preview(frame: &[u8]) -> String {
