@@ -5871,7 +5871,7 @@ pub mod introspect {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, RwLock};
 
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
 
     /// Format an AWDL MAC address as `xx:xx:xx:xx:xx:xx` for JSON consumers.
     pub fn mac_string(addr: [u8; 6]) -> String {
@@ -6163,20 +6163,176 @@ pub mod introspect {
         }
     }
 
+    /// One row of `GET /peers`. The runtime builds these from `awdl_state.peers`
+    /// (`mac`, `decoded_chanseq`) plus `current_channel` and the host clock.
+    #[derive(Debug, Clone, Serialize, PartialEq)]
+    pub struct PeerView {
+        pub mac: String,
+        pub last_seen_ms_ago: u64,
+        pub decoded_chanseq: Vec<u8>,
+        pub current_channel: u8,
+    }
+
+    /// Minimal HTTP request view consumed by the pure [`route`] dispatcher.
+    /// `path` excludes the query string; `query` is the text after `?`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Request<'a> {
+        pub method: &'a str,
+        pub path: &'a str,
+        pub query: &'a str,
+        pub body: &'a [u8],
+    }
+
+    /// Minimal HTTP response produced by [`route`] and serialized by the
+    /// loopback server thread.
+    #[derive(Debug, Clone)]
+    pub struct Response {
+        pub status: u16,
+        pub content_type: &'static str,
+        pub body: Vec<u8>,
+    }
+
+    impl Response {
+        fn json<T: Serialize>(status: u16, value: &T) -> Self {
+            Self {
+                status,
+                content_type: "application/json",
+                body: serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec()),
+            }
+        }
+
+        fn text(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                content_type: "text/plain; charset=utf-8",
+                body: body.as_bytes().to_vec(),
+            }
+        }
+    }
+
+    /// Default `n` for `GET /trace` when the query is missing/invalid.
+    pub const TRACE_DEFAULT_N: usize = 300;
+
+    /// Body schema for `POST /trace` (`{"level":"off|debug|trace"}`).
+    #[derive(Debug, Deserialize)]
+    struct TracePostBody {
+        level: String,
+    }
+
+    /// Pure HTTP request dispatcher. Reads from the [`Introspection`] snapshot
+    /// and counters — no socket I/O, fully unit-testable. The loopback server
+    /// thread just parses the request line and calls this.
+    pub fn route(intro: &Introspection, req: &Request<'_>) -> Response {
+        match (req.method, req.path) {
+            ("GET", "/status") => get_status(intro),
+            ("GET", "/peers") => get_peers(intro),
+            ("GET", "/trace") => get_trace(intro, req.query),
+            ("POST", "/trace") => post_trace(intro, req.body),
+            _ => Response::text(404, "not found"),
+        }
+    }
+
+    fn get_status(intro: &Introspection) -> Response {
+        let snapshot = intro.status();
+        let mut rebroadcast = serde_json::Map::new();
+        for (ch, count) in intro.counters.rebroadcast_pairs() {
+            rebroadcast.insert(ch.to_string(), serde_json::json!(count));
+        }
+        #[derive(Serialize)]
+        struct StatusResponse {
+            current_channel: u8,
+            master_mac: String,
+            master_seq: u16,
+            synced: bool,
+            peer_count: usize,
+            rebroadcast_counts: serde_json::Map<String, serde_json::Value>,
+            mdns_rx_self: u64,
+            mdns_rx_other: u64,
+        }
+        Response::json(
+            200,
+            &StatusResponse {
+                current_channel: snapshot.current_channel,
+                master_mac: snapshot.master_mac,
+                master_seq: snapshot.master_seq,
+                synced: snapshot.synced,
+                peer_count: snapshot.peer_count,
+                rebroadcast_counts: rebroadcast,
+                mdns_rx_self: intro.counters.mdns_rx_self(),
+                mdns_rx_other: intro.counters.mdns_rx_other(),
+            },
+        )
+    }
+
+    fn get_peers(intro: &Introspection) -> Response {
+        let peers = intro.peers();
+        Response::json(200, &peers)
+    }
+
+    fn get_trace(intro: &Introspection, query: &str) -> Response {
+        let n = parse_trace_n(query).unwrap_or(TRACE_DEFAULT_N);
+        let events = intro.trace_ring().last_n(n);
+        Response::json(200, &events)
+    }
+
+    fn post_trace(intro: &Introspection, body: &[u8]) -> Response {
+        let parsed: TracePostBody = match serde_json::from_slice(body) {
+            Ok(p) => p,
+            Err(_) => return Response::text(400, "invalid JSON body"),
+        };
+        let level = match GateLevel::from_request_str(&parsed.level) {
+            Some(l) => l,
+            None => {
+                return Response::text(400, "unknown level; expected off|debug|trace")
+            }
+        };
+        intro.trace_gate().set(level);
+        Response::text(200, "ok")
+    }
+
+    /// Extract `n` from a query string like `n=300` (ignoring other pairs).
+    fn parse_trace_n(query: &str) -> Option<usize> {
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "n" {
+                    return v.parse::<usize>().ok();
+                }
+            }
+        }
+        None
+    }
+
     /// Aggregate introspection state, shared (via `Arc`) between the AF_PACKET
     /// hot loop, the optional `TraceLayer`, and the HTTP server thread.
     pub struct Introspection {
         pub counters: Counters,
         status: RwLock<StatusSnapshot>,
+        peers: RwLock<Vec<PeerView>>,
+        trace_ring: Arc<TraceRing>,
+        trace_gate: Arc<TraceGate>,
     }
 
     impl Introspection {
         /// Construct a fresh introspection handle wrapped in an `Arc` — the
-        /// shape the runtime, TraceLayer, and HTTP thread all share.
+        /// shape the runtime, TraceLayer, and HTTP thread all share. Owns a
+        /// private ring + gate so the layer and the HTTP server share state.
         pub fn new() -> Arc<Self> {
+            Self::new_with_trace(
+                Arc::new(TraceRing::new(TRACE_RING_CAP)),
+                Arc::new(TraceGate::new()),
+            )
+        }
+
+        /// Construct with caller-supplied ring/gate handles — useful when the
+        /// `TraceLayer` needs to be wired to the exact same gate the HTTP
+        /// `POST /trace` handler flips.
+        pub fn new_with_trace(ring: Arc<TraceRing>, gate: Arc<TraceGate>) -> Arc<Self> {
             Arc::new(Self {
                 counters: Counters::new(),
                 status: RwLock::new(StatusSnapshot::default()),
+                peers: RwLock::new(Vec::new()),
+                trace_ring: ring,
+                trace_gate: gate,
             })
         }
 
@@ -6195,6 +6351,37 @@ pub mod introspect {
                 Ok(guard) => guard.clone(),
                 Err(e) => e.into_inner().clone(),
             }
+        }
+
+        /// Replace the per-peer view (built by the runtime from `awdl_state.peers`).
+        pub fn set_peers(&self, peers: Vec<PeerView>) {
+            if let Ok(mut guard) = self.peers.write() {
+                *guard = peers;
+            }
+        }
+
+        /// Per-peer view clone for `GET /peers`.
+        pub fn peers(&self) -> Vec<PeerView> {
+            match self.peers.read() {
+                Ok(guard) => guard.clone(),
+                Err(e) => e.into_inner().clone(),
+            }
+        }
+
+        /// The ring backing `GET /trace` and the `TraceLayer`.
+        pub fn trace_ring(&self) -> &Arc<TraceRing> {
+            &self.trace_ring
+        }
+
+        /// The gate flipped by `POST /trace` and read by the `TraceLayer`.
+        pub fn trace_gate(&self) -> &Arc<TraceGate> {
+            &self.trace_gate
+        }
+
+        /// Convenience: build a `TraceLayer` already wired to this handle's
+        /// ring + gate.
+        pub fn trace_layer(&self) -> TraceLayer {
+            TraceLayer::new(self.trace_ring.clone(), self.trace_gate.clone())
         }
     }
 
@@ -6536,7 +6723,7 @@ pub mod introspect {
             assert_eq!(msgs, vec!["info captured", "debug captured"]);
         }
 
-        fn req(method: &str, path: &str) -> Request<'_> {
+        fn req<'a>(method: &'a str, path: &'a str) -> Request<'a> {
             Request {
                 method,
                 path,
@@ -6556,7 +6743,9 @@ pub mod introspect {
 
         fn req_with_query<'a>(method: &'a str, path_and_query: &'a str) -> Request<'a> {
             // split "path?query" into path + query for the router
-            let (path, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
+            let (path, query) = path_and_query
+                .split_once('?')
+                .unwrap_or((path_and_query, ""));
             Request {
                 method,
                 path,
@@ -6653,7 +6842,8 @@ pub mod introspect {
             let intro = Introspection::new_with_trace(ring, Arc::new(TraceGate::new()));
             let resp = route(&intro, &req_with_query("GET", "/trace?n=2"));
             assert_eq!(resp.status, 200);
-            let arr = json_body(&resp).as_array().unwrap();
+            let body = json_body(&resp);
+            let arr = body.as_array().unwrap();
             assert_eq!(arr.len(), 2);
             assert_eq!(
                 arr[0].as_object().unwrap().get("msg").and_then(|v| v.as_str()),
