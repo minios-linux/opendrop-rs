@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use luftlift_rs::{
     client::{FileToSend, RustlsTransport, SenderConfig, send_files},
     mdns, netutil, server, tls,
+    mdns::DEFAULT_FLAGS,
     plist_impl::ReceiverConfig,
 };
 use std::path::PathBuf;
@@ -35,6 +36,11 @@ enum Command {
         /// Directory to save received files (default: current dir).
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+        /// AirDrop `flags` TXT value (default 0x06 = opendrop's verified value
+        /// that makes us appear in iOS 18's AirDrop picker). Override for
+        /// experimentation; e.g. `--flags 0x01`.
+        #[arg(short = 'F', long, default_value_t = DEFAULT_FLAGS, value_parser = parse_flags)]
+        flags: u32,
     },
     /// Find AirDrop senders on the local network.
     Find {
@@ -49,6 +55,16 @@ enum Command {
         /// File to send.
         file: PathBuf,
     },
+}
+
+/// Parse a flags integer in decimal or hex (e.g. `6`, `0x06`).
+fn parse_flags(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    let lower = s.to_ascii_lowercase();
+    let radix_base = if lower.starts_with("0x") { 16 } else { 10 };
+    let stripped = lower.strip_prefix("0x").unwrap_or(s);
+    u32::from_str_radix(stripped, radix_base)
+        .map_err(|e| format!("invalid flags value '{s}': {e}"))
 }
 
 fn main() -> Result<()> {
@@ -68,16 +84,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Receive { output } => receive(&cli.interface, output),
+        Command::Receive { output, flags } => receive(&cli.interface, output, flags),
         Command::Find { duration } => find(duration),
         Command::Send { recipient, file } => send(&cli.interface, &recipient, file),
     }
 }
 
-fn receive(interface: &str, output: PathBuf) -> Result<()> {
+fn receive(interface: &str, output: PathBuf, flags: u32) -> Result<()> {
     let addr = netutil::get_ipv6_for_interface(interface)
         .ok_or_else(|| anyhow::anyhow!("interface {interface} has no IPv6 address — is filin-rs/awdl0 running?"))?;
-    tracing::info!(interface, %addr, "starting AirDrop receiver");
+    tracing::info!(interface, %addr, flags = format!("0x{flags:02x}"), "starting AirDrop receiver");
 
     let cert = tls::generate_self_signed_cert()?;
     let tls_config = tls::build_server_config(&cert)?;
@@ -91,7 +107,7 @@ fn receive(interface: &str, output: PathBuf) -> Result<()> {
     let mdns_cfg = mdns::MdnsConfig {
         computer_name: cfg.computer_name.clone(),
         port: 8771,
-        flags: 1,
+        flags,
     };
     let (daemon, info) = mdns::announce(&mdns_cfg, addr.into())?;
     let fullname = info.get_fullname().to_string();

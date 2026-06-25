@@ -13,11 +13,24 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+/// Default AirDrop `flags` TXT value: matches opendrop's verified default
+/// (`--flags 0x06`), proven to make the receiver appear in iOS 18's AirDrop
+/// picker. `0x06 = 0b110` sets the receiver-capability + discoverability bits.
+pub const DEFAULT_FLAGS: u32 = 0x06;
+
 /// Configuration for the mDNS announcement.
 pub struct MdnsConfig {
     pub computer_name: String,
     pub port: u16,
-    /// AirDrop flags TXT value (1 = "Everyone" discoverability).
+    /// AirDrop `flags` TXT record value (decimal integer advertised as a
+    /// string). This advertises the receiver's discoverability/capability
+    /// bits to the sender; if the wrong bits are set the sender never
+    /// surfaces us in its AirDrop picker.
+    ///
+    /// The opendrop default (verified against iOS 18.6.2) is **`0x06`** =
+    /// `0b110` — sets the "supports receiving" and discoverability bits
+    /// Apple's sender checks. `0x01` (a single bit) is NOT enough for
+    /// current iOS to surface us. Override via `--flags` for experimentation.
     pub flags: u32,
 }
 
@@ -116,7 +129,7 @@ mod tests {
     use super::*;
 
     fn cfg() -> MdnsConfig {
-        MdnsConfig { computer_name: "luftlift-pc".into(), port: 8771, flags: 1 }
+        MdnsConfig { computer_name: "luftlift-pc".into(), port: 8771, flags: DEFAULT_FLAGS }
     }
 
     #[test]
@@ -125,9 +138,15 @@ mod tests {
             build_airdrop_service_info(&cfg(), "127.0.0.1".parse().unwrap()).expect("build info");
         assert_eq!(info.get_port(), 8771);
         assert!(info.get_fullname().contains("_airdrop._tcp"));
-        // flags TXT property must be present.
+        // flags TXT property must be present and carry the opendrop default 0x06.
         let props = info.get_properties();
-        assert_eq!(props.get("flags").map(|v| v.val_str()), Some("1"));
+        assert_eq!(props.get("flags").map(|v| v.val_str()), Some("6"));
+    }
+
+    #[test]
+    fn default_flags_is_opendrop_value_0x06() {
+        // Guards against regressing back to 1 (which didn't surface us on iOS 18).
+        assert_eq!(DEFAULT_FLAGS, 0x06);
     }
 
     #[test]
