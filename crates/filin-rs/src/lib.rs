@@ -1744,11 +1744,12 @@ pub mod schedule {
     /// all social channels).
     ///
     /// After guaranteeing one slot per social channel, any REMAINING null
-    /// slots are filled round-robin with the social channels (Part B: denser
-    /// dwell) so filin spends several slots on 149 — not just one — and
-    /// overlaps the iPhone's 149 listen windows more often. The round-robin
-    /// starts at 149 to maximise 149 dwell first.
-    pub fn ensure_social_coverage(seq: &mut [[u8; 2]; CHANSEQ_LEN]) -> Vec<u8> {
+    /// slots are filled biased toward `anchor` (FILIN_ANCHOR_REBROADCAST.md):
+    /// the anchor alternates with round-robin social channels so the master's
+    /// primary channel gets materially more dwell than the bare ~6% it had
+    /// from the master's sequence alone. If `anchor` is 0 (no master), falls
+    /// back to the original `[149, 6, 44]` round-robin starting at 149.
+    pub fn ensure_social_coverage(seq: &mut [[u8; 2]; CHANSEQ_LEN], anchor: u8) -> Vec<u8> {
         let mut injected = Vec::new();
         for &(ch, opclass) in &AWDL_SOCIAL_CHANNELS {
             if seq.iter().any(|s| s[0] == ch) {
@@ -1759,28 +1760,58 @@ pub mod schedule {
                 injected.push(ch);
             }
         }
-        // Part B: fill any remaining null slots round-robin with the social
-        // channels (starting at 149) so filin dwells on 149 in several slots,
-        // not just one. Only nulls are filled — master-advertised channels
-        // are left untouched.
-        fill_nulls_round_robin(seq);
+        // Fill remaining null slots: biased toward the anchor (if any), else
+        // the original 149-first round-robin.
+        fill_nulls_biased(seq, anchor);
         injected
     }
 
-    /// Fill remaining null (channel-0) slots round-robin with the AWDL social
-    /// channels, starting at 149 so 149 gets the first (and thus most) slots.
-    /// Non-null slots are never touched, so the master's real channels stay
-    /// intact.
-    fn fill_nulls_round_robin(seq: &mut [[u8; 2]; CHANSEQ_LEN]) {
-        // Round-robin order starting at 149 for maximum 149 dwell.
-        let order = [(149u8, 0x80u8), (6, 0x51), (44, 0x80)];
-        let mut idx = 0;
-        for slot in seq.iter_mut() {
-            if slot[0] == 0 {
-                let (ch, opclass) = order[idx % order.len()];
-                *slot = [ch, opclass];
-                idx += 1;
+    /// Fill remaining null (channel-0) slots. When `anchor` is non-zero, the
+    /// anchor alternates with round-robin social channels (`[anchor, 149,
+    /// anchor, 6, anchor, 44, ...]`) so the master's primary channel gets
+    /// ~50% of null fills — materially more than the ~6% it would get from a
+    /// flat round-robin. When `anchor` is 0, the original `[149, 6, 44]`
+    /// round-robin starting at 149 is used (backward-compatible).
+    fn fill_nulls_biased(seq: &mut [[u8; 2]; CHANSEQ_LEN], anchor: u8) {
+        if anchor == 0 {
+            // Original behaviour: round-robin 149/6/44 starting at 149.
+            let order = [(149u8, 0x80u8), (6, 0x51), (44, 0x80)];
+            let mut idx = 0;
+            for slot in seq.iter_mut() {
+                if slot[0] == 0 {
+                    let (ch, opclass) = order[idx % order.len()];
+                    *slot = [ch, opclass];
+                    idx += 1;
+                }
             }
+            return;
+        }
+        // Anchor-biased: alternate anchor with social channels.
+        let anchor_opclass = opclass_for_channel(anchor);
+        let socials = [(149u8, 0x80u8), (6, 0x51), (44, 0x80)];
+        let mut social_idx = 0;
+        let mut anchor_next = true;
+        for slot in seq.iter_mut() {
+            if slot[0] != 0 {
+                continue;
+            }
+            if anchor_next {
+                *slot = [anchor, anchor_opclass];
+            } else {
+                let (ch, opclass) = socials[social_idx % socials.len()];
+                *slot = [ch, opclass];
+                social_idx += 1;
+            }
+            anchor_next = !anchor_next;
+        }
+    }
+
+    /// opclass byte for any channel (falls back to 0x80 like owl's default).
+    fn opclass_for_channel(channel: u8) -> u8 {
+        match channel {
+            6 => 0x51,
+            44 | 149 => 0x80,
+            _ => 0x80,
         }
     }
 
@@ -3791,6 +3822,10 @@ pub mod state {
         /// suppresses hopping + master re-adoption so a bulk AirDrop upload
         /// is not cut off mid-stream.
         pub transfer: Option<crate::schedule::TransferPin>,
+        /// The adopted master's anchor channel (slot-0 / dominant channel of
+        /// the decoded master sequence). Used to re-broadcast the cached
+        /// announce AND bias dwell toward it. 0 when self-master or no master.
+        pub master_anchor: u8,
     }
 
     impl AwdlState {
@@ -3818,6 +3853,7 @@ pub mod state {
                 pending_master: self_addr,
                 pending_since_us: now_us,
                 transfer: None,
+                master_anchor: 0,
             }
         }
 
@@ -3947,6 +3983,7 @@ pub mod state {
                 let anchor_seq = [[self.anchor_channel as u8, opclass]; CHANSEQ_LEN];
                 if self.channel_sequence != anchor_seq {
                     self.channel_sequence = anchor_seq;
+                    self.master_anchor = 0; // no external master
                     tracing::debug!("reverted to static anchor channel sequence");
                 }
             } else if let Some(peer) = self.peers.get(&master) {
@@ -3957,12 +3994,20 @@ pub mod state {
                     let decoded: Vec<u8> =
                         peer.sequence.iter().map(|s| s[0]).collect();
                     self.channel_sequence = peer.sequence;
+                    // Extract the master's anchor (slot-0 / dominant channel)
+                    // so filin can re-broadcast + dwell on it adaptively.
+                    let anchor = crate::schedule::master_anchor_channel(
+                        &self.channel_sequence,
+                    );
+                    self.master_anchor = anchor;
                     // Ensure filin visits ALL AWDL social channels (6, 44,
                     // 149) even if the master omits some — e.g. a master in
                     // an active data session may advertise only 44/6, but
-                    // iPhones scan 149 for AirDrop discovery.
+                    // iPhones scan 149 for AirDrop discovery. Also bias null
+                    // fills toward the anchor (FILIN_ANCHOR_REBROADCAST.md).
                     let injected = crate::schedule::ensure_social_coverage(
                         &mut self.channel_sequence,
+                        anchor,
                     );
                     let final_seq: Vec<u8> =
                         self.channel_sequence.iter().map(|s| s[0]).collect();
