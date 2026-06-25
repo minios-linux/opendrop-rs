@@ -1393,6 +1393,8 @@ pub mod schedule {
     pub const CHANSEQ_LEN: usize = 16;
     /// owl `AWDL_MULTICAST_GUARD_TU` (owl/src/schedule.h:29).
     pub const MULTICAST_GUARD_TU: u16 = 16;
+    /// owl `AWDL_UNICAST_GUARD_TU` (owl/src/schedule.h:28).
+    pub const UNICAST_GUARD_TU: u16 = 3;
 
     const TU_US: u64 = 1024;
 
@@ -1406,6 +1408,22 @@ pub mod schedule {
     /// Channel number (opclass encoding) for a sequence slot, or 0 if null.
     pub fn slot_channel(channel_sequence: &[[u8; 2]; CHANSEQ_LEN], slot: usize) -> u8 {
         channel_sequence[slot % CHANSEQ_LEN][0]
+    }
+
+    /// owl `awdl_same_channel_as_peer` (owl/src/schedule.c:30-41): true if we
+    /// and the peer are on the same non-zero channel at the current EAW slot.
+    /// When filin has adopted the master's sequence, this is always true for
+    /// the master; it may differ for non-master peers.
+    pub fn same_channel_as_peer(
+        own_seq: &[[u8; 2]; CHANSEQ_LEN],
+        peer_seq: &[[u8; 2]; CHANSEQ_LEN],
+        sync: &SyncState,
+        now_us: u64,
+    ) -> bool {
+        let own_slot = usize::from(sync.current_eaw(now_us) % CHANSEQ_LEN as u16);
+        let own_chan = slot_channel(own_seq, own_slot);
+        let peer_chan = slot_channel(peer_seq, own_slot);
+        own_chan != 0 && own_chan == peer_chan
     }
 
     /// owl `awdl_can_send_in` (owl/src/schedule.c:48-55): returns 0 when it is
@@ -1462,6 +1480,26 @@ pub mod schedule {
             let seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
             assert_eq!(slot_channel(&seq, 0), 44);
             assert_eq!(slot_channel(&seq, 15), 44);
+        }
+
+        #[test]
+        fn same_channel_when_sequences_match() {
+            let sync = synced();
+            let seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            assert!(same_channel_as_peer(&seq, &seq, &sync, 1_000_000));
+        }
+
+        #[test]
+        fn different_channel_when_sequences_diverge() {
+            let sync = synced();
+            let own = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            let peer = {
+                let mut s = [[149u8, 0x80u8]; CHANSEQ_LEN];
+                s[0] = [0, 0]; // slot 0 is null for peer
+                s
+            };
+            // slot 0: own is 44, peer is 0 (null) → not same
+            assert!(!same_channel_as_peer(&own, &peer, &sync, 1_000_000));
         }
     }
 }
@@ -2861,6 +2899,7 @@ pub mod runtime {
                                     seq << 4,
                                     &body,
                                 )),
+                                dst,
                             };
                             // Try to send immediately; if we can't (wrong
                             // channel, guard interval), buffer for retry.
@@ -2883,11 +2922,12 @@ pub mod runtime {
     /// owl keeps one pending unicast frame in `state->next` (owl/daemon/core.c:42).
     struct PendingFrame {
         radiotap_frame: Vec<u8>,
+        dst: [u8; 6],
     }
 
-    /// owl `awdl_can_send_in` + `awdl_can_send_unicast_in` decision: returns
-    /// true if we are inside the guard-free core of an AW on a non-null channel
-    /// (owl/daemon/core.c:223-224, schedule.c:48-79).
+    /// owl `awdl_can_send_unicast_in` decision (owl/src/schedule.c:57-79):
+    /// returns true if we are inside the guard-free core of an AW AND on the
+    /// same channel as the destination peer (owl awdl_same_channel_as_peer).
     fn try_send_data(
         links: &Links,
         awdl_state: &crate::state::AwdlState,
@@ -2898,13 +2938,22 @@ pub mod runtime {
         if channel == 0 {
             return false; // null slot: not available
         }
-        // owl awdl_can_send_unicast_in checks same-channel-as-peer. For
-        // simplicity we check the multicast guard (awdl_can_send_in) since the
-        // peer must be on our channel if we adopted their sequence.
+        // owl checks same-channel-as-peer for unicast data (schedule.c:62).
+        if let Some(peer) = awdl_state.peers.get(&frame.dst) {
+            if !crate::schedule::same_channel_as_peer(
+                &awdl_state.channel_sequence,
+                &peer.sequence,
+                &awdl_state.sync,
+                now_us,
+            ) {
+                return false; // peer is on a different channel this EAW
+            }
+        }
+        // owl checks the unicast guard interval (schedule.c:65-79).
         let in_guard = crate::schedule::can_send_in(
             &awdl_state.sync,
             now_us,
-            crate::schedule::MULTICAST_GUARD_TU,
+            crate::schedule::UNICAST_GUARD_TU,
         );
         if in_guard != 0 {
             return false; // inside guard interval
