@@ -209,11 +209,36 @@ pub mod awdl {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum ParseError {
-        Unsupported,
+        TooShort,
+        InvalidVendorHeader,
+        UnsupportedSubtype(u8),
     }
 
-    pub fn parse_action_frame(_body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
-        Err(ParseError::Unsupported)
+    pub fn parse_action_frame(body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
+        if body.len() < 16 {
+            return Err(ParseError::TooShort);
+        }
+
+        let valid = body[0] == 127
+            && body[1..4] == [0x00, 0x17, 0xf2]
+            && body[4] == 0x08
+            && body[5] == 0x10;
+        if !valid {
+            return Err(ParseError::InvalidVendorHeader);
+        }
+
+        let subtype = match body[6] {
+            0 => ActionSubtype::Psf,
+            3 => ActionSubtype::Mif,
+            other => return Err(ParseError::UnsupportedSubtype(other)),
+        };
+
+        Ok(ActionFrame {
+            subtype,
+            phy_tx: u32::from_le_bytes([body[8], body[9], body[10], body[11]]),
+            target_tx: u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
+            tlvs: &body[16..],
+        })
     }
 
     #[cfg(test)]
