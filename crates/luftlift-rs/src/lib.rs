@@ -6,4 +6,5 @@
 //!
 //! Reference: ../../opendrop-patch/ (patched Python opendrop + dvzip.py decoder).
 
+pub mod cpio;
 pub mod dvzip;
