@@ -244,6 +244,11 @@ pub mod awdl {
         pub channels: Vec<u16>,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct EthernetFrame {
+        pub bytes: Vec<u8>,
+    }
+
     pub fn parse_action_frame(body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
         if body.len() < 16 {
             return Err(ParseError::TooShort);
@@ -343,6 +348,14 @@ pub mod awdl {
         }
 
         Ok(ChannelSequence { encoding, channels })
+    }
+
+    pub fn decapsulate_data_frame(
+        _body: &[u8],
+        _source: [u8; 6],
+        _destination: [u8; 6],
+    ) -> Result<EthernetFrame, ParseError> {
+        Err(ParseError::TooShort)
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
@@ -473,6 +486,35 @@ pub mod awdl {
                     encoding: 2,
                     channels: (1u16..=16).collect()
                 }
+            );
+        }
+
+        #[test]
+        fn decapsulates_awdl_data_body_to_ethernet_frame() {
+            let mut body = vec![
+                0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00, // LLC/SNAP
+                0x00, 0x00, // head
+                0x01, 0x00, // seq
+                0x00, 0x00, // pad
+                0x86, 0xdd, // ethertype IPv6
+            ];
+            body.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+
+            let frame = decapsulate_data_frame(
+                &body,
+                [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+                [0x33, 0x33, 0x00, 0x00, 0x00, 0x01],
+            )
+            .expect("valid AWDL data frame");
+
+            assert_eq!(
+                frame.bytes,
+                vec![
+                    0x33, 0x33, 0x00, 0x00, 0x00, 0x01,
+                    0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+                    0x86, 0xdd,
+                    0x60, 0x00, 0x00, 0x00,
+                ]
             );
         }
     }
