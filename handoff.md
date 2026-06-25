@@ -90,6 +90,25 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 32 (LIVE RE-TEST: picker+decode fixes WORK; NEW blocker = unicast /Upload stalls from filin chanseq thrash; dispatched pty-5).
+- LIVE RE-TEST RESULT (iPhone42 photo, new stack pids filin 1785176 + luftlift 1785200):
+  - ✅ PICKER/DISCOVERY now reliable: multiple Discover + 2 Ask (file_count=1) from iPhone42; 10s re-announce
+    ticking every 10s in /tmp/lrF.log. The picker-drop + 10s + multicast-spread fixes are effectively validated.
+  - ✅ DECODE fix proven by its NEW correct behavior: instead of silently saving empty "." file, luftlift now
+    logs `connection error error=chunked body: EOF before last-chunk (truncated)` — it correctly detects the
+    upload was cut off. /tmp/ldrop + /tmp/ldrop_raw still EMPTY (transfer never completed, so no dump yet).
+  - ❌ NEW BLOCKER = unicast /Upload STALLS mid-stream (human: "stalled mid-send", retries got "further" then
+    stuck). ROOT CAUSE in /tmp/fF.log: filin re-adopts a master channel sequence ~44x/MIN (every ~1.4s),
+    flip-flopping between SEVERAL sequences [174,232,206,171,81,217]/[202,83,223,212,135,216]/[206,71,161,75,
+    223,188]/[146,197,245,67,95,175]. Those channel numbers are GARBAGE (not valid Wi-Fi channels) => chanseq
+    TLV decode bug. Plus the thrash means filin is never stably co-channel with the iPhone => TLS upload EOFs.
+- DISPATCHED pty-5 (GLM filin, idle after 547ec94) via FILIN_TRANSFER_STALL.md, 3 parts:
+  A) decode AWDL chanseq ENCODING field to REAL channels (port owl src/channel.c+sync.c) — bogus 174/232/245.
+  B) master-adoption hysteresis (stop 44x/min thrash; keep current master unless challenger persistently wins).
+  C) PIN to active-transfer peer's channel + suppress hopping/re-adoption while unicast RX from it is recent
+     (the human's hypothesis: filin hops away mid-/Upload). Lead with A+C. Separate commits, filin-rs only.
+- STACK still UP (old filin 1785176 w/o these fixes). After pty-5 commits: rebuild+restart, human retries photo.
+--- PRIOR cycle-31 below ---
 Last updated: cycle 31 (ALL 3 FIXES COMMITTED + GREEN + STACK RESTARTED w/ debug+dump — awaiting human iPhone re-test).
 - 3 commits landed + tree green (filin 84 + luftlift 104 lib/3 bin tests, clippy clean, release builds):
   - 43e6451 green(luftlift): fix iPhone /Upload decode (chunked truncation + CPIO dir filtering)
