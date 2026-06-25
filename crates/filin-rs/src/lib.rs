@@ -351,11 +351,25 @@ pub mod awdl {
     }
 
     pub fn decapsulate_data_frame(
-        _body: &[u8],
-        _source: [u8; 6],
-        _destination: [u8; 6],
+        body: &[u8],
+        source: [u8; 6],
+        destination: [u8; 6],
     ) -> Result<EthernetFrame, ParseError> {
-        Err(ParseError::TooShort)
+        if body.len() < 16 {
+            return Err(ParseError::TooShort);
+        }
+        if body[0..3] != [0xaa, 0xaa, 0x03] || body[6..8] != [0x08, 0x00] {
+            return Err(ParseError::UnexpectedValue);
+        }
+
+        let ethertype = [body[14], body[15]];
+        let payload = &body[16..];
+        let mut bytes = Vec::with_capacity(14 + payload.len());
+        bytes.extend_from_slice(&destination);
+        bytes.extend_from_slice(&source);
+        bytes.extend_from_slice(&ethertype);
+        bytes.extend_from_slice(payload);
+        Ok(EthernetFrame { bytes })
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
