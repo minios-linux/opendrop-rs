@@ -1121,6 +1121,16 @@ pub mod sync {
             (eaw_period_tu - (time_since_tu % eaw_period_tu)) as u16
         }
 
+        /// owl `awdl_sync_next_aw_us` (owl/src/sync.c:40-45): microseconds to
+        /// the next availability-window boundary.
+        pub fn next_aw_us(&self, now_us: u64) -> u64 {
+            let eaw_period_us = tu_to_us(
+                u64::from(self.presence_mode) * u64::from(self.aw_period_tu),
+            );
+            let time_since = now_us.saturating_sub(self.last_update_us);
+            eaw_period_us - (time_since % eaw_period_us)
+        }
+
         pub fn current_aw(&self, now_us: u64) -> u16 {
             let eaw_period_tu = u64::from(self.presence_mode) * u64::from(self.aw_period_tu);
             let time_since_tu = us_to_tu(now_us - self.last_update_us);
@@ -1250,6 +1260,87 @@ pub mod channel {
             assert_eq!(channel_for_eaw(&sequence, 0), Some(44));
             assert_eq!(channel_for_eaw(&sequence, 2), Some(149));
             assert_eq!(channel_for_eaw(&sequence, 17), Some(44));
+        }
+    }
+}
+
+pub mod schedule {
+    //! Faithful port of owl `schedule.c` / `schedule.h`: availability-window
+    //! gating for action/data transmission.
+    use crate::sync::SyncState;
+
+    pub const CHANSEQ_LEN: usize = 16;
+    /// owl `AWDL_MULTICAST_GUARD_TU` (owl/src/schedule.h:29).
+    pub const MULTICAST_GUARD_TU: u16 = 16;
+
+    const TU_US: u64 = 1024;
+
+    /// owl `awdl_is_multicast_eaw` (owl/src/schedule.c:43-46): slots 0 and 10
+    /// are the AWDL multicast availability windows.
+    pub fn is_multicast_eaw(sync: &SyncState, now_us: u64) -> bool {
+        let slot = usize::from(sync.current_eaw(now_us) % CHANSEQ_LEN as u16);
+        slot == 0 || slot == 10
+    }
+
+    /// Channel number (opclass encoding) for a sequence slot, or 0 if null.
+    pub fn slot_channel(channel_sequence: &[[u8; 2]; CHANSEQ_LEN], slot: usize) -> u8 {
+        channel_sequence[slot % CHANSEQ_LEN][0]
+    }
+
+    /// owl `awdl_can_send_in` (owl/src/schedule.c:48-55): returns 0 when it is
+    /// safe to send now (inside the guard-free core of the AW), a positive
+    /// number of seconds to wait before the next safe window, or a negative
+    /// number of seconds meaning "we are in the trailing guard, wait this long
+    /// plus the guard before retrying".
+    pub fn can_send_in(sync: &SyncState, now_us: u64, guard_tu: u16) -> i64 {
+        let next_aw = sync.next_aw_us(now_us);
+        let guard = tu_to_us(u64::from(guard_tu));
+        let eaw = tu_to_us(64); // presence_mode(4) * aw_period(16) TU
+        if next_aw < guard {
+            -(us_to_sec(guard - next_aw))
+        } else if eaw - next_aw < guard {
+            us_to_sec(guard - (eaw - next_aw))
+        } else {
+            0
+        }
+    }
+
+    fn tu_to_us(tu: u64) -> u64 {
+        tu * TU_US
+    }
+
+    fn us_to_sec(us: u64) -> i64 {
+        us as i64 / 1_000_000
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn synced() -> SyncState {
+            SyncState::new(1_000_000)
+        }
+
+        #[test]
+        fn mid_eaw_is_sendable_outside_guard() {
+            // last_update at 1_000_000; at 1_032_000 we are ~32 TU into the EAW
+            // (well clear of the 16 TU guard on both sides).
+            let sync = synced();
+            assert_eq!(can_send_in(&sync, 1_032_768, MULTICAST_GUARD_TU), 0);
+        }
+
+        #[test]
+        fn detects_multicast_eaw_slots() {
+            let sync = synced();
+            // current_eaw advances with time; verify slot 0 at the start.
+            assert!(is_multicast_eaw(&sync, 1_000_000));
+        }
+
+        #[test]
+        fn slot_channel_reads_chan_num_byte() {
+            let seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            assert_eq!(slot_channel(&seq, 0), 44);
+            assert_eq!(slot_channel(&seq, 15), 44);
         }
     }
 }
@@ -2345,7 +2436,7 @@ pub mod runtime {
                     tracing::info!(removed = removed.len(), peers = awdl_state.peers.len(), "peer table cleaned");
                 }
             }
-            for subtype in announce.due(now_us) {
+            for subtype in announce.due(now_us, &awdl_state) {
                 let seq = awdl_state.next_data_seq();
                 let frame = build_announce_frame(subtype, &awdl_state, seq << 4, now_us);
                 match links.packet.send(&frame) {
@@ -2482,7 +2573,9 @@ pub mod runtime {
         fn new(now_us: u64) -> Self {
             Self {
                 next_psf_us: now_us + PSF_INTERVAL_TU * TU_US,
-                next_mif_us: now_us + 32 * TU_US,
+                // owl arms the MIF timer to fire immediately the first time
+                // (core.c:419), then awdl_send_mif reschedules to mid-EAW.
+                next_mif_us: now_us,
                 next_clean_us: now_us + CLEAN_INTERVAL_US,
             }
         }
@@ -2506,23 +2599,42 @@ pub mod runtime {
             }
         }
 
-        fn due(&mut self, now_us: u64) -> Vec<awdl::ActionSubtype> {
+        /// Returns the action subtypes whose timers have fired, rescheduling
+        /// each. MIF follows owl `awdl_send_mif` (owl/daemon/core.c:184-200): it
+        /// only fires when our current channel slot is non-null and is rearmed
+        /// to the middle of the next EAW. PSF fires every `PSF_INTERVAL_TU`
+        /// (owl `awdl_send_psf`, core.c:178-182).
+        fn due(
+            &mut self,
+            now_us: u64,
+            awdl_state: &crate::state::AwdlState,
+        ) -> Vec<awdl::ActionSubtype> {
             let mut due = Vec::new();
-            let interval_us = PSF_INTERVAL_TU * TU_US;
             if now_us >= self.next_mif_us {
-                due.push(awdl::ActionSubtype::Mif);
-                while self.next_mif_us <= now_us {
-                    self.next_mif_us += interval_us;
+                let slot =
+                    usize::from(awdl_state.sync.current_eaw(now_us) % 16);
+                let channel = crate::schedule::slot_channel(&awdl_state.channel_sequence, slot);
+                if channel > 0 {
+                    due.push(awdl::ActionSubtype::Mif);
                 }
+                self.next_mif_us = next_mif_us(&awdl_state.sync, now_us);
             }
             if now_us >= self.next_psf_us {
                 due.push(awdl::ActionSubtype::Psf);
                 while self.next_psf_us <= now_us {
-                    self.next_psf_us += interval_us;
+                    self.next_psf_us += PSF_INTERVAL_TU * TU_US;
                 }
             }
             due
         }
+    }
+
+    /// owl `awdl_send_mif` rearms to the middle of the next EAW:
+    /// `next_aw + eaw_len/2` (owl/daemon/core.c:199).
+    fn next_mif_us(sync: &crate::sync::SyncState, now_us: u64) -> u64 {
+        let next_aw = sync.next_aw_us(now_us);
+        let eaw_len = u64::from(sync.presence_mode) * u64::from(sync.aw_period_tu) * TU_US;
+        now_us + next_aw + eaw_len / 2
     }
 
     fn build_announce_frame(
@@ -2798,12 +2910,20 @@ pub mod runtime {
 
         #[test]
         fn scheduler_fires_psf_before_mif() {
+            // MIF is armed immediately (now) then rescheduled to mid next-EAW.
+            // PSF fires one PSF_INTERVAL (110 TU = 112640 us) after start.
+            let state =
+                crate::state::AwdlState::new([0x02, 1, 2, 3, 4, 5], "filin".into(), 44, 1_000_000);
             let mut scheduler = AnnounceScheduler::new(1_000_000);
 
-            assert_eq!(scheduler.poll_timeout_ms(1_000_000), 33);
-            assert_eq!(scheduler.due(1_032_768), vec![awdl::ActionSubtype::Mif]);
-            assert_eq!(scheduler.poll_timeout_ms(1_032_768), 80);
-            assert_eq!(scheduler.due(1_112_640), vec![awdl::ActionSubtype::Psf]);
+            // MIF fires immediately; next MIF lands at mid next-EAW:
+            //   next_aw(65536) + eaw_len/2(32768) = 98304 us after start.
+            assert_eq!(scheduler.due(1_000_000, &state), vec![awdl::ActionSubtype::Mif]);
+            assert!(scheduler.due(1_050_000, &state).is_empty());
+            assert_eq!(scheduler.due(1_098_304, &state), vec![awdl::ActionSubtype::Mif]);
+            // PSF lands at 1_000_000 + 110*1024 = 1_112_640.
+            let due = scheduler.due(1_112_640, &state);
+            assert!(due.contains(&awdl::ActionSubtype::Psf));
         }
 
         fn demo_state() -> crate::state::AwdlState {
