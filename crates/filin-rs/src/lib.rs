@@ -558,6 +558,45 @@ pub mod awdl {
         })
     }
 
+    /// owl `enum awdl_chan_encoding` (owl/src/channel.h:27-31): the
+    /// per-entry byte layout of an AWDL channel-sequence TLV.
+    pub const CHAN_ENC_SIMPLE: u8 = 0;
+    pub const CHAN_ENC_LEGACY: u8 = 1;
+    pub const CHAN_ENC_OPCLASS: u8 = 3;
+
+    /// owl `awdl_chan_encoding_size` (owl/src/channel.c:69-79): the number
+    /// of bytes per chanseq entry for a given encoding, or `None` for an
+    /// unknown encoding. SIMPLE packs one `chan_num` byte; LEGACY and
+    /// OPCLASS both use two bytes (with the channel number in different
+    /// positions — see [`chan_num`]).
+    pub fn chan_encoding_size(enc: u8) -> Option<usize> {
+        match enc {
+            CHAN_ENC_SIMPLE => Some(1),
+            CHAN_ENC_LEGACY | CHAN_ENC_OPCLASS => Some(2),
+            _ => None,
+        }
+    }
+
+    /// owl `awdl_chan_num` (owl/src/channel.c:56-67): decode the real
+    /// Wi-Fi channel number from a chanseq entry's raw bytes under the
+    /// given encoding, or `None` for an unknown encoding.
+    ///
+    /// - SIMPLE (0): one byte, `chan_num = bytes[0]`.
+    /// - LEGACY (1): two bytes laid out `[flags, chan_num]`, so the channel
+    ///   number is the SECOND byte. filin previously read it as the first,
+    ///   which yielded garbage channel numbers (e.g. 174/232/245) on live
+    ///   Apple frames and made the radio hop to invalid channels.
+    /// - OPCLASS (3): two bytes laid out `[chan_num, opclass]`, so the
+    ///   channel number is the FIRST byte.
+    pub fn chan_num(enc: u8, bytes: &[u8]) -> Option<u8> {
+        match enc {
+            CHAN_ENC_SIMPLE => bytes.first().copied(),
+            CHAN_ENC_LEGACY => bytes.get(1).copied(),
+            CHAN_ENC_OPCLASS => bytes.first().copied(),
+            _ => None,
+        }
+    }
+
     pub fn parse_channel_sequence(value: &[u8]) -> Result<ChannelSequence, ParseError> {
         let count = *value.first().ok_or(ParseError::TooShort)?;
         let encoding = *value.get(1).ok_or(ParseError::TooShort)?;
@@ -569,19 +608,21 @@ pub mod awdl {
             return Err(ParseError::UnexpectedValue);
         }
 
-        let field_len = match encoding {
-            1 => 1,
-            2 | 3 => 2,
-            _ => return Err(ParseError::UnexpectedValue),
-        };
+        // owl awdl_chan_encoding_size (channel.c:69-79). filin previously
+        // mapped encoding 1→1 byte and rejected encoding 0, both wrong; the
+        // correct sizes are 0→1, 1→2, 3→2 (owl channel.h:27-31).
+        let field_len = chan_encoding_size(encoding).ok_or(ParseError::UnexpectedValue)?;
         let mut offset = 6;
         let mut channels = Vec::with_capacity(16);
         for _ in 0..16 {
-            let channel = match field_len {
-                1 => *value.get(offset).ok_or(ParseError::TooShort)? as u16,
-                2 => read_le16(value, offset)?,
-                _ => unreachable!("field length is validated above"),
-            };
+            let entry = value
+                .get(offset..offset + field_len)
+                .ok_or(ParseError::TooShort)?;
+            // owl awdl_chan_num (channel.c:56-67): decode the REAL channel
+            // number per encoding, not a raw little-endian u16 of both
+            // bytes (which mixed flags/opclass into the channel and produced
+            // invalid channels like 174/232/245 on the live wire).
+            let channel = u16::from(chan_num(encoding, entry).ok_or(ParseError::UnexpectedValue)?);
             channels.push(channel);
             offset += field_len;
         }
@@ -833,21 +874,95 @@ pub mod awdl {
         }
 
         #[test]
-        fn parses_opclass_channel_sequence_tlv() {
+        fn rejects_unknown_chanseq_encoding() {
+            // owl defines only encodings 0, 1, 3 (channel.h:27-31). The old
+            // filin parser accepted a non-existent encoding 2; it must now be
+            // rejected so a malformed/unknown TLV can't misdecode channels.
             let mut value = vec![15, 2, 0, 3, 0xff, 0xff];
             for channel in 1u16..=16 {
                 value.extend_from_slice(&channel.to_le_bytes());
             }
-
-            let parsed = parse_channel_sequence(&value).expect("valid channel sequence TLV");
-
             assert_eq!(
-                parsed,
-                ChannelSequence {
-                    encoding: 2,
-                    channels: (1u16..=16).collect()
-                }
+                parse_channel_sequence(&value).unwrap_err(),
+                ParseError::UnexpectedValue
             );
+        }
+
+        /// Build a chanseq TLV body with a fixed 6-byte header and 16 entries
+        /// laid out per `encoding`, using `entry_bytes(i)` for slot i.
+        fn chanseq_tlv<F: Fn(usize) -> Vec<u8>>(encoding: u8, entry_bytes: F) -> Vec<u8> {
+            let mut value = vec![15, encoding, 0, 3, 0xff, 0xff];
+            for i in 0..16 {
+                value.extend(entry_bytes(i));
+            }
+            value
+        }
+
+        #[test]
+        fn parses_opclass_channel_sequence_tlv() {
+            // AWDL_CHAN_ENC_OPCLASS (3): two bytes [chan_num, opclass].
+            // Apple's default chanseq (owl awdl_chanseq_init) is 8x149 then
+            // 8x6 — exactly the kind of sequence filin must hop through.
+            let value = chanseq_tlv(CHAN_ENC_OPCLASS, |i| {
+                let ch = if i < 8 { 149 } else { 6 };
+                vec![ch, 0x80]
+            });
+            let parsed =
+                parse_channel_sequence(&value).expect("valid OPCLASS channel sequence TLV");
+            assert_eq!(parsed.encoding, CHAN_ENC_OPCLASS);
+            // Real channel numbers, not the raw opclass-or-u16 garbage.
+            assert_eq!(&parsed.channels[0..8], &[149; 8]);
+            assert_eq!(&parsed.channels[8..16], &[6; 8]);
+        }
+
+        #[test]
+        fn parses_legacy_channel_sequence_tlv() {
+            // AWDL_CHAN_ENC_LEGACY (1): two bytes [flags, chan_num], so the
+            // channel number is the SECOND byte. filin previously read the
+            // first byte (flags) as the channel, which produced the live
+            // garbage channels (174/232/245…). This is the regression test
+            // for the live iPhone upload stall.
+            let value = chanseq_tlv(CHAN_ENC_LEGACY, |i| {
+                let ch = if i < 8 { 44 } else { 149 };
+                // flags byte is non-zero to prove we do not return it.
+                vec![0xa4, ch]
+            });
+            let parsed =
+                parse_channel_sequence(&value).expect("valid LEGACY channel sequence TLV");
+            assert_eq!(parsed.encoding, CHAN_ENC_LEGACY);
+            assert_eq!(&parsed.channels[0..8], &[44; 8]);
+            assert_eq!(&parsed.channels[8..16], &[149; 8]);
+        }
+
+        #[test]
+        fn parses_simple_channel_sequence_tlv() {
+            // AWDL_CHAN_ENC_SIMPLE (0): one byte = chan_num. filin previously
+            // rejected encoding 0 outright; owl accepts it.
+            let value = chanseq_tlv(CHAN_ENC_SIMPLE, |i| {
+                vec![if i < 8 { 44u8 } else { 6u8 }]
+            });
+            let parsed =
+                parse_channel_sequence(&value).expect("valid SIMPLE channel sequence TLV");
+            assert_eq!(parsed.encoding, CHAN_ENC_SIMPLE);
+            assert_eq!(&parsed.channels[0..8], &[44u16; 8]);
+            assert_eq!(&parsed.channels[8..16], &[6u16; 8]);
+        }
+
+        #[test]
+        fn chan_num_decodes_per_encoding() {
+            // owl awdl_chan_num (channel.c:56-67) for each encoding.
+            assert_eq!(chan_num(CHAN_ENC_SIMPLE, &[44]), Some(44));
+            assert_eq!(chan_num(CHAN_ENC_LEGACY, &[0xa4, 44]), Some(44));
+            assert_eq!(chan_num(CHAN_ENC_OPCLASS, &[44, 0x80]), Some(44));
+            assert_eq!(chan_num(9, &[44]), None);
+        }
+
+        #[test]
+        fn chan_encoding_size_matches_owl() {
+            assert_eq!(chan_encoding_size(CHAN_ENC_SIMPLE), Some(1));
+            assert_eq!(chan_encoding_size(CHAN_ENC_LEGACY), Some(2));
+            assert_eq!(chan_encoding_size(CHAN_ENC_OPCLASS), Some(2));
+            assert_eq!(chan_encoding_size(9), None);
         }
 
         #[test]
@@ -3140,6 +3255,37 @@ pub mod state {
             // master times out → revert to anchor (44)
             state.clean_peers(1_000 + peers::PEER_TIMEOUT_US + 1);
             assert_eq!(state.channel_sequence[0][0], 44);
+        }
+
+        #[test]
+        fn adopts_legacy_chanseq_to_real_channels_not_flags_bytes() {
+            // Regression for the live iPhone /Upload stall: a master that
+            // advertises a LEGACY-encoded (encoding 1) channel sequence must
+            // decode to REAL Wi-Fi channels, not the raw flags byte. filin
+            // previously stored channel_sequence[slot][0] = flags (e.g.
+            // 174/232/245), tuned the radio to invalid channels, and was
+            // never co-channel with the iPhone for the sustained upload.
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            // LEGACY: [flags=0xa4, chan_num]. Channels 44 then 149.
+            let mut chanseq_val = vec![15, awdl::CHAN_ENC_LEGACY, 0, 3];
+            chanseq_val.extend_from_slice(&0xffffu16.to_le_bytes());
+            for i in 0..16 {
+                let ch = if i < 8 { 44u8 } else { 149u8 };
+                chanseq_val.extend_from_slice(&[0xa4, ch]);
+            }
+            let tlvs = vec![
+                election_v2_tlv(50, 200),
+                version_tlv(0x34, 1),
+                awdl::Tlv { kind: 18, value: &chanseq_val },
+            ];
+            state.apply_action(peer_addr, mif(), &tlvs, 1_000);
+            // Real channels in slot[0] — NOT the 0xa4 flags byte.
+            assert_eq!(state.channel_sequence[0][0], 44);
+            assert_eq!(state.channel_sequence[8][0], 149);
+            // desired_channel feeds the radio retune, so it must be a real
+            // channel too (slot 0 → 44 here).
+            assert_eq!(state.desired_channel(1_000), 44);
         }
 
         #[test]
