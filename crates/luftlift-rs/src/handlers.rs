@@ -86,7 +86,10 @@ fn handle_upload(req: &HttpRequest) -> HandleResult {
         && !ctype.eq_ignore_ascii_case("application/x-cpio")
     {
         warn!(content_type = ctype, "unsupported Upload content-type");
+        // Match the reference 406: Content-Type application/x-cpio,
+        // Content-Length 0, Connection close.
         let mut resp = HttpResponse::new(406);
+        resp.headers.push(("Content-Type".into(), "application/x-cpio".into()));
         resp.headers.push(("Connection".into(), "close".into()));
         return HandleResult { response: resp, received_files: Vec::new() };
     }
@@ -216,5 +219,24 @@ mod tests {
         let req = post("/Foo", vec![], Vec::new());
         let res = handle_post(&req, &cfg());
         assert_eq!(res.response.status, 404);
+    }
+
+    #[test]
+    fn handle_upload_rejects_bad_content_type_with_406_and_cpio_content_type() {
+        // The reference 406 carries Content-Type: application/x-cpio.
+        let req = post(
+            "/Upload",
+            vec![("Content-Type", "text/plain"), ("Transfer-Encoding", "chunked")],
+            Vec::new(),
+        );
+        let res = handle_post(&req, &cfg());
+        assert_eq!(res.response.status, 406);
+        let ct = res
+            .response
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ct, Some("application/x-cpio"), "406 must advertise Content-Type: application/x-cpio");
     }
 }

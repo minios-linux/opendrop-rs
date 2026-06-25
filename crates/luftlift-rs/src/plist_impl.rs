@@ -64,7 +64,11 @@ pub enum PlistError {
 /// (a `{"Version":1}` JSON blob stored as raw data), and optionally
 /// `ReceiverRecordData`.
 pub fn build_discover_response(cfg: &ReceiverConfig) -> Vec<u8> {
-    let caps_json = br#"{"Version":1}"#;
+    // Match Python's json.dumps({"Version": 1}) byte-for-byte: default
+    // separators (", ", ": ") put a space after the colon -> {"Version": 1}.
+    // A real Apple sender parses this as JSON so the whitespace is functionally
+    // inert, but we match the reference exactly.
+    let caps_json = br#"{"Version": 1}"#;
     let mut dict = Dictionary::new();
     dict.insert("ReceiverMediaCapabilities".into(), Value::Data(caps_json.to_vec()));
     dict.insert("ReceiverComputerName".into(), Value::String(cfg.computer_name.clone()));
@@ -206,6 +210,23 @@ mod tests {
         let caps_bytes = caps.as_data().expect("caps is data");
         let caps_json = std::str::from_utf8(caps_bytes).unwrap();
         assert!(caps_json.contains("\"Version\""), "caps JSON has Version key");
+    }
+
+    #[test]
+    fn discover_response_media_caps_matches_python_json_dumps_whitespace() {
+        // Python json.dumps({"Version": 1}) -> '{"Version": 1}' (space after colon).
+        // Verify byte-exactness against the reference shape.
+        let cfg = sample_config();
+        let body = build_discover_response(&cfg);
+        let val = Value::from_reader(std::io::Cursor::new(&body[..])).unwrap();
+        let caps_bytes = val
+            .as_dictionary()
+            .unwrap()
+            .get("ReceiverMediaCapabilities")
+            .unwrap()
+            .as_data()
+            .unwrap();
+        assert_eq!(caps_bytes, b"{\"Version\": 1}");
     }
 
     // ---- Ask response ----

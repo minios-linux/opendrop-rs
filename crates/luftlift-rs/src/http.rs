@@ -98,6 +98,12 @@ pub fn parse_request(raw: &[u8]) -> Result<HttpRequest, HttpError> {
 }
 
 /// Format an [`HttpResponse`] as wire bytes (status line + headers + body).
+///
+/// Always emits `Connection: close` unless the caller already set a
+/// `Connection` header. The server closes the TLS stream after every request
+/// (AirDrop opens a fresh connection per POST), so advertising `close` makes
+/// the HTTP/1.1 connection-state on the wire match what we actually do — an
+/// HTTP/1.1 client otherwise assumes keep-alive and may try to pipeline.
 pub fn format_response(resp: &HttpResponse) -> Vec<u8> {
     let reason = match resp.status {
         200 => "OK",
@@ -117,6 +123,13 @@ pub fn format_response(resp: &HttpResponse) -> Vec<u8> {
     out.extend_from_slice(head.as_bytes());
     for (k, v) in &resp.headers {
         out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+    }
+    let has_connection = resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("connection"));
+    if !has_connection {
+        out.extend_from_slice(b"Connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&resp.body);
@@ -272,6 +285,7 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Type: text/plain\r\n"));
         assert!(text.contains("Content-Length: 2\r\n"));
+        assert!(text.contains("Connection: close\r\n"), "Connection: close is auto-added");
         assert!(text.ends_with("\r\n\r\nok"));
     }
 
@@ -282,6 +296,22 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.starts_with("HTTP/1.1 404 "));
         assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(text.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn format_response_respects_explicit_connection_header() {
+        // If the caller set Connection explicitly, don't double-emit.
+        let mut resp = HttpResponse::new(200);
+        resp.headers.push(("Connection".into(), "keep-alive".into()));
+        let bytes = format_response(&resp);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("Connection: keep-alive\r\n"));
+        assert_eq!(
+            text.matches("Connection:").count(),
+            1,
+            "no duplicate Connection header"
+        );
     }
 
     // ---- format_request (sender side) ----
