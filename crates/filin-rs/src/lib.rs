@@ -3842,6 +3842,13 @@ pub mod state {
         /// by the runtime to feed `/status aw_alignment_pct`
         /// (FILIN_SYNC_QUALITY.md Part A).
         pub last_sync_error_tu: Option<i64>,
+        /// Last-seen cluster top master (election.master_addr), used by
+        /// [`note_election_transitions`] to detect true cluster churn vs
+        /// re-parenting. FILIN_SYNC_QUALITY.md.
+        last_seen_master_addr: [u8; 6],
+        /// Last-seen direct parent (election.sync_addr), used by
+        /// [`note_election_transitions`] to detect re-parenting.
+        last_seen_sync_addr: [u8; 6],
     }
 
     impl AwdlState {
@@ -3872,6 +3879,8 @@ pub mod state {
                 master_anchor: 0,
                 master_adopted_at_us: now_us,
                 last_sync_error_tu: None,
+                last_seen_master_addr: self_addr,
+                last_seen_sync_addr: self_addr,
             }
         }
 
@@ -4108,6 +4117,30 @@ pub mod state {
             self.tx_seq = self.tx_seq.wrapping_add(1);
             s
         }
+
+        /// Compare the current election `master_addr`/`sync_addr` against the
+        /// last-seen values, update the baseline, and report what changed.
+        /// The runtime calls this after each `apply_action` to bump the
+        /// introspection change counters. Distinguishes true cluster churn
+        /// (master_addr flips) from re-parenting (sync_addr flips while
+        /// master_addr stays stable) — FILIN_SYNC_QUALITY.md.
+        pub fn note_election_transitions(&mut self) -> ElectionTransitions {
+            let master_addr_changed = self.election.master_addr != self.last_seen_master_addr;
+            let sync_addr_changed = self.election.sync_addr != self.last_seen_sync_addr;
+            self.last_seen_master_addr = self.election.master_addr;
+            self.last_seen_sync_addr = self.election.sync_addr;
+            ElectionTransitions {
+                master_addr_changed,
+                sync_addr_changed,
+            }
+        }
+    }
+
+    /// Result of [`AwdlState::note_election_transitions`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ElectionTransitions {
+        pub master_addr_changed: bool,
+        pub sync_addr_changed: bool,
     }
 
     /// owl `awdl_handle_election_params_tlv` (owl/src/rx.c:111-131).
@@ -4859,6 +4892,30 @@ pub mod runtime {
                                 let rssi_dbm = frame.rssi_dbm;
                                 let tlv_count = frame.tlvs.len();
                                 awdl_state.apply_action(src, subtype, &frame.tlvs, rx_time_us);
+                                // FILIN_SYNC_QUALITY.md Part A: detect
+                                // master_addr vs sync_addr transitions so
+                                // /status can prove whether the cluster top
+                                // master is stable while we re-parent.
+                                let t = awdl_state.note_election_transitions();
+                                if t.master_addr_changed {
+                                    introspect.counters.inc_master_addr_change();
+                                    introspect
+                                        .counters
+                                        .push_master_mac(crate::introspect::mac_string(
+                                            awdl_state.election.master_addr,
+                                        ));
+                                }
+                                if t.sync_addr_changed {
+                                    introspect.counters.inc_sync_addr_change();
+                                    introspect.counters.inc_master_change();
+                                }
+                                // AW alignment sample: aligned iff the last
+                                // sync error was within ~1 EAW guard band.
+                                if let Some(err_tu) = awdl_state.last_sync_error_tu {
+                                    introspect
+                                        .counters
+                                        .record_aw_check(err_tu.abs() <= AW_ALIGN_TOLERANCE_TU);
+                                }
                                 tracing::trace!(
                                     rx_time_us,
                                     rssi_dbm,
@@ -5163,6 +5220,11 @@ pub mod runtime {
     /// owl `PSF_INTERVAL_MASTER_TU` is 110; slave is 440. owl clean interval
     /// (`PEERS_DEFAULT_CLEAN_INTERVAL`) = 1 000 000 us (owl/src/peers.c:29).
     const CLEAN_INTERVAL_US: u64 = 1_000_000;
+    /// Sync-error tolerance (TU) below which an availability window counts as
+    /// "aligned" for `/status aw_alignment_pct` (FILIN_SYNC_QUALITY.md). Half
+    /// an AW guard (8 TU) — loose enough to ride EMA jitter, tight enough that
+    /// a runaway bridge shows up as 0%.
+    const AW_ALIGN_TOLERANCE_TU: i64 = 8;
     const AWDL_BROADCAST: [u8; 6] = [0xff; 6];
     const AWDL_BSSID: [u8; 6] = [0x00, 0x25, 0x00, 0xff, 0x94, 0x73];
 
