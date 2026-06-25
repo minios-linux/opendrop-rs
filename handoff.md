@@ -90,6 +90,20 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 7 (filin binary wired w/ honest hw TODO; luftlift on server loop).
+- filin (gpt-5.5): + integrated RX (TSFT-required), AWDL data->Ethernet decap, clap
+  CLI (-i/-c/-h/-N), binary uses validated config. The ONE remaining gap is the
+  hardware-touching bit, honestly stubbed: `TODO(gpt-5.5): open monitor iface and
+  create awdl0`. That netlink/rawsock + awdl0 TUN bring-up is THE part for the live
+  hardware pass with the human (carl9170 monitor, ch44) — everything feeding it is
+  tested. Don't block on it.
+- luftlift (GLM-5.2): building handle_one_connection (pure fn: reader->TLS/HTTP/
+  handlers->writer) + accept loop = the receive flow. Then wire into main.rs. Close
+  to feature-complete. Autonomous, no blocker.
+- ENDGAME (when luftlift's server loop + main wiring land): root `cargo build` +
+  `cargo test --workspace` + `cargo clippy`; sanity-run both binaries' --help/-N
+  dry path; then write success report (run instructions + the awdl0/hw-pass caveat).
+--- (prior cycle notes below) ---
 Last updated: cycle 6 (filin ALL PORT.md milestones DONE + integrating; luftlift on mDNS).
 - filin (gpt-5.5): COMPLETE through PORT.md — parsers, election, sync, TSFT bridge,
   sync-error, channel freq/slot, TX backpressure queue, iface config (awdl0/mon/ch44)
