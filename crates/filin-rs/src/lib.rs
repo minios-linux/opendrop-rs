@@ -477,3 +477,53 @@ pub mod awdl {
         }
     }
 }
+
+pub mod election {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ElectionState {
+        pub self_addr: [u8; 6],
+        pub sync_addr: [u8; 6],
+        pub master_addr: [u8; 6],
+        pub master_counter: u32,
+        pub master_metric: u32,
+        pub self_metric: u32,
+        pub height: u32,
+    }
+
+    pub fn choose_sync_master(
+        _local: &ElectionState,
+        _peers: &[ElectionState],
+    ) -> ElectionState {
+        unimplemented!("RED: election selection not implemented yet")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn state(addr: [u8; 6], master_metric: u32, height: u32) -> ElectionState {
+            ElectionState {
+                self_addr: addr,
+                sync_addr: addr,
+                master_addr: addr,
+                master_counter: 1,
+                master_metric,
+                self_metric: master_metric,
+                height,
+            }
+        }
+
+        #[test]
+        fn adopts_peer_with_higher_master_metric() {
+            let local = state([0x02, 0, 0, 0, 0, 1], 100, 0);
+            let peer = state([0x02, 0, 0, 0, 0, 2], 200, 0);
+
+            let selected = choose_sync_master(&local, &[peer.clone()]);
+
+            assert_eq!(selected.master_addr, peer.master_addr);
+            assert_eq!(selected.sync_addr, peer.self_addr);
+            assert_eq!(selected.master_metric, 200);
+            assert_eq!(selected.height, 1);
+        }
+    }
+}
