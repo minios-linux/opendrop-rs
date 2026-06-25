@@ -212,6 +212,7 @@ pub mod awdl {
         TooShort,
         InvalidVendorHeader,
         UnsupportedSubtype(u8),
+        UnexpectedValue,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -313,8 +314,35 @@ pub mod awdl {
         })
     }
 
-    pub fn parse_channel_sequence(_value: &[u8]) -> Result<ChannelSequence, ParseError> {
-        Err(ParseError::TooShort)
+    pub fn parse_channel_sequence(value: &[u8]) -> Result<ChannelSequence, ParseError> {
+        let count = *value.first().ok_or(ParseError::TooShort)?;
+        let encoding = *value.get(1).ok_or(ParseError::TooShort)?;
+        let duplicate_count = *value.get(2).ok_or(ParseError::TooShort)?;
+        let step_count = *value.get(3).ok_or(ParseError::TooShort)?;
+        let fill_channel = read_le16(value, 4)?;
+
+        if count != 15 || duplicate_count != 0 || step_count != 3 || fill_channel != 0xffff {
+            return Err(ParseError::UnexpectedValue);
+        }
+
+        let field_len = match encoding {
+            1 => 1,
+            2 | 3 => 2,
+            _ => return Err(ParseError::UnexpectedValue),
+        };
+        let mut offset = 6;
+        let mut channels = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let channel = match field_len {
+                1 => *value.get(offset).ok_or(ParseError::TooShort)? as u16,
+                2 => read_le16(value, offset)?,
+                _ => unreachable!("field length is validated above"),
+            };
+            channels.push(channel);
+            offset += field_len;
+        }
+
+        Ok(ChannelSequence { encoding, channels })
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
