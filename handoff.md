@@ -118,8 +118,10 @@ Last updated: cycle 19 (AUTONOMOUS mode — human napping; force-master WORKED; 
     sync/AW schedule, AW-gated TX timing + channel hopping, TX content (chanseq
     opclass encoding, real election values). Audit flags these as the peering
     blockers. Don't build/test mid-edit; wait for idle+commit.
-  - pty-3 (GLM-5.2 luftlift): fix(luftlift) send mDNS goodbye (TTL=0) on
-    SIGINT/SIGTERM so Apple picker stops showing ghost luftlift/linuxdrop entries.
+  - pty-3 (GLM-5.2 luftlift): fix(luftlift) = 3 parts in one commit: (a) mDNS
+    goodbye (TTL=0) on SIGINT/SIGTERM via ctrlc handler; (b) short record TTL (~120s)
+    so ungraceful exits self-clear; (c) PID in mDNS instance name ("luftlift-<pid>")
+    so picker entries are identifiable per-run. Stops ghost luftlift/linuxdrop entries.
     *** NEXT (human's instruction): when pty-3 finishes the goodbye fix, CLEAR its
     context (OpenCode /new or /clear — full at 135K tokens), then dispatch a fresh
     systematic LUFTLIFT faithfulness audit -> LUFTLIFT_AUDIT.md: compare luftlift-rs
