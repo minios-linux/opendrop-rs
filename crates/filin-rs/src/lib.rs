@@ -1188,6 +1188,229 @@ pub mod channel {
     }
 }
 
+pub mod peers {
+    //! Faithful port of owl `peers.c` / `peers.h`.
+    use crate::election::{ElectionState, PeerElection};
+
+    /// owl `AWDL_CHANSEQ_LENGTH` (owl/src/channel.h:25).
+    pub const CHANSEQ_LEN: usize = 16;
+    /// owl `HOST_NAME_LENGTH_MAX` (owl/src/peers.h:29).
+    pub const HOST_NAME_MAX: usize = 64;
+    /// owl `PEERS_DEFAULT_TIMEOUT` (owl/src/peers.c:28). The peer table stores
+    /// `last_update` in microseconds (set from the RX timestamp), so the value
+    /// owl labels "ms" is applied as microseconds: a peer unheard for ~2 s is
+    /// dropped.
+    pub const PEER_TIMEOUT_US: u64 = 2_000_000;
+
+    /// owl `struct awdl_peer` (owl/src/peers.h:38-52).
+    #[derive(Debug, Clone)]
+    pub struct Peer {
+        pub addr: [u8; 6],
+        pub last_update_us: u64,
+        pub election: ElectionState,
+        /// Channel sequence, each slot a `(chan_num, opclass)` pair (opclass
+        /// encoding). `owl awdl_chan` is a 2-byte union.
+        pub sequence: [[u8; 2]; CHANSEQ_LEN],
+        pub sync_offset_us: u64,
+        pub name: String,
+        pub country_code: [u8; 3],
+        pub infra_addr: [u8; 6],
+        pub version: u8,
+        pub devclass: u8,
+        pub supports_v2: bool,
+        pub sent_mif: bool,
+        pub is_valid: bool,
+    }
+
+    impl Peer {
+        /// owl `awdl_peer_new` (owl/src/peers.c:66-81).
+        pub fn new(addr: [u8; 6]) -> Self {
+            Self {
+                addr,
+                last_update_us: 0,
+                election: ElectionState::new(addr),
+                sequence: [[0, 0]; CHANSEQ_LEN],
+                sync_offset_us: 0,
+                name: String::new(),
+                country_code: [b'N', b'A', 0],
+                infra_addr: [0; 6],
+                version: 0,
+                devclass: 0,
+                supports_v2: false,
+                sent_mif: false,
+                is_valid: false,
+            }
+        }
+
+        /// owl `awdl_peer_is_valid` (owl/src/peers.c:62-64): a peer becomes a
+        /// candidate for election/data once it has sent a MIF, a version, and a
+        /// device class.
+        pub fn is_complete(&self) -> bool {
+            self.sent_mif && self.devclass != 0 && self.version != 0
+        }
+
+        /// Read-only election view consumed by `ElectionState::run`.
+        pub fn election_view(&self) -> PeerElection {
+            PeerElection {
+                self_addr: self.addr,
+                sync_addr: self.election.sync_addr,
+                master_addr: self.election.master_addr,
+                height: self.election.height,
+                master_metric: self.election.master_metric,
+                master_counter: self.election.master_counter,
+                is_valid: self.is_valid,
+            }
+        }
+    }
+
+    /// owl `struct awdl_peer_state` and its hashmap (owl/src/peers.c).
+    #[derive(Debug, Default)]
+    pub struct PeerTable {
+        peers: Vec<Peer>,
+    }
+
+    impl PeerTable {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn len(&self) -> usize {
+            self.peers.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.peers.is_empty()
+        }
+
+        pub fn get(&self, addr: &[u8; 6]) -> Option<&Peer> {
+            self.peers.iter().find(|p| &p.addr == addr)
+        }
+
+        pub fn get_mut(&mut self, addr: &[u8; 6]) -> Option<&mut Peer> {
+            self.peers.iter_mut().find(|p| &p.addr == addr)
+        }
+
+        /// owl `awdl_peer_add` (owl/src/peers.c:83-116): create or update the
+        /// peer, refresh `last_update`, and recompute validity. Returns `true`
+        /// iff the peer transitioned to valid on this call (owl fires its
+        /// `peer_cb` then).
+        pub fn touch(&mut self, addr: [u8; 6], now_us: u64) -> bool {
+            if let Some(idx) = self.peers.iter().position(|p| p.addr == addr) {
+                let peer = &mut self.peers[idx];
+                let was_valid = peer.is_valid;
+                peer.last_update_us = now_us;
+                peer.is_valid = peer.is_complete();
+                peer.is_valid && !was_valid
+            } else {
+                let mut peer = Peer::new(addr);
+                peer.last_update_us = now_us;
+                peer.is_valid = peer.is_complete();
+                let became = peer.is_valid;
+                self.peers.push(peer);
+                became
+            }
+        }
+
+        pub fn iter(&self) -> std::slice::Iter<'_, Peer> {
+            self.peers.iter()
+        }
+
+        /// Election inputs for all peers (owl feeds the whole table to
+        /// `awdl_election_run`).
+        pub fn election_views(&self) -> Vec<PeerElection> {
+            self.peers.iter().map(Peer::election_view).collect()
+        }
+
+        /// owl `awdl_peers_remove` (owl/src/peers.c:170-187): drop peers whose
+        /// `last_update` is strictly older than `cutoff_us`. Returns the removed
+        /// addresses (owl invokes `peer_remove_cb` for each).
+        pub fn remove_stale(&mut self, cutoff_us: u64) -> Vec<[u8; 6]> {
+            let mut removed = Vec::new();
+            self.peers.retain(|p| {
+                if p.last_update_us < cutoff_us {
+                    removed.push(p.addr);
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn touch_creates_then_updates_peer() {
+            let mut table = PeerTable::new();
+            let addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+
+            assert!(!table.touch(addr, 1_000));
+            assert_eq!(table.len(), 1);
+            assert_eq!(table.get(&addr).unwrap().last_update_us, 1_000);
+
+            assert!(!table.touch(addr, 2_000));
+            assert_eq!(table.len(), 1);
+            assert_eq!(table.get(&addr).unwrap().last_update_us, 2_000);
+        }
+
+        #[test]
+        fn peer_becomes_valid_only_with_mif_version_and_devclass() {
+            let mut table = PeerTable::new();
+            let addr = [0x02, 0, 0, 0, 0, 1];
+            table.touch(addr, 0);
+
+            table.get_mut(&addr).unwrap().sent_mif = true;
+            assert!(!table.touch(addr, 10)); // still missing version/devclass
+
+            table.get_mut(&addr).unwrap().version = 0x34;
+            assert!(!table.touch(addr, 20)); // still missing devclass
+
+            table.get_mut(&addr).unwrap().devclass = 1;
+            assert!(table.touch(addr, 30)); // now complete -> valid transition
+            assert!(table.get(&addr).unwrap().is_valid);
+        }
+
+        #[test]
+        fn remove_stale_drops_old_peers_keeps_recent() {
+            let mut table = PeerTable::new();
+            let old = [0x02, 0, 0, 0, 0, 1];
+            let recent = [0x02, 0, 0, 0, 0, 2];
+            table.touch(old, 1_000);
+            table.touch(recent, 5_000);
+
+            let removed = table.remove_stale(4_000);
+
+            assert_eq!(removed, vec![old]);
+            assert!(table.get(&old).is_none());
+            assert!(table.get(&recent).is_some());
+        }
+
+        #[test]
+        fn election_views_carry_validity_and_addrs() {
+            let mut table = PeerTable::new();
+            let addr = [0x02, 0, 0, 0, 0, 7];
+            table.touch(addr, 100);
+            {
+                let p = table.get_mut(&addr).unwrap();
+                p.sent_mif = true;
+                p.version = 0x34;
+                p.devclass = 1;
+                p.election.master_counter = 42;
+            }
+            table.touch(addr, 200); // recompute validity
+
+            let views = table.election_views();
+            assert_eq!(views.len(), 1);
+            assert!(views[0].is_valid);
+            assert_eq!(views[0].self_addr, addr);
+            assert_eq!(views[0].master_counter, 42);
+        }
+    }
+}
+
 pub mod tx {
     use std::collections::VecDeque;
 
