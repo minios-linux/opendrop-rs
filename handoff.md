@@ -90,6 +90,35 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 26 (LIVE TEST done + RADIO WEDGED; GLM fixing /Upload stall; picker-name fixed).
+*** STATE CHANGE — do NOT try to restart the filin/luftlift stack: the carl9170 RADIO
+    IS WEDGED and needs a REBOOT. Interface wlxbc05430d50a1 is GONE. ***
+- LIVE TEST RESULTS (improved filin + luftlift vs real Mac/iPhone, over owl force-master):
+  - filin CHANNEL HOPPING confirmed working live (monitor ch cycled 6<->44 per master seq;
+    "adopted master channel sequence" logs). BUT filin has a REGRESSION: its new AW-gated
+    TX gates out the MULTICAST mDNS announce -> NO Apple device sees luftlift under filin
+    (owl works). Needs fix: multicast/broadcast frames must NOT be peer-channel-gated.
+  - Over owl (force-master): Discover + /Ask WORK reliably (Mac + iPhone saw luftlift,
+    Ask auto-accepted). But /Upload STALLS — awdl0 RX bursts then freezes, file never
+    lands. Mac shows "almost complete but stuck". Likely causes: (a) marginal carl9170 RF
+    (~0.4% sync) under multi-device contention, AND/OR (b) a luftlift /Upload REGRESSION:
+    the OLD luftlift's Upload worked earlier; the NEW one (with Expect:100-continue fix
+    614818e) stalls. Round-trip passes because our sender doesn't drive Expect:100-continue
+    like a real Mac.
+- RADIO: after 12h, carl9170 driver WEDGED (dmesg: kthread stack trace + 'writing reg ...
+  failed (-110)' USB timeouts). Tried: replug (re-enumerated as Bus1 Dev046 AR9001U but
+  no iface), modprobe -r (FATAL: in use, hung kthread), iw del + manual USB rebind -> no
+  iface. NEEDS REBOOT. After reboot: re-setup (nmcli set wlxbc05430d50a1 managed no; iw
+  set type monitor; ip link up; iw set channel 44) then restart owl(force-master)+luftlift.
+- DELEGATED (pty-3 GLM luftlift, per LUFTLIFT_UPLOAD_STALL.md):
+  - DONE: d0c2637 PID in ReceiverComputerName (picker shows luftlift-<pid> now).
+  - IN PROGRESS: diagnose+fix the /Upload Expect:100-continue + chunked stall (TLS
+    header/body boundary suspect) + regression test mimicking an Apple sender.
+- STILL TODO (filin, when human/agent available): fix the multicast-announce TX-gating
+  regression (the reason filin's luftlift was invisible to Apple). pty-5/filin idle.
+- Tree green: filin 68 + luftlift 84 tests, builds. owl still patched force-master;
+  bluetoothd stopped pty-8.
+--- PRIOR cycle-25 below ---
 Last updated: cycle 25 (AUTONOMOUS idle-monitor — all green, idle, ready for human; no change).
 - Idle health-checks (cycles 24-25), nothing changed: tree green (filin 68 + luftlift
   84 tests, builds, clippy clean, git clean besides owl force-master patch). Stack
