@@ -3270,9 +3270,12 @@ pub mod state {
                 if peer.sequence.iter().any(|s| s[0] != 0)
                     && self.channel_sequence != peer.sequence
                 {
+                    let decoded: Vec<u8> =
+                        peer.sequence.iter().map(|s| s[0]).collect();
                     self.channel_sequence = peer.sequence;
                     tracing::info!(
                         master = ?master,
+                        decoded = ?decoded,
                         "adopted master channel sequence"
                     );
                 }
@@ -3366,13 +3369,36 @@ pub mod state {
         }
     }
 
+    /// Format a byte slice as a hex string for debug logging.
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
+    }
+
     /// owl `awdl_handle_chanseq_tlv` (owl/src/rx.c:60-109): store the peer's
     /// 16-slot channel sequence (as raw `(chan_num, opclass)` bytes).
     fn apply_chanseq(peer: &mut Peer, value: &[u8]) {
         if let Ok(seq) = awdl::parse_channel_sequence(value) {
+            let decoded: Vec<u8> = seq.channels.iter().map(|&c| c as u8).collect();
+            tracing::debug!(
+                raw = %hex_encode(value),
+                encoding = seq.encoding,
+                decoded = ?decoded,
+                peer = ?peer.addr,
+                "chanseq TLV decoded"
+            );
             for (slot, ch) in seq.channels.iter().take(CHANSEQ_LEN).enumerate() {
                 peer.sequence[slot] = ch.to_le_bytes();
             }
+        } else {
+            tracing::debug!(
+                raw = %hex_encode(value),
+                peer = ?peer.addr,
+                "chanseq TLV parse failed — peer sequence unchanged"
+            );
         }
     }
 
