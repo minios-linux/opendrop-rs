@@ -547,5 +547,16 @@ pub mod election {
             assert_eq!(selected.master_metric, 200);
             assert_eq!(selected.height, 1);
         }
+
+        #[test]
+        fn breaks_equal_metric_tie_by_peer_address() {
+            let local = state([0x02, 0, 0, 0, 0, 1], 100, 0);
+            let lower = state([0x02, 0, 0, 0, 0, 2], 100, 0);
+            let higher = state([0x02, 0, 0, 0, 0, 3], 100, 0);
+
+            let selected = choose_sync_master(&local, &[lower, higher.clone()]);
+
+            assert_eq!(selected.sync_addr, higher.self_addr);
+        }
     }
 }
