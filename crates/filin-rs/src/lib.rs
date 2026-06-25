@@ -10,11 +10,90 @@ pub mod radiotap {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum RadiotapError {
-        Unsupported,
+        TooShort,
+        UnsupportedVersion(u8),
+        InvalidLength { header_len: usize, frame_len: usize },
+        ExtendedPresentBitmap,
+        UnsupportedField(u8),
     }
 
-    pub fn parse_header(_frame: &[u8]) -> Result<RadiotapHeader<'_>, RadiotapError> {
-        Err(RadiotapError::Unsupported)
+    pub fn parse_header(frame: &[u8]) -> Result<RadiotapHeader<'_>, RadiotapError> {
+        if frame.len() < 8 {
+            return Err(RadiotapError::TooShort);
+        }
+        if frame[0] != 0 {
+            return Err(RadiotapError::UnsupportedVersion(frame[0]));
+        }
+
+        let header_len = u16::from_le_bytes([frame[2], frame[3]]) as usize;
+        if header_len < 8 || header_len > frame.len() {
+            return Err(RadiotapError::InvalidLength {
+                header_len,
+                frame_len: frame.len(),
+            });
+        }
+
+        let present = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+        if present & (1 << 31) != 0 {
+            return Err(RadiotapError::ExtendedPresentBitmap);
+        }
+
+        let mut offset = 8;
+        let mut tsft = None;
+        let mut flags = None;
+        let mut antenna_signal_dbm = None;
+
+        for bit in 0..32 {
+            if present & (1 << bit) == 0 {
+                continue;
+            }
+
+            match bit {
+                0 => {
+                    offset = align(offset, 8);
+                    let bytes = read_field::<8>(frame, header_len, offset)?;
+                    tsft = Some(u64::from_le_bytes(bytes));
+                    offset += 8;
+                }
+                1 => {
+                    let bytes = read_field::<1>(frame, header_len, offset)?;
+                    flags = Some(bytes[0]);
+                    offset += 1;
+                }
+                5 => {
+                    let bytes = read_field::<1>(frame, header_len, offset)?;
+                    antenna_signal_dbm = Some(bytes[0] as i8);
+                    offset += 1;
+                }
+                _ => return Err(RadiotapError::UnsupportedField(bit)),
+            }
+        }
+
+        Ok(RadiotapHeader {
+            header_len,
+            payload: &frame[header_len..],
+            tsft,
+            flags,
+            antenna_signal_dbm,
+        })
+    }
+
+    fn align(offset: usize, alignment: usize) -> usize {
+        debug_assert!(alignment.is_power_of_two());
+        (offset + alignment - 1) & !(alignment - 1)
+    }
+
+    fn read_field<const N: usize>(
+        frame: &[u8],
+        header_len: usize,
+        offset: usize,
+    ) -> Result<[u8; N], RadiotapError> {
+        let end = offset.checked_add(N).ok_or(RadiotapError::TooShort)?;
+        let bytes = frame
+            .get(offset..end)
+            .filter(|_| end <= header_len)
+            .ok_or(RadiotapError::TooShort)?;
+        Ok(bytes.try_into().expect("slice length matches field length"))
     }
 
     #[cfg(test)]
