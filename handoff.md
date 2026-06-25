@@ -90,6 +90,22 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 34 (DISCOVERY REGRESSION: filin covers only ch6/44 never 149; dispatched pty-5 FILIN_CH149_COVERAGE.md).
+- After the cycle-33 fixes the iPhone NO LONGER sees luftlift in the picker (it DID in cycle 32). Root-cause
+  evidence from filin debug log (`switched monitor channel channel=N`): 167x ch44, 166x ch6, ZERO ch149 across
+  333 hops. Real iPhone AirDrop needs the social channel 149. The mDNS announce is healthy + IS spread on-wire
+  (tcpdump awdl0 confirmed) — pure CHANNEL-COVERAGE problem. Watched luftlift log 35s w/ sheet open => no Discover.
+- WHY: hysteresis (4e91681) stopped the master thrash that was incidentally covering more channels; filin now
+  commits to one master whose DECODED seq is only 6/44. Either Bug A's chanseq decode (0674ad1) DROPS 149, or the
+  masters truly advertise 6/44 only.
+- DISPATCHED pty-5 (idle, 99 tests) FILIN_CH149_COVERAGE.md: add raw-chanseq-hex + decoded-16-slot debug log,
+  verify decode vs owl awdl_chan_num (is 149/0x95 dropped?), then fix so filin covers 149 (fix decode, and/or
+  spread announce across social channels 6/44/149). TDD, filin-rs only, don't touch running filin pid.
+- STACK UP (regressed, no 149): filin 1798331 + luftlift 1798360 on pty-7 (logs /tmp/fF.log /tmp/lrF.log;
+  debug filin log was /tmp/fD.log). DO NOT ask human to retry until pty-5's 149 fix is rebuilt+restarted.
+- NOTE: avoid restarting filin alone — it recreates awdl0 under luftlift; always restart BOTH (filin then luftlift).
+- All cycle-33 fixes still valid (transfer-pin, hysteresis, decode); 149-coverage is the remaining discovery gap.
+--- PRIOR cycle-33 below ---
 Last updated: cycle 33 (filin transfer-pin + hysteresis + chanseq-decode COMMITTED; stack rebuilt+restarted; AWAITING human photo retry).
 - COMMITS: 0674ad1 fix(filin) decode AWDL chanseq encoding to real channels; 4e91681 fix(filin) pin to active-
   transfer peer channel + master-adoption hysteresis. Tree green: filin 99 tests, clippy clean, release built.
