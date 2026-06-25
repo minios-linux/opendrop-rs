@@ -320,3 +320,57 @@ are dropped, matching owl `awdl_rx_data` (`owl/src/rx.c:361`).
 - Unicast data TX guard gating (`awdl_can_send_unicast_in`) — multicast/data
   TX timing uses the multicast guard; unicast per-peer same-channel gating is
   scaffolded but not yet wired into the data TX path.
+
+---
+
+# RESULT — session 2 (channel hopping + remaining gaps)
+
+Final state: `cargo test -p filin-rs` = **68 passed**,
+`cargo clippy -p filin-rs --all-targets -- -D warnings` clean,
+`cargo build --release -p filin-rs` succeeds.
+
+## Section 7 — Channel hopping + AW-gated TX  (commits a4f99a7, eb7f579)
+
+**Channel sequence adoption**: `AwdlState::sync_channel_sequence` copies the
+elected master's channel sequence (received via the chanseq TLV) into filin's
+own sequence. When the master is lost (peer timeout), filin reverts to the
+static anchor sequence. This makes filin hop between social channels
+(6/44/149) in lockstep with the Apple peer.
+
+**Channel switching**: a new `next_switch_us` timer in `AnnounceScheduler`
+fires at every AW boundary (`next_aw_us`). `AwdlState::update_channel` returns
+`Some(channel)` when a retune is needed; the runtime then calls
+`os::nl80211::set_channel` to retune the monitor interface. This faithfully
+ports owl `awdl_switch_channel` (owl/daemon/core.c:279-308).
+
+**AW-gated data TX**: outbound data frames from awdl0 are buffered in a
+`PendingFrame` (matching owl's `state->next`, owl/daemon/core.c:42) and
+retried when the availability window opens. The gate checks: (1) non-null
+current channel, (2) same channel as destination peer (owl
+`awdl_same_channel_as_peer`), (3) inside the guard-free core (owl
+`awdl_can_send_in`). Uses the 3-TU unicast guard
+(`AWDL_UNICAST_GUARD_TU`).
+
+## Section 1 — A-MSDU data support  (commit 3fa3c69)
+
+`MacHeader` now exposes `qos_control: Option<u16>`. The runtime checks the
+A-MSDU present bit (`IEEE80211_QOS_CTL_A_MSDU_PRESENT`) and dispatches to
+`awdl::decapsulate_amsdu_data_frames` which iterates 14-byte-header subframes
+with 4-byte padding, faithfully porting owl `awdl_rx_data_amsdu`
+(owl/src/rx.c:391-418). Non-A-MSDU frames use the single-frame path.
+`decapsulate_rx_data` now returns `Vec<EthernetFrame>`.
+
+## Section 7b — Unicast same-channel gating  (commit a9753e6)
+
+`schedule::same_channel_as_peer` ports owl `awdl_same_channel_as_peer`
+(owl/src/schedule.c:30-41): compares own channel-sequence slot vs the peer's
+slot. `try_send_data` uses this before injecting unicast data, plus the tighter
+3-TU unicast guard. Frames to peers on a different channel are buffered for
+retry at the next slot.
+
+## Known follow-ups (minor, not peering-blockers)
+- PSF is sent unconditionally (not gated to channel), matching owl (owl sends
+  PSF every psf_interval regardless of channel).
+- Multicast data TX (mDNS broadcasts) is treated like unicast for now. owl has
+  a separate multicast queue with `awdl_is_multicast_eaw` gating; this could be
+  added if the Mac requires multicast-only-on-multicast-EAWs.
