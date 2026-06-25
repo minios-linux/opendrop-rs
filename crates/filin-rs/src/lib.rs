@@ -1213,7 +1213,7 @@ pub mod runtime {
     use std::io::Read;
     use std::os::fd::AsRawFd;
 
-    use crate::{channel, iface::Config, os, rx, sync::TsftBridge};
+    use crate::{awdl, channel, ieee80211, iface::Config, os, rx, sync::TsftBridge};
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Error {
@@ -1248,6 +1248,7 @@ pub mod runtime {
 
     pub fn run(mut links: Links) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
+        let mut tx_seq = 0u16;
         let mut wlan_buf = vec![0u8; 4096];
         let mut tap_buf = vec![0u8; 2048];
 
@@ -1290,9 +1291,35 @@ pub mod runtime {
 
             if fds[1].revents & libc::POLLIN != 0 {
                 let len = links.tap.read(&mut tap_buf).map_err(|_| Error::Io)?;
-                tracing::trace!(len, "rx host tap frame");
+                if len >= 14 {
+                    let dst = mac_from_slice(&tap_buf[0..6]);
+                    let src = mac_from_slice(&tap_buf[6..12]);
+                    match awdl::encapsulate_ethernet_payload(&tap_buf[..len], tx_seq) {
+                        Ok(body) => {
+                            let frame = ieee80211::build_data_frame(
+                                dst,
+                                src,
+                                [0x00, 0x25, 0x00, 0xff, 0x94, 0x73],
+                                tx_seq << 4,
+                                &body,
+                            );
+                            tx_seq = tx_seq.wrapping_add(1);
+                            match links.packet.send(&frame) {
+                                Ok(sent) => tracing::trace!(sent, "injected awdl data frame"),
+                                Err(err) => tracing::trace!(?err, "packet send failed"),
+                            }
+                        }
+                        Err(err) => tracing::trace!(?err, len, "ignored host tap frame"),
+                    }
+                }
             }
         }
+    }
+
+    fn mac_from_slice(bytes: &[u8]) -> [u8; 6] {
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&bytes[..6]);
+        mac
     }
 
     fn host_time_us() -> u64 {
