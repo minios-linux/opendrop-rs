@@ -54,8 +54,14 @@ enum Command {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "luftlift_rs=debug,info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Default: our crate at debug, info elsewhere, but silence the
+                // mdns-sd 0.11 NSEC parse spam ("Invalid incoming DNS message:
+                // NSEC block length must be in the range 1-32: 0") triggered by
+                // other devices' mDNS records on the LAN — not our bug, but it
+                // drowns `luftlift find` output. RUST_LOG still overrides this.
+                "luftlift_rs=debug,info,mdns_sd=off".into()
+            }),
         )
         .init();
 
