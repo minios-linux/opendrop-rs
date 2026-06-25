@@ -18,12 +18,18 @@ use tracing::{error, info, warn};
 
 /// Handle a single HTTP request from `reader`, write the response to `writer`.
 /// Pure (no sockets) — works with in-memory buffers for testing.
+///
+/// If the request carries `Expect: 100-continue`, an interim
+/// `HTTP/1.1 100 Continue` line is written to `writer` *before* the body is
+/// read — mirroring `opendrop-patch/server.py.patched::handle_upload`. Without
+/// this, an Apple sender that waits for the 100 before shipping the body
+/// deadlocks against a server blocked reading the body.
 pub fn handle_one_connection(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     cfg: &ReceiverConfig,
 ) -> Result<HandleResult> {
-    let raw = read_full_request(reader)?;
+    let raw = read_request_respecting_expect(reader, writer)?;
     let req = parse_request(&raw)?;
     let result = handle_post(&req, cfg);
     let response_bytes = format_response(&result.response);
@@ -31,9 +37,42 @@ pub fn handle_one_connection(
     Ok(result)
 }
 
-/// Read a complete HTTP/1.1 request (headers + body) from a `BufRead`.
+/// Read a complete HTTP/1.1 request (headers + body) from a `BufRead`,
+/// without handling `Expect: 100-continue`. Kept for callers/tests that don't
+/// need the interim response.
 pub fn read_full_request(reader: &mut impl BufRead) -> Result<Vec<u8>> {
-    // Read headers until \r\n\r\n
+    let header_bytes = read_headers(reader)?;
+    let body = read_body(reader, &header_bytes)?;
+    let mut full = header_bytes;
+    full.extend_from_slice(&body);
+    Ok(full)
+}
+
+/// Read a complete HTTP/1.1 request. If the headers carry
+/// `Expect: 100-continue`, write `HTTP/1.1 100 Continue\r\n\r\n` to `writer`
+/// **before** reading the body, so a peer waiting on the interim response
+/// ships the body. This is the counterpart to the Python upload handler's
+/// `send_response(100)` branch.
+pub fn read_request_respecting_expect(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+) -> Result<Vec<u8>> {
+    let header_bytes = read_headers(reader)?;
+    let head_str = std::str::from_utf8(&header_bytes).unwrap_or("");
+    if let Some(expect) = parse_header_value(head_str, "expect") {
+        if expect.eq_ignore_ascii_case("100-continue") {
+            writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        }
+    }
+    let body = read_body(reader, &header_bytes)?;
+    let mut full = header_bytes;
+    full.extend_from_slice(&body);
+    Ok(full)
+}
+
+/// Read the HTTP/1.1 header section up to and including the `\r\n\r\n`
+/// terminator. Returns the raw header bytes (including the terminator).
+fn read_headers(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         let mut line = Vec::new();
@@ -49,23 +88,28 @@ pub fn read_full_request(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     if buf.is_empty() {
         anyhow::bail!("connection closed before headers complete");
     }
+    Ok(buf)
+}
 
-    // Determine how much more body to read.
-    let head_str = std::str::from_utf8(&buf).unwrap_or("");
-    let cl = parse_header_value(head_str, "content-length");
-    let te = parse_header_value(head_str, "transfer-encoding");
-
-    if let Some(cl_str) = cl {
+/// Read the body following already-parsed `header_bytes`. Dispatches on
+/// `Content-Length` (exact read) or `Transfer-Encoding: chunked` (raw chunk
+/// framing preserved for downstream `parse_request`).
+fn read_body(reader: &mut impl BufRead, header_bytes: &[u8]) -> Result<Vec<u8>> {
+    let head_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    if let Some(cl_str) = parse_header_value(head_str, "content-length") {
         let len: usize = cl_str.parse().unwrap_or(0);
         let mut body = vec![0u8; len];
         reader.read_exact(&mut body)?;
-        buf.extend_from_slice(&body);
-    } else if let Some(te_str) = te {
+        Ok(body)
+    } else if let Some(te_str) = parse_header_value(head_str, "transfer-encoding") {
         if te_str.to_ascii_lowercase().contains("chunked") {
-            buf.extend_from_slice(&read_chunked_stream(reader)?);
+            Ok(read_chunked_stream(reader)?)
+        } else {
+            Ok(Vec::new())
         }
+    } else {
+        Ok(Vec::new())
     }
-    Ok(buf)
 }
 
 /// Serve forever on the given listener. Each connection is handled in a
@@ -103,9 +147,24 @@ fn handle_tls_connection(
 ) -> Result<()> {
     let conn = rustls::ServerConnection::new(tls_config)?;
     let mut tls = rustls::StreamOwned::new(conn, tcp_stream);
-    // Read the full request first, then write the response (avoids double-borrow of tls).
+    // Read headers, then body. The split lets us emit an interim
+    // `HTTP/1.1 100 Continue` between them when the client sent
+    // `Expect: 100-continue` — without that an Apple sender can deadlock
+    // waiting for the 100 before shipping the body. We write through
+    // `reader.get_mut()` (the underlying `&mut tls`) because `BufReader`
+    // only buffers reads.
     let mut reader = BufReader::new(&mut tls);
-    let raw = read_full_request(&mut reader)?;
+    let header_bytes = read_headers(&mut reader)?;
+    let head_str = std::str::from_utf8(&header_bytes).unwrap_or("");
+    if let Some(expect) = parse_header_value(head_str, "expect") {
+        if expect.eq_ignore_ascii_case("100-continue") {
+            reader.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        }
+    }
+    let body = read_body(&mut reader, &header_bytes)?;
+    let mut raw = header_bytes;
+    raw.extend_from_slice(&body);
+
     let req = parse_request(&raw)?;
     let result = handle_post(&req, &cfg);
     let response_bytes = format_response(&result.response);
@@ -258,5 +317,58 @@ mod tests {
         assert_eq!(result.received_files.len(), 1);
         assert_eq!(result.received_files[0].name, "test.txt");
         assert_eq!(result.received_files[0].bytes, b"hello");
+    }
+
+    #[test]
+    fn handle_connection_sends_100_continue_for_expect() {
+        // A sender that sends Expect: 100-continue must receive an interim
+        // HTTP/1.1 100 Continue before the final response — otherwise the
+        // sender deadlocks waiting for the 100 before shipping the body.
+        // Mirrors opendrop-patch/server.py.patched::handle_upload's
+        // `send_response(100)` branch.
+        use crate::{cpio::build_odc_cpio, dvzip::cpio_to_dvzip};
+        let dvzip = cpio_to_dvzip(&build_odc_cpio(&[("note.txt", b"expect me")]));
+        let request = format!(
+            "POST /Upload HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/x-dvzip\r\n\
+             Content-Length: {}\r\n\
+             Expect: 100-continue\r\n\
+             \r\n",
+            dvzip.len()
+        );
+        let mut raw = request.into_bytes();
+        raw.extend_from_slice(&dvzip);
+
+        let mut reader = Cursor::new(&raw[..]);
+        let mut writer = Vec::new();
+        let result = handle_one_connection(&mut reader, &mut writer, &cfg()).unwrap();
+        assert_eq!(result.response.status, 200);
+        assert_eq!(result.received_files[0].bytes, b"expect me");
+
+        // The writer must contain the interim 100 Continue BEFORE the final
+        // 200 response. The body was still extracted, proving the body read
+        // happened after the 100 was emitted.
+        let out = String::from_utf8_lossy(&writer);
+        let cont_idx = out
+            .find("HTTP/1.1 100 Continue")
+            .expect("interim 100 Continue must be sent");
+        let final_idx = out.find("HTTP/1.1 200").expect("final 200 response must follow");
+        assert!(cont_idx < final_idx, "100 Continue must precede the final response");
+    }
+
+    #[test]
+    fn handle_connection_no_100_continue_without_expect_header() {
+        // Without Expect: 100-continue there must be no interim response.
+        let request = b"POST /Discover HTTP/1.1\r\n\
+                         Host: localhost\r\n\
+                         Content-Length: 0\r\n\
+                         \r\n";
+        let mut reader = Cursor::new(&request[..]);
+        let mut writer = Vec::new();
+        let _ = handle_one_connection(&mut reader, &mut writer, &cfg()).unwrap();
+        let out = String::from_utf8_lossy(&writer);
+        assert!(!out.contains("100 Continue"), "no 100 Continue without Expect header");
+        assert!(out.starts_with("HTTP/1.1 200"));
     }
 }
