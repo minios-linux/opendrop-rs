@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Maximum number of trace events kept in the ring buffer. Older events are
 /// dropped on push. The spec calls for ~2000.
@@ -207,6 +207,68 @@ pub fn normalize_trace_level(level: &str) -> String {
     match l.as_str() {
         "off" | "debug" | "trace" => l,
         _ => "off".into(),
+    }
+}
+
+/// A `tracing` Layer that feeds structured events into the introspect ring
+/// buffer when it's enabled. Off by default — `on_event` re-checks the
+/// atomic flag every time so `POST /trace {"level":"debug"}` flips it on
+/// without rebuilding the subscriber.
+pub struct TraceCollector {
+    pub state: Arc<IntrospectState>,
+}
+
+impl TraceCollector {
+    pub fn new(state: Arc<IntrospectState>) -> Self {
+        Self { state }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for TraceCollector
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        _event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        todo!()
+    }
+}
+
+/// Build a [`TraceEvent`] from a `tracing::Event` by visiting its recorded
+/// fields. Pure (no I/O) so it's unit-testable in isolation.
+pub fn event_to_trace(_event: &tracing::Event<'_>) -> TraceEvent {
+    todo!()
+}
+
+#[derive(Default)]
+struct FieldVisitor {
+    fields: serde_json::Map<String, serde_json::Value>,
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_debug(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &dyn std::fmt::Debug,
+    ) {
+        let formatted = format!("{:?}", value);
+        if field.name() == "message" {
+            self.message = Some(formatted.clone());
+        }
+        self.fields
+            .insert(field.name().to_string(), serde_json::Value::String(formatted));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        }
+        self.fields
+            .insert(field.name().to_string(), serde_json::Value::String(value.to_string()));
     }
 }
 
@@ -447,5 +509,67 @@ mod tests {
             assert!(obj.contains_key(key), "TraceEvent JSON must include {key}");
         }
         assert_eq!(obj["fields"]["peer"], serde_json::json!("fe80::1"));
+    }
+
+    // ---- TraceCollector layer (integration with tracing) ----
+
+    #[test]
+    fn trace_collector_captures_events_only_when_enabled() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+
+        let state = Arc::new(IntrospectState::new());
+        let collector = TraceCollector::new(state.clone());
+        let subscriber = tracing_subscriber::FmtSubscriber::new().with(collector);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // OFF by default — emit two events, expect zero captured.
+            tracing::info!("off message one");
+            tracing::warn!(peer = "fe80::1", "off message two");
+            assert_eq!(state.trace_last_n(0).len(), 0);
+
+            // Flip ON and emit more events.
+            state.set_trace_level("debug");
+            tracing::info!(peer = "10.0.0.1", port = 8771, "Discover request");
+            tracing::warn!("no fields here");
+        });
+
+        let events = state.trace_last_n(0);
+        assert_eq!(events.len(), 2, "only the two post-enable events captured");
+        // Level + target + msg are extracted from event metadata.
+        assert_eq!(events[0].level, "INFO");
+        assert_eq!(events[0].msg, "Discover request");
+        assert_eq!(events[1].level, "WARN");
+        assert_eq!(events[1].msg, "no fields here");
+        // Structured fields survive as JSON.
+        let f0 = events[0].fields.as_object().expect("fields is object");
+        assert_eq!(f0.get("peer").and_then(|v| v.as_str()), Some("10.0.0.1"));
+        let port_v = f0.get("port").expect("port field present");
+        let port_n: i64 = port_v.as_i64().or_else(|| port_v.as_str().and_then(|s| s.parse().ok())).expect("port numeric");
+        assert_eq!(port_n, 8771);
+    }
+
+    #[test]
+    fn trace_collector_uses_target_from_event_metadata() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+
+        let state = Arc::new(IntrospectState::new());
+        let collector = TraceCollector::new(state.clone());
+        let subscriber = tracing_subscriber::FmtSubscriber::new().with(collector);
+
+        tracing::subscriber::with_default(subscriber, || {
+            state.set_trace_level("trace");
+            tracing::info!("hello target");
+        });
+        let events = state.trace_last_n(0);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].target.contains("introspect"),
+            "target was {:?}, expected to contain 'introspect'",
+            events[0].target
+        );
     }
 }
