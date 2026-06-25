@@ -722,6 +722,10 @@ pub mod channel {
         }
     }
 
+    pub fn channel_for_eaw(_sequence: &[u16], _current_eaw: u16) -> Option<u16> {
+        unimplemented!("RED: channel slot selection not implemented yet")
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -731,6 +735,15 @@ pub mod channel {
             assert_eq!(channel_to_frequency_mhz(6), Some(2437));
             assert_eq!(channel_to_frequency_mhz(44), Some(5220));
             assert_eq!(channel_to_frequency_mhz(149), Some(5745));
+        }
+
+        #[test]
+        fn selects_channel_by_eaw_slot() {
+            let sequence = [44, 44, 149, 6, 0, 0, 44, 149, 6, 44, 0, 0, 149, 44, 6, 44];
+
+            assert_eq!(channel_for_eaw(&sequence, 0), Some(44));
+            assert_eq!(channel_for_eaw(&sequence, 2), Some(149));
+            assert_eq!(channel_for_eaw(&sequence, 17), Some(44));
         }
     }
 }
