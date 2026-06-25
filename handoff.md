@@ -90,6 +90,26 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 28 (*** SHARING WORKS — real AirDrop receive validated end-to-end! ***).
+- *** SUCCESS: a real Mac ("Andrew's MacBook Pro") AirDropped files -> owl AWDL link ->
+  luftlift RECEIVED them: FullSizeRender.jpg (333781 B, valid JPEG 1244x1838) + Image
+  21-01-2026.jpeg (188237 B, valid JPEG 990x1150). Upload complete, files saved to
+  /tmp/ldrop, images byte-valid. THE FULL AIRDROP RECEIVE PATH WORKS ON REAL HARDWARE. ***
+- THE UNLOCK = the 100-continue FLUSH fix: server wrote "HTTP/1.1 100 Continue" but didn't
+  flush() through rustls -> Apple sender deadlocked. Adding writer.flush()? fixed it. The
+  running luftlift (pid 1741936) has GLM's working-tree fix baked into the release binary
+  (that's why it works); GLM (pty-3) is finalizing extra Apple-style chunked-Upload tests
+  (89 tests, clippy clean) and WILL COMMIT the flush fix shortly. DO NOT restart luftlift
+  until GLM commits (running binary works; a transient rebuild could regress it).
+- Setup that worked: owl (force-master patched) on carl9170 ch44 (post-reboot, healthy)
+  + luftlift-1741936 receive. Mac AirDrop -> works. (Reduced contention / good RF window.)
+- REMAINING (nice-to-have, not blocking the headline win):
+  - commit GLM's flush fix (pending).
+  - filin multicast-announce TX-gating regression (so the FULL-Rust stack filin+luftlift
+    works, not just owl+luftlift). pty-5/filin idle.
+  - the carl9170 is still marginal (needed a reboot after 12h; better radio = more
+    reliable). Bulk transfers still RF-sensitive but DO complete now.
+--- PRIOR cycle-27 below ---
 Last updated: cycle 27 (RADIO RECOVERED + stack up; GLM FOUND the /Upload bug = missing flush!).
 - *** RADIO RECOVERED *** (human rebooted; carl9170 healthy: monitor ch44 UP, RX works,
   no -110). Stack RUNNING on pty-7: owl(force-master) pid 1741917 peering (3280+ frames,
