@@ -127,16 +127,79 @@ pub fn format_response(resp: &HttpResponse) -> Vec<u8> {
 /// Auto-adds a `Content-Length` header unless a `Transfer-Encoding` is set.
 /// Used by the AirDrop *sender* to serialise POST requests onto the TLS stream.
 pub fn format_request(req: &HttpRequest) -> Vec<u8> {
-    let _ = req;
-    Vec::new()
+    let mut out = Vec::new();
+    let line = format!("{} {} HTTP/1.1\r\n", req.method, req.path);
+    out.extend_from_slice(line.as_bytes());
+
+    let has_te = req.headers.keys().any(|k| k.eq_ignore_ascii_case("transfer-encoding"));
+    for (k, v) in &req.headers {
+        out.extend_from_slice(format!("{}: {}\r\n", title_case_header(k), v).as_bytes());
+    }
+    if !has_te {
+        out.extend_from_slice(format!("Content-Length: {}\r\n", req.body.len()).as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&req.body);
+    out
+}
+
+/// Canonical HTTP header casing: "content-type" -> "Content-Type".
+fn title_case_header(name: &str) -> String {
+    name.split('-')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// Parse an HTTP/1.1 response from raw bytes (status line + headers + body).
 /// Only reads a `Content-Length`-delimited body (AirDrop responses are small
 /// binary plists sent with Content-Length). Returns the status, headers, body.
 pub fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
-    let _ = raw;
-    Err(HttpError::BadRequestLine)
+    let sep = find_subslice(raw, b"\r\n\r\n").ok_or(HttpError::NoHeaderTerminator)?;
+    let head = std::str::from_utf8(&raw[..sep]).map_err(|_| HttpError::BadRequestLine)?;
+    let body_start = sep + 4;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().ok_or(HttpError::BadRequestLine)?;
+    // "HTTP/1.1 200 OK"
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or(HttpError::BadRequestLine)?
+        .parse()
+        .map_err(|_| HttpError::BadRequestLine)?;
+
+    let mut headers = Vec::new();
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (k, v) = line.split_once(':').ok_or_else(|| HttpError::BadHeaderLine(line.into()))?;
+        let key = k.trim();
+        let val = v.trim();
+        if key.eq_ignore_ascii_case("content-length") {
+            content_length = Some(val.parse().unwrap_or(0));
+        }
+        headers.push((key.to_string(), val.to_string()));
+    }
+
+    let body = match content_length {
+        Some(n) => {
+            if body_start + n > raw.len() {
+                return Err(HttpError::Body("response body shorter than Content-Length".into()));
+            }
+            raw[body_start..body_start + n].to_vec()
+        }
+        None => Vec::new(),
+    };
+
+    Ok(HttpResponse { status, body, headers })
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
