@@ -4316,6 +4316,62 @@ pub mod state {
         pub sync_addr_changed: bool,
     }
 
+    /// A pending change to the system IPv6 neighbor table, surfaced by
+    /// [`NeighborTable`]. The runtime applies these via `os::rtnl::neighbor_*`
+    /// (RTM_NEWNEIGH / RTM_DELNEIGH). FILIN_NEIGHBOR_TABLE.md.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum NeighborChange {
+        /// Add/refresh `{ipv6, mac}` on the host interface.
+        Add([u8; 6], [u8; 16]),
+        /// Remove the entry for this ipv6 (peer evicted).
+        Remove([u8; 6], [u8; 16]),
+        /// No change needed (mapping already present / absent).
+        NoChange,
+    }
+
+    /// Tracks which peer MAC→IPv6 mappings filin has installed in the system
+    /// neighbor table, so it only issues netlink calls on actual changes (not
+    /// on every received frame). FILIN_NEIGHBOR_TABLE.md. AWDL does NOT use
+    /// NDP; instead, on each received action frame the peer's link-local IPv6
+    /// is derived from its source MAC (RFC 4291 modified EUI-64) and a static
+    /// neighbor entry created. Without this, all unicast awdl0 connections
+    /// fail with "No route to host" and AirDrop's /Discover never completes.
+    #[derive(Debug, Default)]
+    pub struct NeighborTable {
+        known: std::collections::BTreeSet<[u8; 6]>,
+    }
+
+    impl NeighborTable {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Record that `mac` was just seen. Returns [`NeighborChange::Add`]
+        /// the first time a MAC is sighted, [`NeighborChange::NoChange`] on
+        /// subsequent sightings (no table churn).
+        pub fn note_peer_seen(&mut self, mac: &[u8; 6]) -> NeighborChange {
+            if self.known.contains(mac) {
+                return NeighborChange::NoChange;
+            }
+            self.known.insert(*mac);
+            NeighborChange::Add(*mac, crate::awdl::link_local_ipv6(*mac))
+        }
+
+        /// Evict every known MAC that is NOT in `live_macs` (the peer table
+        /// after a clean pass). Returns one [`NeighborChange::Remove`] per
+        /// evicted MAC.
+        pub fn evict_stale(&mut self, live_macs: &[[u8; 6]]) -> Vec<NeighborChange> {
+            let live: std::collections::BTreeSet<[u8; 6]> = live_macs.iter().copied().collect();
+            let to_remove: Vec<[u8; 6]> = self.known.difference(&live).copied().collect();
+            let mut out = Vec::with_capacity(to_remove.len());
+            for mac in to_remove {
+                self.known.remove(&mac);
+                out.push(NeighborChange::Remove(mac, crate::awdl::link_local_ipv6(mac)));
+            }
+            out
+        }
+    }
+
     /// owl `awdl_handle_election_params_tlv` (owl/src/rx.c:111-131).
     fn apply_election_v1(peer: &mut Peer, value: &[u8]) {
         if let Ok(e) = awdl::parse_election_parameters(value) {
@@ -4978,14 +5034,15 @@ pub mod state {
             table.note_peer_seen(&mac_a);
             table.note_peer_seen(&mac_b);
 
-            // Evicting a MAC that was present → Remove.
-            let removed = table.evict_stale(&[mac_a]);
+            // mac_a is no longer live (only mac_b in the live set) → mac_a
+            // is evicted; mac_b stays.
+            let removed = table.evict_stale(&[mac_b]);
             assert_eq!(
                 removed,
                 vec![NeighborChange::Remove(mac_a, awdl::link_local_ipv6(mac_a))]
             );
-            // Evicting a MAC not in the table → nothing.
-            let removed = table.evict_stale(&[mac_a]);
+            // Evicting when the only known MAC (mac_b) is still live → nothing.
+            let removed = table.evict_stale(&[mac_b]);
             assert!(removed.is_empty());
             // mac_b still in the table.
             assert_eq!(table.note_peer_seen(&mac_b), NeighborChange::NoChange);
