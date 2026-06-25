@@ -1008,3 +1008,41 @@ pub mod rx {
         }
     }
 }
+
+pub mod cli {
+    use crate::iface;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum CliError {
+        Invalid,
+    }
+
+    pub fn parse_config_from<I, S>(_args: I) -> Result<iface::Config, CliError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Err(CliError::Invalid)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_owl_compatible_interface_flags() {
+            let config = parse_config_from(["filin", "-i", "wlan0mon", "-c", "44", "-h", "awdl0", "-N"])
+                .expect("valid CLI args");
+
+            assert_eq!(
+                config,
+                iface::Config {
+                    monitor_iface: "wlan0mon".into(),
+                    host_iface: "awdl0".into(),
+                    anchor_channel: 44,
+                    assume_monitor: true,
+                }
+            );
+        }
+    }
+}
