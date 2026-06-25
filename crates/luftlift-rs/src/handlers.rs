@@ -8,7 +8,7 @@ use crate::cpio::read_odc_cpio;
 use crate::dvzip::dvzip_to_cpio;
 use crate::http::{HttpRequest, HttpResponse};
 use crate::plist_impl::{ReceiverConfig, build_ask_response, build_discover_response, parse_ask_request};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// A file extracted from an `/Upload` body.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,17 +28,78 @@ pub struct HandleResult {
 /// Route a POST request to the matching AirDrop handler. Returns a 404
 /// [`HttpResponse`] for unknown paths.
 pub fn handle_post(req: &HttpRequest, cfg: &ReceiverConfig) -> HandleResult {
-    let _ = (req, cfg);
-    HandleResult { response: HttpResponse::new(404), received_files: Vec::new() }
+    match req.path.as_str() {
+        "/Discover" => handle_discover(req, cfg),
+        "/Ask" => handle_ask(req, cfg),
+        "/Upload" => handle_upload(req),
+        path => {
+            warn!(path, "unknown POST path");
+            HandleResult { response: HttpResponse::new(404), received_files: Vec::new() }
+        }
+    }
 }
-
-// ---- Upload body decoder (pure, reused by tests + handler) -----
 
 /// Decode an Upload body (dvzip or raw CPIO) into extracted file entries.
 /// Returns the list of (name, bytes) found in the archive.
 pub fn decode_upload_body(content_type: &str, body: &[u8]) -> Vec<ReceivedFile> {
-    let _ = (content_type, body);
-    Vec::new()
+    let ct = content_type.to_ascii_lowercase();
+    let cpio_bytes: Vec<u8> = if ct == "application/x-dvzip" {
+        dvzip_to_cpio(body)
+    } else {
+        body.to_vec()
+    };
+    read_odc_cpio(&cpio_bytes)
+        .into_iter()
+        .map(|e| ReceivedFile { name: e.name, bytes: e.data.to_vec() })
+        .collect()
+}
+
+fn handle_discover(_req: &HttpRequest, cfg: &ReceiverConfig) -> HandleResult {
+    info!("Discover request — appearing in sender picker");
+    let mut resp = HttpResponse::new(200);
+    resp.headers.push(("Content-Type".into(), "application/x-apple-plist".into()));
+    resp.body = build_discover_response(cfg);
+    HandleResult { response: resp, received_files: Vec::new() }
+}
+
+fn handle_ask(req: &HttpRequest, cfg: &ReceiverConfig) -> HandleResult {
+    let ask = parse_ask_request(&req.body);
+    match &ask {
+        Ok(a) => info!(
+            transfer_id = %a.transfer_id,
+            transfer_type = %a.transfer_type,
+            sender = %a.sender_computer_name,
+            file_count = a.files.len(),
+            "Ask request — auto-accepting"
+        ),
+        Err(e) => warn!(error = %e, "failed to parse Ask body"),
+    }
+    let mut resp = HttpResponse::new(200);
+    resp.headers.push(("Content-Type".into(), "application/x-apple-plist".into()));
+    resp.body = build_ask_response(cfg);
+    HandleResult { response: resp, received_files: Vec::new() }
+}
+
+fn handle_upload(req: &HttpRequest) -> HandleResult {
+    let ctype = req.header("content-type").unwrap_or("");
+    if !ctype.eq_ignore_ascii_case("application/x-dvzip")
+        && !ctype.eq_ignore_ascii_case("application/x-cpio")
+    {
+        warn!(content_type = ctype, "unsupported Upload content-type");
+        let mut resp = HttpResponse::new(406);
+        resp.headers.push(("Connection".into(), "close".into()));
+        return HandleResult { response: resp, received_files: Vec::new() };
+    }
+
+    let files = decode_upload_body(ctype, &req.body);
+    for f in &files {
+        info!(file = %f.name, bytes = f.bytes.len(), "received file");
+    }
+    info!(count = files.len(), "Upload complete");
+
+    let mut resp = HttpResponse::new(200);
+    resp.headers.push(("Connection".into(), "close".into()));
+    HandleResult { response: resp, received_files: files }
 }
 
 #[cfg(test)]
