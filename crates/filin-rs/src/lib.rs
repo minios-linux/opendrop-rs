@@ -191,3 +191,55 @@ pub mod ieee80211 {
         }
     }
 }
+
+pub mod awdl {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ActionSubtype {
+        Psf,
+        Mif,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ActionFrame<'a> {
+        pub subtype: ActionSubtype,
+        pub phy_tx: u32,
+        pub target_tx: u32,
+        pub tlvs: &'a [u8],
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ParseError {
+        Unsupported,
+    }
+
+    pub fn parse_action_frame(_body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
+        Err(ParseError::Unsupported)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_psf_vendor_action_header() {
+            let body = [
+                0x7f, // vendor-specific action category
+                0x00, 0x17, 0xf2, // Apple OUI
+                0x08, // AWDL type
+                0x10, // AWDL version 1.0
+                0x00, // PSF subtype
+                0x00, // reserved
+                0x44, 0x33, 0x22, 0x11, // phy_tx
+                0x88, 0x77, 0x66, 0x55, // target_tx
+                0x04, 0x02, 0x00, 0xaa, 0xbb, // first TLV
+            ];
+
+            let parsed = parse_action_frame(&body).expect("valid AWDL PSF action frame");
+
+            assert_eq!(parsed.subtype, ActionSubtype::Psf);
+            assert_eq!(parsed.phy_tx, 0x1122_3344);
+            assert_eq!(parsed.target_tx, 0x5566_7788);
+            assert_eq!(parsed.tlvs, &[0x04, 0x02, 0x00, 0xaa, 0xbb]);
+        }
+    }
+}
