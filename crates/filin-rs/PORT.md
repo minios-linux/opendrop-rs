@@ -124,13 +124,27 @@ apparent churn is re-PARENTING among peers sharing one `master_addr`.
   the re-parenting channel thrash entirely. AW timing is kept so announces still
   transmit during availability windows. Default remains the hopping mode.
 
-**Re-parent hysteresis keyed on master_addr** (Part B):
-- In `sync_channel_sequence`, when the election winner is a different peer but
-  reports the SAME `master_addr` as the current committed parent (and that
-  parent is still alive), filin does NOT re-parent — it rides through the
-  intra-cluster churn. Only a real `master_addr` change or the current parent
-  going stale allows a re-sync. Cross-cluster switches still go through the
-  existing Bug B debounce (`MASTER_DEBOUNCE_US`).
+**Re-parent hysteresis**: the same-cluster re-parent guard was removed (it
+froze the channel sequence and broke channel surfing, causing peer_count=0).
+The existing Bug B debounce (`MASTER_DEBOUNCE_US`) handles single-frame
+flip-flops. Use park mode (`--park`) for cluster-churn stability.
+
+## IPv6 neighbor table population (FILIN_NEIGHBOR_TABLE.md)
+**Likely THE root cause of AirDrop discovery failing past mDNS.** AWDL does
+NOT use NDP. A node must derive each peer's link-local IPv6 from the source
+MAC (RFC 4291 modified EUI-64) and install a static neighbor entry so unicast
+awdl0 connections work. Without it, the Mac's `curl https://[our-v6]:8771/`
+fails with "No route to host" and AirDrop never completes past mDNS.
+
+- `awdl::link_local_ipv6(mac)` — pure RFC 4291 derivation (`fe80::(mac0 ^ 0x02):mac1:mac2:ff:fe:mac3:mac4:mac5`). Matches owl's `rfc4291_addr`.
+- `state::NeighborTable` — dedup tracker: `note_peer_seen` returns `Add` the
+  first time a MAC is sighted (then `NoChange`); `evict_stale(live)` returns
+  `Remove` per evicted MAC. No netlink churn on re-frames.
+- `os::rtnl::add_neighbor` / `remove_neighbor` — RTM_NEWNEIGH (NUD_PERMANENT)
+  / RTM_DELNEIGH over NETLINK_ROUTE. Mirrors owl's `neighbor_add_rfc4291` but
+  uses rtnetlink directly (owl shelled out to `ndp` on macOS).
+- Wired into the hot loop: add on every parsed action frame, remove on
+  `clean_peers` eviction. Errors are logged (warn) but non-fatal.
 
 Coordinate with Claude (orchestrator) for: workspace dep additions, the awdl0
 contract, and anything that would touch shared files. Keep all your code under
