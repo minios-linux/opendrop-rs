@@ -3771,11 +3771,25 @@ pub mod cli {
                 assume_monitor: true,
                 pcap_path: None,
                 http_addr: Some(non_loopback),
+                park: false,
             };
             assert_eq!(
                 iface::validate_config(bad),
                 Err(iface::ConfigError::NonLoopbackHttpAddr(non_loopback))
             );
+        }
+
+        #[test]
+        fn park_flag_defaults_off() {
+            let config = parse_config_from(["filin", "-i", "wlan0mon"]).expect("valid");
+            assert!(!config.park, "park defaults off — hopping is the default");
+        }
+
+        #[test]
+        fn park_flag_opts_into_single_channel_mode() {
+            let config =
+                parse_config_from(["filin", "-i", "wlan0mon", "--park"]).expect("valid");
+            assert!(config.park, "--park enables single-channel park mode");
         }
     }
 }
