@@ -5527,6 +5527,7 @@ pub mod runtime {
             master_anchor: state.master_anchor,
             tsf_offset_us,
             master_age_ms: now_us.saturating_sub(state.master_adopted_at_us) / 1_000,
+            sync_addr_mac: crate::introspect::mac_string(state.election.sync_addr),
         }
     }
 
@@ -6647,6 +6648,13 @@ pub mod introspect {
         /// FILIN_SYNC_QUALITY.md Part A: how many times the committed master
         /// MAC changed. Bumped once per real switch.
         master_changes: AtomicU64,
+        /// How many times the cluster TOP master (election.master_addr)
+        /// changed — the signal of true cluster churn, as opposed to
+        /// re-parenting (sync_addr) among peers sharing one top master.
+        master_addr_changes: AtomicU64,
+        /// How many times our direct PARENT (election.sync_addr) changed.
+        /// High relative to master_addr_changes = re-parenting churn.
+        sync_addr_changes: AtomicU64,
         /// Availability-window alignment samples: aligned vs total. Bumped on
         /// each sync update from the elected master; `pct = aligned/total`.
         aw_aligned: AtomicU64,
@@ -6684,6 +6692,12 @@ pub mod introspect {
         /// Milliseconds since the current master was adopted. Grows while we
         /// hold one master; resets on each switch. Large + growing = stable.
         pub master_age_ms: u64,
+        /// Our direct PARENT's MAC (election.sync_addr) — the peer we
+        /// currently sync to. Distinct from `master_mac` (the cluster's top
+        /// master_addr). Exposed so live debugging can tell re-parenting
+        /// churn (sync_addr flips) from real cluster churn (master_addr
+        /// flips). FILIN_SYNC_QUALITY.md refinement.
+        pub sync_addr_mac: String,
     }
 
     /// Capacity of the trace ring buffer (FILIN_HTTP_INTROSPECT.md: ~2000).
@@ -7027,6 +7041,9 @@ pub mod introspect {
             master_changes: u64,
             aw_alignment_pct: u8,
             last_master_macs: Vec<String>,
+            sync_addr_mac: String,
+            master_addr_changes: u64,
+            sync_addr_changes: u64,
         }
         Response::json(
             200,
@@ -7045,6 +7062,9 @@ pub mod introspect {
                 master_changes: intro.counters.master_changes(),
                 aw_alignment_pct: intro.counters.aw_alignment_pct(),
                 last_master_macs: intro.counters.last_master_macs(),
+                sync_addr_mac: snapshot.sync_addr_mac,
+                master_addr_changes: intro.counters.master_addr_changes(),
+                sync_addr_changes: intro.counters.sync_addr_changes(),
             },
         )
     }
@@ -7317,6 +7337,8 @@ pub mod introspect {
                 mdns_rx_other: AtomicU64::new(0),
                 rebroadcast: std::sync::Mutex::new(std::collections::BTreeMap::new()),
                 master_changes: AtomicU64::new(0),
+                master_addr_changes: AtomicU64::new(0),
+                sync_addr_changes: AtomicU64::new(0),
                 aw_aligned: AtomicU64::new(0),
                 aw_total: AtomicU64::new(0),
                 last_master_macs: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -7368,6 +7390,24 @@ pub mod introspect {
 
         pub fn master_changes(&self) -> u64 {
             self.master_changes.load(Ordering::Relaxed)
+        }
+
+        /// Bump the cluster-top-master (master_addr) change counter.
+        pub fn inc_master_addr_change(&self) {
+            self.master_addr_changes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn master_addr_changes(&self) -> u64 {
+            self.master_addr_changes.load(Ordering::Relaxed)
+        }
+
+        /// Bump the parent (sync_addr) change counter.
+        pub fn inc_sync_addr_change(&self) {
+            self.sync_addr_changes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn sync_addr_changes(&self) -> u64 {
+            self.sync_addr_changes.load(Ordering::Relaxed)
         }
 
         /// Append a master MAC string to the recent-masters ring; the oldest
@@ -7612,6 +7652,7 @@ pub mod introspect {
                 master_anchor: 0,
                 tsf_offset_us: 0,
                 master_age_ms: 0,
+                sync_addr_mac: "02:00:00:00:00:01".into(),
             };
             intro.set_status(snapshot.clone());
 
@@ -7634,6 +7675,7 @@ pub mod introspect {
                 master_anchor: 0,
                 tsf_offset_us: 0,
                 master_age_ms: 0,
+                sync_addr_mac: mac_string([0x02, 0, 0, 0, 0, 1]),
             });
 
             assert_eq!(intro.counters.mdns_rx_other(), 1);
@@ -7866,6 +7908,7 @@ pub mod introspect {
                 master_anchor: 0,
                 tsf_offset_us: 800,
                 master_age_ms: 3200,
+                sync_addr_mac: mac_string([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
             });
             intro.counters.inc_mdns_rx_self();
             intro.counters.inc_mdns_rx_self();
@@ -8106,6 +8149,7 @@ pub mod introspect {
                 master_anchor: 0,
                 tsf_offset_us: 0,
                 master_age_ms: 0,
+                sync_addr_mac: "02:aa:bb:cc:dd:ee".into(),
             });
             intro.counters.inc_mdns_rx_other();
             intro.counters.inc_rebroadcast(44);
