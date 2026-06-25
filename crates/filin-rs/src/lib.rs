@@ -13,7 +13,6 @@ pub mod radiotap {
         TooShort,
         UnsupportedVersion(u8),
         InvalidLength { header_len: usize, frame_len: usize },
-        ExtendedPresentBitmap,
         UnsupportedField(u8),
     }
 
@@ -33,39 +32,45 @@ pub mod radiotap {
             });
         }
 
-        let present = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
-        if present & (1 << 31) != 0 {
-            return Err(RadiotapError::ExtendedPresentBitmap);
+        let mut offset = 4;
+        let mut present_words = Vec::new();
+        loop {
+            let word = read_field::<4>(frame, header_len, offset)?;
+            let present = u32::from_le_bytes(word);
+            present_words.push(present);
+            offset += 4;
+            if present & (1 << 31) == 0 {
+                break;
+            }
         }
 
-        let mut offset = 8;
         let mut tsft = None;
         let mut flags = None;
         let mut antenna_signal_dbm = None;
 
-        for bit in 0..32 {
-            if present & (1 << bit) == 0 {
-                continue;
-            }
+        for (word_index, present) in present_words.into_iter().enumerate() {
+            for bit in 0..31 {
+                if present & (1 << bit) == 0 {
+                    continue;
+                }
 
-            match bit {
-                0 => {
-                    offset = align(offset, 8);
-                    let bytes = read_field::<8>(frame, header_len, offset)?;
-                    tsft = Some(u64::from_le_bytes(bytes));
-                    offset += 8;
+                let field = field_layout(word_index, bit)
+                    .ok_or(RadiotapError::UnsupportedField((word_index * 32 + bit) as u8))?;
+                offset = align(offset, field.align);
+                let bytes = read_slice(frame, header_len, offset, field.size)?;
+
+                match (word_index, bit) {
+                    (0, 0) => {
+                        tsft = Some(u64::from_le_bytes(
+                            bytes.try_into().expect("TSFT length is 8 bytes"),
+                        ));
+                    }
+                    (0, 1) => flags = Some(bytes[0]),
+                    (0, 5) => antenna_signal_dbm = Some(bytes[0] as i8),
+                    _ => {}
                 }
-                1 => {
-                    let bytes = read_field::<1>(frame, header_len, offset)?;
-                    flags = Some(bytes[0]);
-                    offset += 1;
-                }
-                5 => {
-                    let bytes = read_field::<1>(frame, header_len, offset)?;
-                    antenna_signal_dbm = Some(bytes[0] as i8);
-                    offset += 1;
-                }
-                _ => return Err(RadiotapError::UnsupportedField(bit)),
+
+                offset += field.size;
             }
         }
 
@@ -83,17 +88,66 @@ pub mod radiotap {
         (offset + alignment - 1) & !(alignment - 1)
     }
 
+    #[derive(Clone, Copy)]
+    struct FieldLayout {
+        align: usize,
+        size: usize,
+    }
+
+    fn field_layout(word_index: usize, bit: usize) -> Option<FieldLayout> {
+        if word_index != 0 {
+            return None;
+        }
+
+        let layout = match bit {
+            0 => FieldLayout { align: 8, size: 8 },  // TSFT
+            1 => FieldLayout { align: 1, size: 1 },  // flags
+            2 => FieldLayout { align: 1, size: 1 },  // rate
+            3 => FieldLayout { align: 2, size: 4 },  // channel
+            4 => FieldLayout { align: 2, size: 2 },  // FHSS
+            5 => FieldLayout { align: 1, size: 1 },  // dBm antenna signal
+            6 => FieldLayout { align: 1, size: 1 },  // dBm antenna noise
+            7 => FieldLayout { align: 2, size: 2 },  // lock quality
+            8 => FieldLayout { align: 2, size: 2 },  // TX attenuation
+            9 => FieldLayout { align: 2, size: 2 },  // dB TX attenuation
+            10 => FieldLayout { align: 1, size: 1 }, // dBm TX power
+            11 => FieldLayout { align: 1, size: 1 }, // antenna
+            12 => FieldLayout { align: 1, size: 1 }, // dB antenna signal
+            13 => FieldLayout { align: 1, size: 1 }, // dB antenna noise
+            14 => FieldLayout { align: 2, size: 2 }, // RX flags
+            15 => FieldLayout { align: 2, size: 2 }, // TX flags
+            16 => FieldLayout { align: 1, size: 1 }, // RTS retries
+            17 => FieldLayout { align: 1, size: 1 }, // data retries
+            19 => FieldLayout { align: 1, size: 3 }, // MCS
+            20 => FieldLayout { align: 4, size: 8 }, // A-MPDU status
+            21 => FieldLayout { align: 2, size: 12 }, // VHT
+            22 => FieldLayout { align: 8, size: 12 }, // timestamp
+            29 | 30 => return None, // namespace switches are not data fields
+            _ => return None,
+        };
+        Some(layout)
+    }
+
     fn read_field<const N: usize>(
         frame: &[u8],
         header_len: usize,
         offset: usize,
     ) -> Result<[u8; N], RadiotapError> {
-        let end = offset.checked_add(N).ok_or(RadiotapError::TooShort)?;
-        let bytes = frame
+        let bytes = read_slice(frame, header_len, offset, N)?;
+        Ok(bytes.try_into().expect("slice length matches field length"))
+    }
+
+    fn read_slice(
+        frame: &[u8],
+        header_len: usize,
+        offset: usize,
+        size: usize,
+    ) -> Result<&[u8], RadiotapError> {
+        let end = offset.checked_add(size).ok_or(RadiotapError::TooShort)?;
+        frame
             .get(offset..end)
             .filter(|_| end <= header_len)
-            .ok_or(RadiotapError::TooShort)?;
-        Ok(bytes.try_into().expect("slice length matches field length"))
+            .ok_or(RadiotapError::TooShort)
     }
 
     #[cfg(test)]
