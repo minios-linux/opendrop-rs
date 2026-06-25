@@ -6302,6 +6302,146 @@ pub mod introspect {
         None
     }
 
+    /// Parsed HTTP request line. `path` excludes the query string.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ParsedRequestLine<'a> {
+        pub method: &'a str,
+        pub path: &'a str,
+        pub query: &'a str,
+    }
+
+    /// Parse an HTTP request line like `GET /trace?n=300 HTTP/1.1\r\n`.
+    /// Returns `None` if the line doesn't have at least `METHOD TARGET` tokens.
+    pub fn parse_request_line(line: &str) -> Option<ParsedRequestLine<'_>> {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let mut parts = trimmed.split_whitespace();
+        let method = parts.next()?;
+        let target = parts.next()?;
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        Some(ParsedRequestLine { method, path, query })
+    }
+
+    /// Reason phrase for the few status codes this minimal server emits.
+    fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            _ => "OK",
+        }
+    }
+
+    /// Serialize a [`Response`] as a complete HTTP/1.1 message (status line +
+    /// headers + blank line + body). `Connection: close` so the client reads
+    /// the body until EOF — no chunked encoding or keep-alive to worry about.
+    pub fn format_response(resp: &Response) -> Vec<u8> {
+        let reason = reason_phrase(resp.status);
+        let head = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+            status = resp.status,
+            ct = resp.content_type,
+            len = resp.body.len(),
+        );
+        let mut out = Vec::with_capacity(head.len() + resp.body.len());
+        out.extend_from_slice(head.as_bytes());
+        out.extend_from_slice(&resp.body);
+        out
+    }
+
+    /// Serve introspection requests on a dedicated thread. The `listener` is
+    /// supplied (not bound here) so the caller can pick an ephemeral port in
+    /// tests via `TcpListener::bind("127.0.0.1:0")` + `local_addr()`. Bind to
+    /// `127.0.0.1` only — never expose this off-box (the peer-address check
+    /// below is defense-in-depth).
+    pub fn spawn(
+        intro: Arc<Introspection>,
+        listener: std::net::TcpListener,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
+            .name("filin-introspect".into())
+            .spawn(move || serve_loop(intro, listener))
+            .expect("spawn filin-introspect thread")
+    }
+
+    fn serve_loop(intro: Arc<Introspection>, listener: std::net::TcpListener) {
+        for stream in listener.incoming() {
+            let stream = match stream {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::trace!(?err, "introspection accept failed");
+                    continue;
+                }
+            };
+            // Defense-in-depth: never reply to non-loopback peers.
+            let is_loopback = stream
+                .peer_addr()
+                .map(|a| a.ip().is_loopback())
+                .unwrap_or(false);
+            if !is_loopback {
+                continue;
+            }
+            if let Err(err) = handle_connection(&intro, stream) {
+                tracing::trace!(?err, "introspection connection ended");
+            }
+        }
+    }
+
+    fn handle_connection(
+        intro: &Introspection,
+        mut stream: std::net::TcpStream,
+    ) -> std::io::Result<()> {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let mut reader = BufReader::new(&mut stream);
+
+        // Request line: "METHOD TARGET HTTP/1.x"
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line)? == 0 {
+            return Ok(()); // empty connection
+        }
+        let Some(parsed) = parse_request_line(&request_line) else {
+            stream.write_all(&format_response(&Response::text(400, "bad request")))?;
+            return Ok(());
+        };
+
+        // Headers: read until blank line, pick out Content-Length.
+        let mut content_length: usize = 0;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                break;
+            }
+            let trimmed = header.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+
+        // Body (only POST /trace uses this, and it's tiny).
+        let mut body = Vec::new();
+        if content_length > 0 {
+            body.resize(content_length, 0u8);
+            reader.read_exact(&mut body)?;
+        }
+
+        let response = route(
+            intro,
+            &Request {
+                method: parsed.method,
+                path: parsed.path,
+                query: parsed.query,
+                body: &body,
+            },
+        );
+        stream.write_all(&format_response(&response))?;
+        Ok(())
+    }
+
     /// Aggregate introspection state, shared (via `Arc`) between the AF_PACKET
     /// hot loop, the optional `TraceLayer`, and the HTTP server thread.
     pub struct Introspection {
@@ -6930,7 +7070,7 @@ pub mod introspect {
 
             assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
             assert!(text.contains("Content-Type: application/json\r\n"));
-            assert!(text.contains("Content-Length: 7\r\n"));
+            assert!(text.contains("Content-Length: 8\r\n"));
             assert!(text.contains("Connection: close\r\n"));
             assert!(text.ends_with("{\"ok\":1}"));
         }
