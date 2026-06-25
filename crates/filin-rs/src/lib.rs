@@ -491,10 +491,32 @@ pub mod election {
     }
 
     pub fn choose_sync_master(
-        _local: &ElectionState,
-        _peers: &[ElectionState],
+        local: &ElectionState,
+        peers: &[ElectionState],
     ) -> ElectionState {
-        unimplemented!("RED: election selection not implemented yet")
+        let mut selected = local.clone();
+
+        for peer in peers {
+            if compare_master(peer, &selected).is_gt() {
+                selected = ElectionState {
+                    self_addr: local.self_addr,
+                    sync_addr: peer.self_addr,
+                    master_addr: peer.master_addr,
+                    master_counter: peer.master_counter,
+                    master_metric: peer.master_metric,
+                    self_metric: local.self_metric,
+                    height: peer.height + 1,
+                };
+            }
+        }
+
+        selected
+    }
+
+    fn compare_master(a: &ElectionState, b: &ElectionState) -> std::cmp::Ordering {
+        a.master_counter
+            .cmp(&b.master_counter)
+            .then_with(|| a.master_metric.cmp(&b.master_metric))
     }
 
     #[cfg(test)]
