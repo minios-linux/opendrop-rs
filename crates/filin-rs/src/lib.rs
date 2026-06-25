@@ -5983,5 +5983,70 @@ pub mod introspect {
 
             assert_eq!(c.rebroadcast_pairs(), vec![(6, 1), (44, 0), (149, 2)]);
         }
+
+        #[test]
+        fn status_snapshot_serializes_to_required_json_keys() {
+            let snapshot = StatusSnapshot {
+                current_channel: 44,
+                master_mac: mac_string([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                master_seq: 7,
+                synced: true,
+                peer_count: 2,
+            };
+
+            let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
+            let obj = json.as_object().expect("snapshot is a JSON object");
+
+            assert_eq!(obj.get("current_channel").and_then(|v| v.as_u64()), Some(44));
+            assert_eq!(
+                obj.get("master_mac").and_then(|v| v.as_str()),
+                Some("02:aa:bb:cc:dd:ee")
+            );
+            assert_eq!(obj.get("master_seq").and_then(|v| v.as_u64()), Some(7));
+            assert_eq!(obj.get("synced").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(obj.get("peer_count").and_then(|v| v.as_u64()), Some(2));
+            // The counter-backed fields live on Counters, not the snapshot —
+            // they are merged into /status at response time, so they must NOT
+            // be part of the snapshot's own JSON shape.
+            assert!(
+                !obj.contains_key("rebroadcast_counts"),
+                "rebroadcast_counts belong to Counters, not the snapshot"
+            );
+        }
+
+        #[test]
+        fn introspection_round_trips_status_through_rwlock() {
+            let intro = Introspection::new();
+            let snapshot = StatusSnapshot {
+                current_channel: 149,
+                master_mac: "02:00:00:00:00:01".into(),
+                master_seq: 42,
+                synced: false,
+                peer_count: 1,
+            };
+            intro.set_status(snapshot.clone());
+
+            assert_eq!(intro.status(), snapshot);
+        }
+
+        #[test]
+        fn introspection_shares_counters_and_status_behind_one_arc() {
+            // The runtime holds Introspection as a single Arc and bumps
+            // counters on the hot path while refreshing status less often.
+            let intro = Introspection::new();
+            intro.counters.inc_mdns_rx_other();
+            intro.counters.inc_rebroadcast(6);
+            intro.set_status(StatusSnapshot {
+                current_channel: 6,
+                master_mac: mac_string([0x02, 0, 0, 0, 0, 1]),
+                master_seq: 3,
+                synced: true,
+                peer_count: 4,
+            });
+
+            assert_eq!(intro.counters.mdns_rx_other(), 1);
+            assert_eq!(intro.counters.rebroadcast_for(6), 1);
+            assert_eq!(intro.status().peer_count, 4);
+        }
     }
 }
