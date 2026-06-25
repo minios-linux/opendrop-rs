@@ -1248,6 +1248,7 @@ pub mod runtime {
 
     pub fn run(mut links: Links) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
+        let mut sync = crate::sync::SyncState::new(host_time_us());
         let mut tx_seq = 0u16;
         let mut wlan_buf = vec![0u8; 4096];
         let mut tap_buf = vec![0u8; 2048];
@@ -1276,12 +1277,17 @@ pub mod runtime {
                     Ok(len) => {
                         let now_us = host_time_us();
                         match rx::parse_action_frame(&wlan_buf[..len], now_us, &mut bridge) {
-                            Ok(frame) => tracing::trace!(
-                                rx_time_us = frame.rx_time_us,
-                                rssi_dbm = frame.rssi_dbm,
-                                tlv_count = frame.tlvs.len(),
-                                "rx awdl action frame"
-                            ),
+                            Ok(frame) => {
+                                for tlv in &frame.tlvs {
+                                    handle_action_tlv(tlv, frame.rx_time_us, &mut sync);
+                                }
+                                tracing::trace!(
+                                    rx_time_us = frame.rx_time_us,
+                                    rssi_dbm = frame.rssi_dbm,
+                                    tlv_count = frame.tlvs.len(),
+                                    "rx awdl action frame"
+                                );
+                            }
                             Err(err) => match decapsulate_rx_data(&wlan_buf[..len]) {
                                 Ok(frame) => {
                                     links.tap.write_all(&frame.bytes).map_err(|_| Error::Io)?;
@@ -1334,6 +1340,51 @@ pub mod runtime {
         let radiotap = radiotap::parse_header(frame).map_err(|_| ())?;
         let mac = ieee80211::parse_mac_header(radiotap.payload).map_err(|_| ())?;
         awdl::decapsulate_data_frame(mac.body, mac.source, mac.destination).map_err(|_| ())
+    }
+
+    fn handle_action_tlv(tlv: &awdl::Tlv<'_>, rx_time_us: u64, sync: &mut crate::sync::SyncState) {
+        match tlv.kind {
+            4 => {
+                if let Ok(params) = awdl::parse_sync_parameters(tlv.value) {
+                    let error_tu = sync.sync_error_tu(
+                        rx_time_us,
+                        params.time_to_next_aw_tu,
+                        params.aw_counter,
+                    );
+                    sync.update_from_master(
+                        rx_time_us,
+                        params.time_to_next_aw_tu,
+                        params.aw_counter,
+                    );
+                    tracing::trace!(
+                        error_tu,
+                        aw_counter = params.aw_counter,
+                        time_to_next_aw_tu = params.time_to_next_aw_tu,
+                        "sync_error"
+                    );
+                }
+            }
+            18 => {
+                if let Ok(sequence) = awdl::parse_channel_sequence(tlv.value) {
+                    tracing::trace!(
+                        encoding = sequence.encoding,
+                        channels = ?sequence.channels,
+                        "peer channel sequence"
+                    );
+                }
+            }
+            24 => {
+                if let Ok(election) = awdl::parse_election_parameters_v2(tlv.value) {
+                    tracing::trace!(
+                        master_metric = election.master_metric,
+                        self_metric = election.self_metric,
+                        distance_to_master = election.distance_to_master,
+                        "peer election v2"
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     fn host_time_us() -> u64 {
