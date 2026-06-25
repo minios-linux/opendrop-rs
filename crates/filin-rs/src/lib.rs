@@ -5101,6 +5101,7 @@ pub mod runtime {
         self_addr: [u8; 6],
         anchor_channel: u16,
         monitor_iface: String,
+        host_iface: String,
         pcap: Option<pcap::Writer<File>>,
     }
 
@@ -5133,6 +5134,7 @@ pub mod runtime {
             self_addr: monitor_addr,
             anchor_channel: config.anchor_channel,
             monitor_iface: config.monitor_iface.clone(),
+            host_iface: config.host_iface.clone(),
             pcap,
         })
     }
@@ -5172,6 +5174,14 @@ pub mod runtime {
             crate::schedule::ANNOUNCE_REBROADCAST_MIN_GAP_US,
             crate::schedule::ANNOUNCE_CACHE_TTL_US,
         );
+
+        // FILIN_NEIGHBOR_TABLE.md: tracks which peer MAC→IPv6 mappings filin
+        // has installed in the system neighbor table. AWDL does NOT use NDP;
+        // filin derives each peer's link-local IPv6 from its source MAC and
+        // installs a static neighbor entry so unicast awdl0 connections work
+        // (without this, AirDrop's /Discover fails with "No route to host").
+        let mut neighbor_table = crate::state::NeighborTable::new();
+        let host_iface = links.host_iface.clone();
 
         // --- localhost introspection HTTP server (FILIN_HTTP_INTROSPECT.md).
         //     Runs on its own OS thread so it can never block the AF_PACKET
@@ -5264,6 +5274,27 @@ pub mod runtime {
                         peers = awdl_state.peers.len(),
                         "peer table cleaned"
                     );
+                }
+                // FILIN_NEIGHBOR_TABLE.md: evict neighbor entries for peers
+                // no longer in the table. `removed` is the MACs dropped this
+                // cycle; live_macs is everyone still present.
+                let live_macs: Vec<[u8; 6]> =
+                    awdl_state.peers.iter().map(|p| p.addr).collect();
+                for change in neighbor_table.evict_stale(&live_macs) {
+                    if let crate::state::NeighborChange::Remove(mac, ipv6) = change {
+                        if let Err(err) = os::rtnl::remove_neighbor(&host_iface, ipv6) {
+                            tracing::warn!(
+                                ?err,
+                                mac = %crate::introspect::mac_string(mac),
+                                "neighbor remove failed"
+                            );
+                        } else {
+                            tracing::debug!(
+                                mac = %crate::introspect::mac_string(mac),
+                                "removed neighbor entry for evicted peer"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -5359,6 +5390,31 @@ pub mod runtime {
                                 let rssi_dbm = frame.rssi_dbm;
                                 let tlv_count = frame.tlvs.len();
                                 awdl_state.apply_action(src, subtype, &frame.tlvs, rx_time_us);
+                                // FILIN_NEIGHBOR_TABLE.md: install a static
+                                // neighbor entry for this peer so unicast
+                                // awdl0 connections work. AWDL does not use
+                                // NDP — derive IPv6 from MAC (RFC 4291) and
+                                // add to the kernel neighbor table.
+                                match neighbor_table.note_peer_seen(&src) {
+                                    crate::state::NeighborChange::Add(mac, ipv6) => {
+                                        if let Err(err) =
+                                            os::rtnl::add_neighbor(&host_iface, ipv6, mac)
+                                        {
+                                            tracing::warn!(
+                                                ?err,
+                                                ?mac,
+                                                "neighbor add failed; unicast to this peer may fail"
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                mac = %crate::introspect::mac_string(mac),
+                                                "installed neighbor entry for peer"
+                                            );
+                                        }
+                                    }
+                                    crate::state::NeighborChange::NoChange => {}
+                                    crate::state::NeighborChange::Remove(_, _) => {}
+                                }
                                 // FILIN_SYNC_QUALITY.md Part A: detect
                                 // master_addr vs sync_addr transitions so
                                 // /status can prove whether the cluster top
