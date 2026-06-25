@@ -237,6 +237,12 @@ pub mod awdl {
         pub self_counter: u32,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ChannelSequence {
+        pub encoding: u8,
+        pub channels: Vec<u16>,
+    }
+
     pub fn parse_action_frame(body: &[u8]) -> Result<ActionFrame<'_>, ParseError> {
         if body.len() < 16 {
             return Err(ParseError::TooShort);
@@ -305,6 +311,10 @@ pub mod awdl {
             self_metric: read_le32(value, 24)?,
             self_counter: read_le32(value, 36)?,
         })
+    }
+
+    pub fn parse_channel_sequence(_value: &[u8]) -> Result<ChannelSequence, ParseError> {
+        Err(ParseError::TooShort)
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
@@ -416,6 +426,24 @@ pub mod awdl {
                     master_metric: 900,
                     self_metric: 800,
                     self_counter: 7,
+                }
+            );
+        }
+
+        #[test]
+        fn parses_opclass_channel_sequence_tlv() {
+            let mut value = vec![15, 2, 0, 3, 0xff, 0xff];
+            for channel in 1u16..=16 {
+                value.extend_from_slice(&channel.to_le_bytes());
+            }
+
+            let parsed = parse_channel_sequence(&value).expect("valid channel sequence TLV");
+
+            assert_eq!(
+                parsed,
+                ChannelSequence {
+                    encoding: 2,
+                    channels: (1u16..=16).collect()
                 }
             );
         }
