@@ -870,3 +870,68 @@ pub mod iface {
         }
     }
 }
+
+pub mod rx {
+    use crate::{awdl, ieee80211, radiotap, sync::TsftBridge};
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct ParsedActionFrame<'a> {
+        pub rx_time_us: u64,
+        pub rssi_dbm: Option<i8>,
+        pub source: [u8; 6],
+        pub destination: [u8; 6],
+        pub action: awdl::ActionFrame<'a>,
+        pub tlvs: Vec<awdl::Tlv<'a>>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ParseError {
+        Unsupported,
+    }
+
+    pub fn parse_action_frame<'a>(
+        _frame: &'a [u8],
+        _host_now_us: u64,
+        _bridge: &mut TsftBridge,
+    ) -> Result<ParsedActionFrame<'a>, ParseError> {
+        Err(ParseError::Unsupported)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_radiotap_80211_awdl_action_frame_with_tsft() {
+            let mut frame = vec![
+                0x00, 0x00, 0x12, 0x00, // radiotap version, pad, len
+                0x23, 0x00, 0x00, 0x00, // TSFT, flags, RSSI
+                0xe8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // TSFT 1000 us
+                0x00, // flags
+                0xd8, // -40 dBm
+            ];
+            frame.extend_from_slice(&[
+                0xd0, 0x00, 0x00, 0x00, // action header
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // destination
+                0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, // source
+                0x00, 0x25, 0x00, 0xff, 0x94, 0x73, // bssid
+                0x00, 0x00, // sequence control
+                0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10, 0x03, 0x00, // AWDL MIF
+                0x00, 0x00, 0x00, 0x00, // phy_tx
+                0x00, 0x00, 0x00, 0x00, // target_tx
+                0x04, 0x02, 0x00, 0xaa, 0xbb, // TLV
+            ]);
+
+            let mut bridge = TsftBridge::default();
+            let parsed = parse_action_frame(&frame, 101_000, &mut bridge)
+                .expect("valid RX AWDL action frame");
+
+            assert_eq!(parsed.rx_time_us, 101_000);
+            assert_eq!(parsed.rssi_dbm, Some(-40));
+            assert_eq!(parsed.source, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+            assert_eq!(parsed.destination, [0xff; 6]);
+            assert_eq!(parsed.action.subtype, awdl::ActionSubtype::Mif);
+            assert_eq!(parsed.tlvs[0].kind, 0x04);
+        }
+    }
+}
