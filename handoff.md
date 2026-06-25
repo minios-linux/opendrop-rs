@@ -98,7 +98,7 @@ Last updated: cycle 28 (*** SHARING WORKS — real AirDrop receive validated end
 - THE UNLOCK = the 100-continue FLUSH fix: server wrote "HTTP/1.1 100 Continue" but didn't
   flush() through rustls -> Apple sender deadlocked. Adding writer.flush()? fixed it. The
   running luftlift (pid 1741936) has GLM's working-tree fix baked into the release binary
-  (that's why it works); GLM (pty-3) is finalizing extra Apple-style chunked-Upload tests
+  (that's why it works); GLM committed the flush fix (6abe69e); luftlift 89 tests green
   (89 tests, clippy clean) and WILL COMMIT the flush fix shortly. DO NOT restart luftlift
   until GLM commits (running binary works; a transient rebuild could regress it).
 - Setup that worked: owl (force-master patched) on carl9170 ch44 (post-reboot, healthy)
