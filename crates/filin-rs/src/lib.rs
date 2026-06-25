@@ -781,8 +781,22 @@ pub mod tx {
             self.pending.len()
         }
 
-        pub fn flush<I: Injector>(&mut self, _injector: &mut I) -> Result<usize, InjectError> {
-            unimplemented!("RED: TX retry queue not implemented yet")
+        pub fn flush<I: Injector>(&mut self, injector: &mut I) -> Result<usize, InjectError> {
+            let mut sent = 0;
+            while let Some(frame) = self.pending.pop_front() {
+                match injector.inject(&frame) {
+                    Ok(()) => sent += 1,
+                    Err(InjectError::WouldBlock) => {
+                        self.pending.push_front(frame);
+                        return Ok(sent);
+                    }
+                    Err(InjectError::Failed) => {
+                        self.pending.push_front(frame);
+                        return Err(InjectError::Failed);
+                    }
+                }
+            }
+            Ok(sent)
         }
     }
 
