@@ -373,12 +373,21 @@ pub mod awdl {
     }
 
     pub fn build_action_body(
-        _subtype: ActionSubtype,
-        _phy_tx: u32,
-        _target_tx: u32,
-        _tlvs: &[u8],
+        subtype: ActionSubtype,
+        phy_tx: u32,
+        target_tx: u32,
+        tlvs: &[u8],
     ) -> Vec<u8> {
-        unimplemented!("RED: action body builder not implemented yet")
+        let subtype = match subtype {
+            ActionSubtype::Psf => 0,
+            ActionSubtype::Mif => 3,
+        };
+        let mut body = Vec::with_capacity(16 + tlvs.len());
+        body.extend_from_slice(&[0x7f, 0x00, 0x17, 0xf2, 0x08, 0x10, subtype, 0x00]);
+        body.extend_from_slice(&phy_tx.to_le_bytes());
+        body.extend_from_slice(&target_tx.to_le_bytes());
+        body.extend_from_slice(tlvs);
+        body
     }
 
     fn read_le16(bytes: &[u8], offset: usize) -> Result<u16, ParseError> {
