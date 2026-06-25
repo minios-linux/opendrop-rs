@@ -94,14 +94,12 @@ Last updated: cycle 5 (filin channel logic DONE; luftlift thrashing rustls 0.23 
 - filin (gpt-5.5): + sync-error compute, channel<->frequency, channel-slot-for-EAW
   (with %16 wraparound) all green. Stack complete through CHANNEL. Remaining per
   PORT.md: TX (frame build/serialize) + awdl0 interface bring-up.
-- luftlift (GLM-5.2): TLS cert-gen RED committed; GREEN failing to compile on rustls
-  0.23 API churn. **TLS-thrash cycle 1.** If it's STILL on the same rustls errors next
-  pty-3 pass, inject this exact hint (pty-3 is autonomous, send text + [ENTER] when
-  it's idle, don't interrupt mid-compile):
-    "rustls 0.23: ServerConfig::builder() already has safe defaults — drop
-     .with_safe_defaults(); use .with_no_client_auth().with_single_cert(vec![cert_der],
-     key_der)?. PrivateKeyDer isn't Clone — move it in (don't clone) or use
-     key_der.clone_key()."
+- luftlift (GLM-5.2): TLS cert-gen — **self-resolving the rustls 0.23 / rcgen 0.13
+  churn on its own** (switched to CertificateParams::new(..).self_signed(&key_pair)
+  and PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(serialize_der)) to dodge the
+  Clone issue). No injection needed — letting it self-resolve worked. If it regresses,
+  the hint was: drop .with_safe_defaults() (gone in rustls 0.23); use
+  .with_no_client_auth().with_single_cert(vec![cert_der], key_der)?.
 --- (prior cycle notes below) ---
 Last updated: cycle 4 (filin sync+TSFT bridge DONE; luftlift on TLS).
 - filin (gpt-5.5): election (metric + tie-break) green; sync-update-from-hw-timestamp
