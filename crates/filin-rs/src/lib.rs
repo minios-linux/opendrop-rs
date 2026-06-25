@@ -1607,6 +1607,17 @@ pub mod os {
     }
 
     pub mod nl80211 {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        const GENL_ID_CTRL: u16 = 0x10;
+        const CTRL_CMD_GETFAMILY: u8 = 3;
+        const CTRL_ATTR_FAMILY_ID: u16 = 1;
+        const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+        const NL80211_CMD_SET_CHANNEL: u8 = 65;
+        const NL80211_ATTR_IFINDEX: u16 = 3;
+        const NL80211_ATTR_WIPHY_FREQ: u16 = 38;
+
         #[derive(Debug, PartialEq, Eq)]
         pub struct ChannelRequest {
             pub ifindex: libc::c_int,
@@ -1626,6 +1637,172 @@ pub mod os {
         #[derive(Debug, PartialEq, Eq)]
         pub enum Error {
             Invalid,
+            InvalidName,
+            Io(i32),
+            Protocol,
+        }
+
+        pub fn set_channel(iface: &str, frequency_mhz: u32) -> Result<(), Error> {
+            let iface = CString::new(iface).map_err(|_| Error::InvalidName)?;
+            // SAFETY: iface is a valid NUL-terminated C string.
+            let ifindex = unsafe { libc::if_nametoindex(iface.as_ptr()) };
+            if ifindex == 0 {
+                return Err(last_errno());
+            }
+            set_channel_ifindex(ifindex as libc::c_int, frequency_mhz)
+        }
+
+        pub fn set_channel_ifindex(ifindex: libc::c_int, frequency_mhz: u32) -> Result<(), Error> {
+            let request = plan_set_channel(ifindex, frequency_mhz)?;
+            let socket = NetlinkSocket::open()?;
+            let family_id = socket.resolve_family("nl80211")?;
+            let mut payload = vec![NL80211_CMD_SET_CHANNEL, 1, 0, 0];
+            push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, request.ifindex as u32);
+            push_attr_u32(&mut payload, NL80211_ATTR_WIPHY_FREQ, request.frequency_mhz);
+            socket.request(family_id, libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16, &payload)?;
+            Ok(())
+        }
+
+        struct NetlinkSocket {
+            fd: OwnedFd,
+            seq: std::cell::Cell<u32>,
+        }
+
+        impl NetlinkSocket {
+            fn open() -> Result<Self, Error> {
+                // SAFETY: socket arguments open a generic netlink socket.
+                let fd = unsafe {
+                    libc::socket(
+                        libc::AF_NETLINK,
+                        libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                        libc::NETLINK_GENERIC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(last_errno());
+                }
+                // SAFETY: fd was just returned by socket and is uniquely owned here.
+                Ok(Self {
+                    fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                    seq: std::cell::Cell::new(1),
+                })
+            }
+
+            fn resolve_family(&self, family: &str) -> Result<u16, Error> {
+                let mut payload = vec![CTRL_CMD_GETFAMILY, 1, 0, 0];
+                push_attr_bytes(&mut payload, CTRL_ATTR_FAMILY_NAME, family.as_bytes(), true);
+                let response = self.request(GENL_ID_CTRL, libc::NLM_F_REQUEST as u16, &payload)?;
+                parse_family_id(&response).ok_or(Error::Protocol)
+            }
+
+            fn request(&self, nlmsg_type: u16, flags: u16, payload: &[u8]) -> Result<Vec<u8>, Error> {
+                let seq = self.seq.get();
+                self.seq.set(seq.wrapping_add(1));
+                let mut msg = Vec::with_capacity(16 + payload.len());
+                msg.extend_from_slice(&((16 + payload.len()) as u32).to_ne_bytes());
+                msg.extend_from_slice(&nlmsg_type.to_ne_bytes());
+                msg.extend_from_slice(&flags.to_ne_bytes());
+                msg.extend_from_slice(&seq.to_ne_bytes());
+                msg.extend_from_slice(&0u32.to_ne_bytes());
+                msg.extend_from_slice(payload);
+
+                // SAFETY: msg is valid readable memory for msg.len() bytes.
+                let sent = unsafe {
+                    libc::send(
+                        self.fd.as_raw_fd(),
+                        msg.as_ptr().cast::<libc::c_void>(),
+                        msg.len(),
+                        0,
+                    )
+                };
+                if sent < 0 {
+                    return Err(last_errno());
+                }
+
+                let mut buf = vec![0u8; 8192];
+                // SAFETY: buf is valid writable memory for buf.len() bytes.
+                let len = unsafe {
+                    libc::recv(
+                        self.fd.as_raw_fd(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                        0,
+                    )
+                };
+                if len < 0 {
+                    return Err(last_errno());
+                }
+                buf.truncate(len as usize);
+                parse_ack_or_payload(&buf)
+            }
+        }
+
+        fn parse_ack_or_payload(buf: &[u8]) -> Result<Vec<u8>, Error> {
+            if buf.len() < 16 {
+                return Err(Error::Protocol);
+            }
+            let len = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            let kind = u16::from_ne_bytes([buf[4], buf[5]]);
+            if len > buf.len() || len < 16 {
+                return Err(Error::Protocol);
+            }
+            if kind == libc::NLMSG_ERROR as u16 {
+                if len < 20 {
+                    return Err(Error::Protocol);
+                }
+                let code = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
+                return if code == 0 { Ok(Vec::new()) } else { Err(Error::Io(-code)) };
+            }
+            Ok(buf[16..len].to_vec())
+        }
+
+        fn parse_family_id(payload: &[u8]) -> Option<u16> {
+            if payload.len() < 4 {
+                return None;
+            }
+            let mut attrs = &payload[4..];
+            while attrs.len() >= 4 {
+                let len = u16::from_ne_bytes([attrs[0], attrs[1]]) as usize;
+                let kind = u16::from_ne_bytes([attrs[2], attrs[3]]);
+                if len < 4 || len > attrs.len() {
+                    return None;
+                }
+                if kind == CTRL_ATTR_FAMILY_ID && len >= 6 {
+                    return Some(u16::from_ne_bytes([attrs[4], attrs[5]]));
+                }
+                let aligned = align4(len);
+                if aligned > attrs.len() {
+                    return None;
+                }
+                attrs = &attrs[aligned..];
+            }
+            None
+        }
+
+        fn push_attr_u32(buf: &mut Vec<u8>, kind: u16, value: u32) {
+            push_attr_bytes(buf, kind, &value.to_ne_bytes(), false);
+        }
+
+        fn push_attr_bytes(buf: &mut Vec<u8>, kind: u16, value: &[u8], nul: bool) {
+            let payload_len = value.len() + usize::from(nul);
+            let len = 4 + payload_len;
+            buf.extend_from_slice(&(len as u16).to_ne_bytes());
+            buf.extend_from_slice(&kind.to_ne_bytes());
+            buf.extend_from_slice(value);
+            if nul {
+                buf.push(0);
+            }
+            while !buf.len().is_multiple_of(4) {
+                buf.push(0);
+            }
+        }
+
+        fn align4(len: usize) -> usize {
+            (len + 3) & !3
+        }
+
+        fn last_errno() -> Error {
+            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
         }
 
         #[cfg(test)]
