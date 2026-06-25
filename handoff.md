@@ -90,6 +90,49 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 19 (AUTONOMOUS mode — human napping; force-master WORKED; GLM deep in filin layers).
+*** AUTONOMOUS: human asleep (hot weather), I test filin vs hardware on my own.
+    Do NOT rely on Mac-initiated sends (need a human tap). Measure objective
+    signals: filin sync stability, awdl0 RX climbing (peering), TX frame
+    correctness vs owl (pcap diff). ***
+- *** KEY FINDING — FORCE-MASTER fixes the data path on a churny link. ***
+  Live: with multiple Apple devices (Mac+iPad+AppleTV), owl's elected master
+  flip-flopped (13 re-elections, 6 MACs — AWDL MAC-randomization + near-equal
+  metrics 511-524 + marginal RX). That churn strangled the unicast data path
+  (Mac stuck "Waiting", awdl0 RX~13). FIX: patched owl to advertise a winning
+  election (owl/src/election.h: METRIC_INIT 60->2000, COUNTER_INIT 0->2000000;
+  rebuilt via `make -C owl/build owl`). owl became sole master -> Mac then
+  completed Discover+Ask and STARTED a real file Upload (awdl0 RX 13->210, peer
+  got an AirDrop UUID). Transfer was VERY SLOW (carl9170 ~0.4% sync = RF ceiling)
+  and didn't survive a cancel. **owl is currently PATCHED (force-master).** Revert
+  owl/src/election.h if a faithful owl baseline is needed. filin needs the same
+  lesson: a deliberate master strategy (master stability >> being a follower on a
+  contended link).
+- BLE bootstrap PoC (for luftlift send->Apple): PARKED per human. Proven viable
+  (hci0 works, captured 270 real AirDrop adverts type5/Apple-0x4c, broadcast our
+  own) but synthetic advert didn't wake the Mac; needs exact-byte replay. Not now.
+- DELEGATED NOW:
+  - pty-5 (GLM): filin layer audit -> FILIN_AUDIT.md (DONE, 11.9KB) + fixes landed:
+    b1f6570 real election, 3cd4cb0 peer table, 7d5e626 MIF-TLV tolerance, d98cb1f
+    state aggregation, 2fe41ec wire runtime to election/peer/sync. STILL WORKING:
+    sync/AW schedule, AW-gated TX timing + channel hopping, TX content (chanseq
+    opclass encoding, real election values). Audit flags these as the peering
+    blockers. Don't build/test mid-edit; wait for idle+commit.
+  - pty-3 (GLM-5.2 luftlift): fix(luftlift) send mDNS goodbye (TTL=0) on
+    SIGINT/SIGTERM so Apple picker stops showing ghost luftlift/linuxdrop entries.
+    *** NEXT (human's instruction): when pty-3 finishes the goodbye fix, CLEAR its
+    context (OpenCode /new or /clear — full at 135K tokens), then dispatch a fresh
+    systematic LUFTLIFT faithfulness audit -> LUFTLIFT_AUDIT.md: compare luftlift-rs
+    vs python reference opendrop-patch/ + docs/airdrop-protocol.md byte-for-byte —
+    dvzip framing, ODC CPIO encode/decode, chunked HTTP, plist Discover/Ask/Upload
+    (req+resp fields), TLS cert/cipher, mDNS TXT/flags/service props, handlers, send
+    client. Then fix gaps. Parallels the filin audit; different crate so no conflict
+    with pty-5. (Same idea: fresh context = unbiased audit, not rosy self-memory.) ***
+- pty-2 (gpt-5.5): idle, stood down off filin.
+- HARDWARE state: owl(patched,force-master) was running on pty-7; carl9170
+  wlxbc05430d50a1 monitor ch44; bluetoothd stopped on pty-8 (BLE experiment) —
+  restart with `systemctl start bluetooth` when done.
+--- PRIOR cycle-18 below ---
 Last updated: cycle 18 (REFRAME: lower AWDL layers only superficially work; full owl-vs-filin audit underway).
 *** Human's call: filin's lower layers (election/sync/schedule/AW-timing/peer-table)
     are hacky/stubbed — they produce plausible numbers but don't actually peer.
