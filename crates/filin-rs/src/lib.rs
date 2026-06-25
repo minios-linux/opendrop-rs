@@ -1684,6 +1684,52 @@ pub mod schedule {
         (149, 0x80),  // CHAN_OPCLASS_149
     ];
 
+    /// The distinct social-channel NUMBERS (6, 44, 149), sorted ascending.
+    pub const AWDL_SOCIAL_CHANNEL_NUMS: [u8; 3] = [6, 44, 149];
+
+    /// Extract the adopted master's **anchor channel** — the slot-0 / primary
+    /// channel of the decoded master sequence — so filin can re-broadcast and
+    /// dwell on it adaptively (FILIN_ANCHOR_REBROADCAST.md). Returns slot 0's
+    /// channel if non-zero; otherwise the most-frequent non-zero channel
+    /// (the "dominant" one); or 0 if the sequence is all-null (no master).
+    ///
+    /// On a frequency tie the lowest channel number wins (deterministic).
+    pub fn master_anchor_channel(chanseq: &[[u8; 2]; CHANSEQ_LEN]) -> u8 {
+        if chanseq[0][0] != 0 {
+            return chanseq[0][0];
+        }
+        // Slot 0 is null: fall back to the most-frequent non-zero channel.
+        use std::collections::BTreeMap;
+        let mut counts: BTreeMap<u8, usize> = BTreeMap::new();
+        for slot in chanseq.iter() {
+            if slot[0] != 0 {
+                *counts.entry(slot[0]).or_default() += 1;
+            }
+        }
+        // BTreeMap iterates ascending by channel. On a tie, prefer the lowest
+        // channel: pick the first whose count equals the max.
+        let max_count = counts.values().copied().max().unwrap_or(0);
+        counts
+            .into_iter()
+            .find(|(_, c)| *c == max_count)
+            .map(|(ch, _)| ch)
+            .unwrap_or(0)
+    }
+
+    /// The set of channels filin should re-broadcast the cached mDNS announce
+    /// on: always the three AWDL social channels (6/44/149), plus the adopted
+    /// master's anchor if it is not already among them (e.g. 52 on a
+    /// DFS-anchored cluster). Sorted ascending, deduped. If `anchor` is 0
+    /// (no master) only the social channels are returned.
+    pub fn rebroadcast_channels(anchor: u8) -> Vec<u8> {
+        use std::collections::BTreeSet;
+        let mut set: BTreeSet<u8> = AWDL_SOCIAL_CHANNEL_NUMS.iter().copied().collect();
+        if anchor != 0 {
+            set.insert(anchor);
+        }
+        set.into_iter().collect()
+    }
+
     /// Ensure every AWDL social channel (6, 44, 149) appears at least once
     /// in the channel sequence by injecting any missing social channels into
     /// null or duplicate slots. This guarantees filin physically visits 149
