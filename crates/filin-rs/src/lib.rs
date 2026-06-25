@@ -1230,6 +1230,9 @@ pub mod os {
     }
 
     pub mod packet {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
         #[derive(Debug, PartialEq, Eq)]
         pub struct BindPlan {
             pub ifindex: libc::c_int,
@@ -1249,6 +1252,8 @@ pub mod os {
         #[derive(Debug, PartialEq, Eq)]
         pub enum Error {
             InvalidIfIndex,
+            InvalidName,
+            Io(i32),
         }
 
         #[cfg(test)]
@@ -1262,6 +1267,102 @@ pub mod os {
                 assert_eq!(plan.ifindex, 7);
                 assert_eq!(plan.protocol_be, (libc::ETH_P_ALL as u16).to_be());
             }
+        }
+
+        pub struct PacketSocket {
+            fd: OwnedFd,
+        }
+
+        impl PacketSocket {
+            pub fn open_bound(iface: &str) -> Result<Self, Error> {
+                let iface = CString::new(iface).map_err(|_| Error::InvalidName)?;
+                // SAFETY: iface is a valid NUL-terminated C string.
+                let ifindex = unsafe { libc::if_nametoindex(iface.as_ptr()) };
+                if ifindex == 0 {
+                    return Err(last_errno());
+                }
+                Self::open_bound_ifindex(ifindex as libc::c_int)
+            }
+
+            pub fn open_bound_ifindex(ifindex: libc::c_int) -> Result<Self, Error> {
+                let plan = plan_bind(ifindex)?;
+                // SAFETY: socket arguments are constants for an AF_PACKET raw socket.
+                let fd = unsafe {
+                    libc::socket(
+                        libc::AF_PACKET,
+                        libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                        libc::ETH_P_ALL.to_be(),
+                    )
+                };
+                if fd < 0 {
+                    return Err(last_errno());
+                }
+                // SAFETY: fd was just returned by socket and is uniquely owned here.
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+                let addr = libc::sockaddr_ll {
+                    sll_family: libc::AF_PACKET as libc::c_ushort,
+                    sll_protocol: plan.protocol_be,
+                    sll_ifindex: plan.ifindex,
+                    sll_hatype: 0,
+                    sll_pkttype: 0,
+                    sll_halen: 0,
+                    sll_addr: [0; 8],
+                };
+                // SAFETY: addr points to a valid sockaddr_ll for the duration of the call.
+                let rc = unsafe {
+                    libc::bind(
+                        fd.as_raw_fd(),
+                        (&addr as *const libc::sockaddr_ll).cast::<libc::sockaddr>(),
+                        std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                    )
+                };
+                if rc < 0 {
+                    return Err(last_errno());
+                }
+
+                Ok(Self { fd })
+            }
+
+            pub fn recv(&self, buf: &mut [u8]) -> Result<usize, Error> {
+                // SAFETY: buf is valid writable memory for buf.len() bytes.
+                let rc = unsafe {
+                    libc::recv(
+                        self.fd.as_raw_fd(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                        0,
+                    )
+                };
+                if rc < 0 {
+                    return Err(last_errno());
+                }
+                Ok(rc as usize)
+            }
+
+            pub fn send(&self, frame: &[u8]) -> Result<usize, Error> {
+                // SAFETY: frame is valid readable memory for frame.len() bytes.
+                let rc = unsafe {
+                    libc::send(
+                        self.fd.as_raw_fd(),
+                        frame.as_ptr().cast::<libc::c_void>(),
+                        frame.len(),
+                        0,
+                    )
+                };
+                if rc < 0 {
+                    return Err(last_errno());
+                }
+                Ok(rc as usize)
+            }
+
+            pub fn as_raw_fd(&self) -> RawFd {
+                self.fd.as_raw_fd()
+            }
+        }
+
+        fn last_errno() -> Error {
+            Error::Io(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
         }
     }
 }
