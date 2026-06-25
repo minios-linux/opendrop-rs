@@ -1452,6 +1452,73 @@ pub mod schedule {
         us as i64 / 1_000_000
     }
 
+    /// Decision returned by [`data_send_decision`]: whether the TX path
+    /// should inject a data frame now (`Send`) or hold it for retry (`Hold`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DataSendDecision {
+        /// Inject the frame now on the current channel/availability window.
+        Send,
+        /// Hold the frame and retry on the next availability window.
+        Hold,
+    }
+
+    /// Pure TX-gate decision that ports owl's split between
+    /// `awdl_send_unicast` (owl/daemon/core.c:202-244, per-peer and
+    /// channel-gated) and `awdl_send_multicast` (owl/daemon/core.c:246-277,
+    /// sent on the current AW channel with no per-peer gate).
+    ///
+    /// Given a data frame's destination MAC, the current channel, our own
+    /// channel sequence, the peer table, and the current sync/now, decide
+    /// whether the runtime TX path should inject the frame now.
+    ///
+    /// - **Multicast/broadcast** destinations — the Ethernet I/G bit is set,
+    ///   `dst[0] & 0x01 == 1`, which covers IPv6 multicast `33:33:..` (mDNS
+    ///   announce `ff02::fb`, NDP solicitations `33:33:ff:..`) and broadcast
+    ///   `ff:ff:..` — are NOT peer-gated. Like owl's `awdl_send_multicast`,
+    ///   they inject on the current channel during the multicast availability
+    ///   window (slots 0 and 10) outside the multicast guard interval,
+    ///   regardless of whether any single peer happens to be on this channel.
+    ///   A multicast frame has no single destination peer, so the
+    ///   "same channel as peer" lookup must not apply.
+    /// - **Unicast** destinations keep owl's `awdl_send_unicast` gate: sent
+    ///   only when the destination peer is known and on the same channel this
+    ///   EAW, outside the unicast guard interval.
+    pub fn data_send_decision(
+        dst: &[u8; 6],
+        current_channel: u8,
+        own_seq: &[[u8; 2]; CHANSEQ_LEN],
+        peers: &crate::peers::PeerTable,
+        sync: &SyncState,
+        now_us: u64,
+    ) -> DataSendDecision {
+        if current_channel == 0 {
+            return DataSendDecision::Hold; // null slot: not available
+        }
+        if dst[0] & 0x01 == 1 {
+            // owl awdl_send_multicast (core.c:254-255): multicast EAW +
+            // multicast guard, never the per-peer same-channel gate.
+            if !is_multicast_eaw(sync, now_us) {
+                return DataSendDecision::Hold;
+            }
+            if can_send_in(sync, now_us, MULTICAST_GUARD_TU) != 0 {
+                return DataSendDecision::Hold;
+            }
+            DataSendDecision::Send
+        } else {
+            // owl awdl_send_unicast (core.c:222-223): per-peer gate.
+            let Some(peer) = peers.get(dst) else {
+                return DataSendDecision::Hold; // non-peer unicast: drop/hold
+            };
+            if !same_channel_as_peer(own_seq, &peer.sequence, sync, now_us) {
+                return DataSendDecision::Hold; // peer is on a different channel
+            }
+            if can_send_in(sync, now_us, UNICAST_GUARD_TU) != 0 {
+                return DataSendDecision::Hold; // inside unicast guard interval
+            }
+            DataSendDecision::Send
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1500,6 +1567,167 @@ pub mod schedule {
             };
             // slot 0: own is 44, peer is 0 (null) → not same
             assert!(!same_channel_as_peer(&own, &peer, &sync, 1_000_000));
+        }
+
+        // --- data_send_decision: the multicast/broadcast TX fix ---
+
+        fn empty_peers() -> crate::peers::PeerTable {
+            crate::peers::PeerTable::new()
+        }
+
+        fn peer_on_channel(addr: [u8; 6], chan: u8) -> crate::peers::PeerTable {
+            // Build a peer table whose single peer advertises `chan` on every
+            // slot of its channel sequence (so same_channel_as_peer is true
+            // iff our own sequence also has `chan` on the current slot).
+            let mut table = crate::peers::PeerTable::new();
+            table.touch(addr, 1_000_000);
+            table.get_mut(&addr).unwrap().sequence = [[chan, 0x80]; CHANSEQ_LEN];
+            table
+        }
+
+        /// The mDNS announce multicast destination (ff02::fb maps to the
+        /// Ethernet multicast address 33:33:00:00:00:fb). Its first octet has
+        /// the I/G bit set.
+        const MDNS_V6_MCAST: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0xfb];
+
+        #[test]
+        fn multicast_dst_is_not_peer_gated() {
+            // Regression: an mDNS announce (multicast) must be injected on
+            // the current channel during a multicast EAW even when the peer
+            // table is empty (no single destination peer to channel-match).
+            // owl `awdl_send_multicast` (core.c:246-277).
+            let sync = synced();
+            let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            // 1_032_768 is ~32 TU into slot 0 (multicast EAW), clear of the
+            // 16 TU multicast guard on both sides.
+            assert_eq!(
+                data_send_decision(
+                    &MDNS_V6_MCAST,
+                    44,
+                    &own_seq,
+                    &empty_peers(),
+                    &sync,
+                    1_032_768,
+                ),
+                DataSendDecision::Send,
+            );
+        }
+
+        #[test]
+        fn broadcast_dst_is_not_peer_gated() {
+            // ff:ff:ff:ff:ff:ff also has the I/G bit set and must not be
+            // held waiting for a per-peer channel match.
+            let sync = synced();
+            let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            assert_eq!(
+                data_send_decision(
+                    &[0xff; 6],
+                    44,
+                    &own_seq,
+                    &empty_peers(),
+                    &sync,
+                    1_032_768,
+                ),
+                DataSendDecision::Send,
+            );
+        }
+
+        #[test]
+        fn multicast_dst_held_off_multicast_eaw() {
+            // Multicast frames are sent during multicast EAWs (slots 0/10)
+            // like owl; mid-EAW slot 1 is not a multicast EAW, so hold.
+            // 1_065_536 is the start of EAW slot 1 (one full EAW after
+            // 1_000_000).
+            let sync = synced();
+            let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            assert_eq!(
+                data_send_decision(
+                    &MDNS_V6_MCAST,
+                    44,
+                    &own_seq,
+                    &empty_peers(),
+                    &sync,
+                    1_098_304,
+                ),
+                DataSendDecision::Hold,
+            );
+        }
+
+        #[test]
+        fn multicast_dst_held_on_null_channel() {
+            let sync = synced();
+            let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            assert_eq!(
+                data_send_decision(
+                    &MDNS_V6_MCAST,
+                    0,
+                    &own_seq,
+                    &empty_peers(),
+                    &sync,
+                    1_032_768,
+                ),
+                DataSendDecision::Hold,
+            );
+        }
+
+        #[test]
+        fn unicast_dst_with_no_peer_is_held() {
+            // owl `awdl_send_unicast` drops/holds unicast to non-peers.
+            let sync = synced();
+            let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            assert_eq!(
+                data_send_decision(
+                    &[0x02, 0, 0, 0, 0, 0x07],
+                    44,
+                    &own_seq,
+                    &empty_peers(),
+                    &sync,
+                    1_032_768,
+                ),
+                DataSendDecision::Hold,
+            );
+        }
+
+        #[test]
+        fn unicast_dst_same_channel_as_peer_is_sent() {
+            // Unicast keeps the per-peer same-channel gate: when the peer is
+            // known and on our channel, send.
+            let sync = synced();
+            let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            let peer_addr = [0x02, 0, 0, 0, 0, 0x07];
+            let peers = peer_on_channel(peer_addr, 44);
+            assert_eq!(
+                data_send_decision(
+                    &peer_addr,
+                    44,
+                    &own_seq,
+                    &peers,
+                    &sync,
+                    1_032_768,
+                ),
+                DataSendDecision::Send,
+            );
+        }
+
+        #[test]
+        fn unicast_dst_different_channel_is_held() {
+            // The unicast same-channel gate is preserved: peer on a
+            // different channel this EAW → hold (frame buffered for retry).
+            let sync = synced();
+            let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
+            let peer_addr = [0x02, 0, 0, 0, 0, 0x07];
+            // Peer sequence has a null slot 0, so it is not on our channel
+            // (44) during slot 0.
+            let mut peers = crate::peers::PeerTable::new();
+            peers.touch(peer_addr, 1_000_000);
+            {
+                let seq = &mut peers.get_mut(&peer_addr).unwrap().sequence;
+                seq[0] = [0, 0];
+            }
+            assert_eq!(
+                data_send_decision(&peer_addr, 44, &own_seq, &peers, &sync, 1_032_768),
+                DataSendDecision::Hold,
+            );
         }
     }
 }
@@ -2934,33 +3162,25 @@ pub mod runtime {
         now_us: u64,
         frame: &PendingFrame,
     ) -> bool {
-        let channel = awdl_state.current_channel;
-        if channel == 0 {
-            return false; // null slot: not available
-        }
-        // owl checks same-channel-as-peer for unicast data (schedule.c:62).
-        if let Some(peer) = awdl_state.peers.get(&frame.dst) {
-            if !crate::schedule::same_channel_as_peer(
-                &awdl_state.channel_sequence,
-                &peer.sequence,
-                &awdl_state.sync,
-                now_us,
-            ) {
-                return false; // peer is on a different channel this EAW
-            }
-        }
-        // owl checks the unicast guard interval (schedule.c:65-79).
-        let in_guard = crate::schedule::can_send_in(
+        let decision = crate::schedule::data_send_decision(
+            &frame.dst,
+            awdl_state.current_channel,
+            &awdl_state.channel_sequence,
+            &awdl_state.peers,
             &awdl_state.sync,
             now_us,
-            crate::schedule::UNICAST_GUARD_TU,
         );
-        if in_guard != 0 {
-            return false; // inside guard interval
+        if decision != crate::schedule::DataSendDecision::Send {
+            return false;
         }
         match links.packet.send(&frame.radiotap_frame) {
             Ok(sent) => {
-                tracing::trace!(sent, channel, "injected awdl data frame");
+                tracing::trace!(
+                    sent,
+                    channel = awdl_state.current_channel,
+                    multicast = frame.dst[0] & 0x01 == 1,
+                    "injected awdl data frame"
+                );
                 true
             }
             Err(err) => {
