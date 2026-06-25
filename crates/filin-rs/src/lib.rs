@@ -4752,6 +4752,97 @@ pub mod state {
             assert_eq!(state.current_channel, 44);
         }
 
+        // --- FILIN_SYNC_QUALITY.md Part B: re-parent hysteresis keyed on
+        //     master_addr stability — do NOT re-adopt the channel sequence
+        //     when re-parenting among peers sharing the same top master. ---
+
+        fn peer_with_cluster(addr: [u8; 6], top: [u8; 6], slot0: u8, counter: u32) -> awdl::Tlv<'static> {
+            // election v2 TLV: master_addr=top, sync_addr=addr(self), counter.
+            let mut v = vec![0u8; 40];
+            v[0..6].copy_from_slice(&top);
+            v[6..12].copy_from_slice(&addr);
+            v[12..16].copy_from_slice(&counter.to_le_bytes());
+            v[16..20].copy_from_slice(&0u32.to_le_bytes()); // distance
+            v[20..24].copy_from_slice(&200u32.to_le_bytes()); // master_metric
+            v[24..28].copy_from_slice(&200u32.to_le_bytes()); // self_metric
+            v[36..40].copy_from_slice(&0u32.to_le_bytes());
+            awdl::Tlv { kind: 24, value: v.leak() }
+        }
+
+        fn chanseq_tlv(slot0: u8) -> awdl::Tlv<'static> {
+            let mut v = vec![15, awdl::CHAN_ENC_OPCLASS, 0, 3];
+            v.extend_from_slice(&0xffffu16.to_le_bytes());
+            for _ in 0..16 {
+                v.extend_from_slice(&[slot0, 0x80]);
+            }
+            awdl::Tlv { kind: 18, value: v.leak() }
+        }
+
+        #[test]
+        fn reparent_within_same_cluster_does_not_readopt_channel_sequence() {
+            // Peer A and Peer B both report the SAME cluster top master M.
+            // Adopt A's sequence (slot0 = 149). Then election re-parents to B
+            // (same master_addr M, B's slot0 = 6). filin must NOT re-copy B's
+            // sequence — the schedule stays stable at 149 to avoid channel
+            // thrash. Only a real master_addr change re-adopts.
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let top = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let peer_a = [0x02, 0xc1, 0, 0, 0, 1];
+            let peer_b = [0x02, 0xc2, 0, 0, 0, 2];
+
+            // Adopt peer A (cluster top M, slot0 = 149).
+            state.apply_action(
+                peer_a,
+                mif(),
+                &[
+                    peer_with_cluster(peer_a, top, 149, 50),
+                    version_tlv(0x34, 1),
+                    chanseq_tlv(149),
+                ],
+                1_000,
+            );
+            assert!(state.channel_sequence.iter().any(|s| s[0] == 149));
+            let seq_after_a = state.channel_sequence;
+
+            // Re-parent to peer B (SAME top M, higher counter so it wins,
+            // but slot0 = 6). filin must NOT re-parent within the same cluster
+            // (same master_addr) — keep syncing to A, keep A's sequence.
+            state.apply_action(
+                peer_b,
+                mif(),
+                &[
+                    peer_with_cluster(peer_b, top, 6, 60),
+                    version_tlv(0x34, 1),
+                    chanseq_tlv(6),
+                ],
+                2_000,
+            );
+            // Push B PAST the existing Bug B debounce window so the OLD logic
+            // would flip to B. The new master_addr-keyed hysteresis must still
+            // hold: same cluster → no re-parent.
+            let after_debounce = 2_000 + crate::schedule::MASTER_DEBOUNCE_US + 1;
+            state.apply_action(
+                peer_b,
+                mif(),
+                &[
+                    peer_with_cluster(peer_b, top, 6, 60),
+                    version_tlv(0x34, 1),
+                    chanseq_tlv(6),
+                ],
+                after_debounce,
+            );
+            // committed parent STAYS A (same cluster → no re-parent), and the
+            // adopted channel sequence is unchanged (no thrash).
+            assert_eq!(
+                state.committed_master, peer_a,
+                "must not re-parent within the same cluster (same master_addr) even past the debounce window"
+            );
+            assert_eq!(
+                state.channel_sequence, seq_after_a,
+                "channel sequence must stay stable across same-cluster re-parent attempt"
+            );
+        }
+
         // --- FILIN_SYNC_QUALITY.md: master_addr vs sync_addr transitions ---
 
         #[test]
