@@ -146,6 +146,31 @@ fails with "No route to host" and AirDrop never completes past mDNS.
 - Wired into the hot loop: add on every parsed action frame, remove on
   `clean_peers` eviction. Errors are logged (warn) but non-fatal.
 
+## Audit fixes vs owl + book (FILIN_AUDIT_FIXES.md)
+Three fixes from an audit of filin vs owl (`owl/src/`) + book (docs/book/04,05):
+
+**1. RSSI admission filter** (HIGH — fixes master flapping):
+- owl drops weak frames before admitting/updating a peer (`rx.c:273-278`).
+  filin now does the same: unknown peer needs `rssi >= -65`
+  (`RSSI_THRESHOLD_DEFAULT`); known peer gets grace: `rssi >= -70`
+  (threshold + `RSSI_GRACE_DEFAULT`). This hysteresis prevents marginal
+  frames from causing election thrash.
+- Pure decision fn: `rx::rssi_admits(rssi, peer_known, threshold, grace)`.
+- CLI: `-f` / `--no-rssi-filter` disables the filter for testing (owl's `-f`).
+
+**2. TSF saturating_sub** (MEDIUM — prevents underflow):
+- `update_from_master`, `next_aw_tu`, and `current_aw` now use
+  `saturating_sub` instead of unchecked `-`, matching `next_aw_us`. Prevents
+  underflow early after start / after a TsftBridge re-lock.
+
+**3. AWDL data-header magic** (LOW — fixes file transfer):
+- `encapsulate_ethernet_payload` now writes `0x0403` (`AWDL_DATA_HEAD`,
+  owl/src/tx.c:33) instead of `0x0000`. A real Apple peer may reject data
+  frames with the wrong head magic. Discovery (action frames) was unaffected.
+
+**NOT changed**: election `METRIC_INIT`/`COUNTER_INIT` stay at owl's canonical
+60/0 (not the uncommitted election.h edit's 2000/2000000).
+
 Coordinate with Claude (orchestrator) for: workspace dep additions, the awdl0
 contract, and anything that would touch shared files. Keep all your code under
 `crates/filin-rs/`.
