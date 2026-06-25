@@ -29,7 +29,6 @@ fn now_unix_ms() -> u64 {
 /// the AirDrop HTTPS handler thread can bump them without contending with the
 /// introspection HTTP thread's snapshot read. The receiver name and last
 /// peer are updated rarely, so a `Mutex<String>` is plenty.
-#[derive(Default)]
 pub struct IntrospectState {
     /// `ReceiverComputerName` shown in the Apple AirDrop picker.
     pub receiver_name: Mutex<String>,
@@ -60,6 +59,25 @@ pub struct IntrospectState {
     /// default. Stored for `/status` transparency and for re-applying on
     /// POST /trace. The atomic flag above is the hot-path gate.
     pub trace_level: Mutex<String>,
+}
+
+impl Default for IntrospectState {
+    fn default() -> Self {
+        Self {
+            receiver_name: Mutex::new(String::new()),
+            mdns_announced: AtomicBool::new(false),
+            https_port: AtomicU16::new(0),
+            last_announce_unix_ms: AtomicU64::new(0),
+            mdns_query_rx: AtomicU64::new(0),
+            discover_count: AtomicU64::new(0),
+            ask_count: AtomicU64::new(0),
+            upload_count: AtomicU64::new(0),
+            last_peer: Mutex::new(String::new()),
+            trace_ring: Mutex::new(VecDeque::new()),
+            trace_enabled: AtomicU8::new(0),
+            trace_level: Mutex::new("off".into()),
+        }
+    }
 }
 
 impl IntrospectState {
@@ -128,36 +146,68 @@ impl IntrospectState {
     }
 
     /// Push a trace event into the ring. **No-op when `trace_enabled == 0`**
-    /// (the default) — the hot path pays only a single atomic load.
-    pub fn push_trace(&self, _event: TraceEvent) {
-        todo!()
+    /// (the default) — the hot path pays only a single atomic load. When on,
+    /// appends to the ring and drops the oldest entry past `TRACE_RING_CAP`.
+    pub fn push_trace(&self, event: TraceEvent) {
+        if self.trace_enabled.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if let Ok(mut ring) = self.trace_ring.lock() {
+            while ring.len() >= TRACE_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(event);
+        }
     }
 
     /// Return the last `n` trace events (newest last). `n == 0` returns all.
-    pub fn trace_last_n(&self, _n: usize) -> Vec<TraceEvent> {
-        todo!()
+    pub fn trace_last_n(&self, n: usize) -> Vec<TraceEvent> {
+        if let Ok(ring) = self.trace_ring.lock() {
+            if n == 0 {
+                ring.iter().cloned().collect()
+            } else {
+                let start = ring.len().saturating_sub(n);
+                ring.iter().skip(start).cloned().collect()
+            }
+        } else {
+            Vec::new()
+        }
     }
 
-    /// Set the trace level (`"off"` / `"debug"` / `"trace"`).
-    pub fn set_trace_level(&self, _level: &str) {
-        todo!()
+    /// Set the trace level (`"off"` / `"debug"` / `"trace"`). Anything other
+    /// than `"off"` enables the ring; `"off"` disables it but does NOT clear
+    /// the buffer — re-enabling surfaces previously captured events.
+    pub fn set_trace_level(&self, level: &str) {
+        let normalized = normalize_trace_level(level);
+        let enabled = if normalized == "off" { 0 } else { 1 };
+        self.trace_enabled.store(enabled, Ordering::Release);
+        if let Ok(mut cell) = self.trace_level.lock() {
+            *cell = normalized;
+        }
     }
 
     /// Current trace level (`"off"` / `"debug"` / `"trace"`).
     pub fn trace_level(&self) -> String {
-        todo!()
+        self.trace_level
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| "off".into())
     }
 
     /// Whether the trace ring is currently accepting events.
     pub fn trace_enabled(&self) -> bool {
-        todo!()
+        self.trace_enabled.load(Ordering::Acquire) != 0
     }
 }
 
 /// Normalise a POSTed trace level to one of `off|debug|trace`. Unknown
-/// values default to `"off"` (fail-safe).
-pub fn normalize_trace_level(_level: &str) -> String {
-    todo!()
+/// values default to `"off"` (fail-safe: never silently enable tracing).
+pub fn normalize_trace_level(level: &str) -> String {
+    let l = level.trim().to_ascii_lowercase();
+    match l.as_str() {
+        "off" | "debug" | "trace" => l,
+        _ => "off".into(),
+    }
 }
 
 /// A captured structured trace event in the ring buffer.
