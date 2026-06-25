@@ -101,9 +101,22 @@ Last updated: cycle 30 (DISPATCHED pty-3 to fix iPhone /Upload decode — chunke
   Also asked pty-3 to add an env-gated raw /Upload body dump (LUFTLIFT_DUMP_UPLOAD=/tmp/upload.bin) so next
   live test we can diff vs `python3 opendrop-patch/dvzip.py`. NOTE: dvzip/CPIO core logic matches the Python
   reference byte-for-byte (verified) — Mac's 2 JPEGs decoded fine; bug is iPhone-chunk-framing specific.
-- pty-3 is WORKING on it now (accepted the prompt). pty-2 (gpt-5.5) idle/stood down. notify-1 still armed.
-  NEXT HEARTBEAT: check pty-3 committed the fix + tree green (cargo test -p luftlift-rs + clippy), then have
-  human re-send a PHOTO from the iPhone to re-test. ASK HUMAN what was sent (photo vs link/webloc).
+- pty-3 is WORKING on it now (Bug1 chunked-trunc DONE, Bug2 skip-dir DONE, raw-dump in progress, then regr
+  test + verify). Refined the dump per human: LUFTLIFT_DUMP_UPLOAD = a DIRECTORY, files named
+  upload-<unix_ts>-<sender>.bin (sender from /Ask SenderComputerName, carried via shared state to /Upload).
+  pty-2 (gpt-5.5) idle/stood down. notify-1 still armed.
+  NEXT HEARTBEAT: check pty-3 committed the fix + tree green (cargo test -p luftlift-rs + clippy). Working tree
+  currently does NOT compile = pty-3 mid-edit (expected). Then rebuild+restart luftlift, have human re-send a
+  PHOTO from iPhone to re-test. ASK HUMAN what was sent (photo vs link/webloc).
+- PICKER-DROP DIAGNOSIS (human asked "after a few min luftlift vanishes from picker — is re-announce working?"):
+  YES it works — confirmed ON THE WIRE via `tcpdump -i awdl0 udp port 5353`: caught the re-announce burst at
+  12:16:40 + 12:16:41 (announce + RFC6762 §8.3 1s retransmit): PTR luftlift-1763244._airdrop._tcp.local /
+  SRV luftlift.local.:8771 / TXT flags=6 / AAAA fe80::be05:43ff:fe0d:50a1. Running binary HAS the re-announcer.
+  Root cause of picker-drop is BELOW mDNS = filin channel-hopping: re-announce is a ~1s burst every 60s; iPhone
+  only hears it if filin TXes on the iPhone's listen channel at that instant. Misses -> 120s A/SRV TTL lapses ->
+  drops from picker. FIXES: (a) luftlift quick = REANNOUNCE_SECS 60->~10 (mdns.rs const) for more chances;
+  (b) filin deep = repeat multicast announce across the full master channel-hop cycle, not once on current chan.
+  ASKED HUMAN whether to queue (a) into the next rebuild + dispatch (b) to a filin agent — AWAITING ANSWER.
 - STACK on pty-7: filin pid 1763226 + luftlift pid 1763244 (full-Rust). To restart: kill both; filin then luftlift.
 --- PRIOR cycle-29 below ---
 Last updated: cycle 29 (*** FULL-RUST STACK WORKS — but Upload decode yields empty file; live debug w/ human ***).
