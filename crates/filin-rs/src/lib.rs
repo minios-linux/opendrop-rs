@@ -7158,6 +7158,361 @@ pub mod os {
             }
         }
     }
+
+    /// rtnetlink neighbor-table manipulation (FILIN_NEIGHBOR_TABLE.md).
+    /// AWDL does not use NDP; filin must install static IPv6→MAC mappings via
+    /// `RTM_NEWNEIGH` (NUD_PERMANENT) so unicast awdl0 connections work —
+    /// mirrors owl's `neighbor_add_rfc4291` (owl/daemon/netutils.c:595).
+    pub mod rtnl {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // rtnetlink message types (uclibc/libc RTM_* constants).
+        const RTM_NEWNEIGH: u16 = 28;
+        const RTM_DELNEIGH: u16 = 29;
+        // rtm attribute ids (linux/include/uapi/linux/neighbour.h).
+        const NDA_DST: u16 = 1;
+        const NDA_LLADDR: u16 = 2;
+        // NUD_PERMANENT = 0x80 (linux/include/uapi/linux/neighbour.h).
+        const NUD_PERMANENT: u16 = 0x80;
+        // AF_INET6 = 10.
+        const AF_INET6: u8 = 10;
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub struct NeighborRequest {
+            pub ifindex: libc::c_int,
+            pub ipv6: [u8; 16],
+            pub mac: [u8; 6],
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum Error {
+            Invalid,
+            InvalidName,
+            Io(i32),
+            Protocol,
+        }
+
+        /// Validate a neighbor add/remove request. Mirrors `plan_set_channel`.
+        pub fn plan_neighbor(
+            ifindex: libc::c_int,
+            ipv6: [u8; 16],
+            mac: [u8; 6],
+        ) -> Result<NeighborRequest, Error> {
+            if ifindex <= 0 {
+                return Err(Error::Invalid);
+            }
+            // Reject non-link-local (fe80::/10) addresses — only AWDL-derived
+            // link-local mappings make sense here.
+            if ipv6[0] != 0xfe || (ipv6[1] & 0xc0) != 0x80 {
+                return Err(Error::Invalid);
+            }
+            Ok(NeighborRequest { ifindex, ipv6, mac })
+        }
+
+        /// Build the netlink message payload for an RTM_NEWNEIGH (add/replace)
+        /// or RTM_DELNEIGH (remove) request. Pure (no I/O), so unit-testable.
+        /// The payload starts with the `ndmsg` struct (12 bytes) followed by
+        /// rtattrs (NDA_DST = 16-byte IPv6, NDA_LLADDR = 6-byte MAC).
+        pub fn build_neighbor_payload(req: &NeighborRequest, remove: bool) -> (u16, Vec<u8>) {
+            let msg_type = if remove { RTM_DELNEIGH } else { RTM_NEWNEIGH };
+            let flags = if remove {
+                libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16
+            } else {
+                libc::NLM_F_REQUEST as u16
+                    | libc::NLM_F_ACK as u16
+                    | libc::NLM_F_CREATE as u16
+                    | libc::NLM_F_REPLACE as u16
+            };
+            // ndmsg struct (linux/include/uapi/linux/neighbour.h):
+            //   u8 ndm_family;  u8 ndm_pad1;  u16 ndm_pad2;
+            //   s32 ndm_ifindex;  u16 ndm_state;  u8 ndm_flags;  u8 ndm_type;
+            let mut payload = Vec::with_capacity(12 + 24 + 12);
+            payload.push(AF_INET6); // ndm_family
+            payload.push(0); // ndm_pad1
+            payload.extend_from_slice(&0u16.to_ne_bytes()); // ndm_pad2
+            payload.extend_from_slice(&req.ifindex.to_ne_bytes()); // ndm_ifindex
+            payload.extend_from_slice(&NUD_PERMANENT.to_ne_bytes()); // ndm_state
+            payload.push(0); // ndm_flags
+            payload.push(0); // ndm_type
+            // NDA_DST (IPv6 address, 16 bytes).
+            push_attr(&mut payload, NDA_DST, &req.ipv6);
+            // NDA_LLADDR (MAC, 6 bytes) — only for NEWNEIGH; DELNEIGH keys on
+            // the dst alone but including lladdr is harmless and keeps the
+            // builder symmetric.
+            push_attr(&mut payload, NDA_LLADDR, &req.mac);
+            let _ = flags; // flags are applied by the caller's netlink send
+            (msg_type, payload)
+        }
+
+        fn push_attr(buf: &mut Vec<u8>, kind: u16, value: &[u8]) {
+            let len = 4 + value.len();
+            buf.extend_from_slice(&(len as u16).to_ne_bytes());
+            buf.extend_from_slice(&kind.to_ne_bytes());
+            buf.extend_from_slice(value);
+            while !buf.len().is_multiple_of(4) {
+                buf.push(0);
+            }
+        }
+
+        /// Add (or replace) a static neighbor entry: `{ipv6 → mac}` on `iface`.
+        /// Idempotent via NLM_F_REPLACE; logs and continues on error (the
+        /// daemon stays up — a missing neighbor only affects one peer's
+        /// unicast path). Mirrors owl's `neighbor_add_rfc4291`.
+        pub fn add_neighbor(iface: &str, ipv6: [u8; 16], mac: [u8; 6]) -> Result<(), Error> {
+            let ifindex = resolve_ifindex(iface)?;
+            add_neighbor_ifindex(ifindex, ipv6, mac)
+        }
+
+        pub fn add_neighbor_ifindex(
+            ifindex: libc::c_int,
+            ipv6: [u8; 16],
+            mac: [u8; 6],
+        ) -> Result<(), Error> {
+            let req = plan_neighbor(ifindex, ipv6, mac)?;
+            let (msg_type, payload) = build_neighbor_payload(&req, false);
+            send_rtnl(msg_type, &payload)
+        }
+
+        /// Remove the static neighbor entry for `ipv6` on `iface`.
+        pub fn remove_neighbor(iface: &str, ipv6: [u8; 16]) -> Result<(), Error> {
+            let ifindex = resolve_ifindex(iface)?;
+            remove_neighbor_ifindex(ifindex, ipv6)
+        }
+
+        pub fn remove_neighbor_ifindex(ifindex: libc::c_int, ipv6: [u8; 16]) -> Result<(), Error> {
+            // DELNEIGH keys on (ifindex, dst) — the mac is not required, but
+            // build_neighbor_payload wants one; pass zeros (ignored on delete).
+            let req = plan_neighbor(ifindex, ipv6, [0; 6])?;
+            let (msg_type, payload) = build_neighbor_payload(&req, true);
+            send_rtnl(msg_type, &payload)
+        }
+
+        fn resolve_ifindex(iface: &str) -> Result<libc::c_int, Error> {
+            let iface = CString::new(iface).map_err(|_| Error::InvalidName)?;
+            // SAFETY: iface is a valid NUL-terminated C string.
+            let ifindex = unsafe { libc::if_nametoindex(iface.as_ptr()) };
+            if ifindex == 0 {
+                return Err(last_errno());
+            }
+            Ok(ifindex as libc::c_int)
+        }
+
+        fn send_rtnl(msg_type: u16, payload: &[u8]) -> Result<(), Error> {
+            let socket = RtnlSocket::open()?;
+            socket.request(
+                msg_type,
+                libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16,
+                payload,
+            )?;
+            Ok(())
+        }
+
+        struct RtnlSocket {
+            fd: OwnedFd,
+            seq: std::cell::Cell<u32>,
+        }
+
+        impl RtnlSocket {
+            fn open() -> Result<Self, Error> {
+                // SAFETY: socket arguments open a routing-netlink socket.
+                let fd = unsafe {
+                    libc::socket(
+                        libc::AF_NETLINK,
+                        libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                        libc::NETLINK_ROUTE,
+                    )
+                };
+                if fd < 0 {
+                    return Err(last_errno());
+                }
+                // SAFETY: fd was just returned by socket and is uniquely owned.
+                Ok(Self {
+                    fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                    seq: std::cell::Cell::new(1),
+                })
+            }
+
+            fn request(
+                &self,
+                nlmsg_type: u16,
+                flags: u16,
+                payload: &[u8],
+            ) -> Result<Vec<u8>, Error> {
+                let seq = self.seq.get();
+                self.seq.set(seq.wrapping_add(1));
+                let total = 16 + payload.len();
+                let mut msg = Vec::with_capacity(total);
+                msg.extend_from_slice(&(total as u32).to_ne_bytes());
+                msg.extend_from_slice(&nlmsg_type.to_ne_bytes());
+                msg.extend_from_slice(&flags.to_ne_bytes());
+                msg.extend_from_slice(&seq.to_ne_bytes());
+                msg.extend_from_slice(&0u32.to_ne_bytes());
+                msg.extend_from_slice(payload);
+
+                // SAFETY: msg is valid readable memory for msg.len() bytes.
+                let sent = unsafe {
+                    libc::send(
+                        self.fd.as_raw_fd(),
+                        msg.as_ptr().cast::<libc::c_void>(),
+                        msg.len(),
+                        0,
+                    )
+                };
+                if sent < 0 {
+                    return Err(last_errno());
+                }
+
+                let mut buf = vec![0u8; 8192];
+                // SAFETY: buf is valid writable memory for buf.len() bytes.
+                let len = unsafe {
+                    libc::recv(
+                        self.fd.as_raw_fd(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                        0,
+                    )
+                };
+                if len < 0 {
+                    return Err(last_errno());
+                }
+                buf.truncate(len as usize);
+                parse_ack(&buf)
+            }
+        }
+
+        fn parse_ack(buf: &[u8]) -> Result<Vec<u8>, Error> {
+            if buf.len() < 16 {
+                return Err(Error::Protocol);
+            }
+            let len = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            let kind = u16::from_ne_bytes([buf[4], buf[5]]);
+            if len > buf.len() || len < 16 {
+                return Err(Error::Protocol);
+            }
+            if kind == libc::NLMSG_ERROR as u16 {
+                if len < 20 {
+                    return Err(Error::Protocol);
+                }
+                let code = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
+                return if code == 0 {
+                    Ok(Vec::new())
+                } else {
+                    Err(Error::Io(-code))
+                };
+            }
+            Ok(buf[16..len].to_vec())
+        }
+
+        fn last_errno() -> Error {
+            Error::Io(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn plan_rejects_zero_ifindex() {
+                assert_eq!(
+                    plan_neighbor(0, [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0xff, 0xfe, 0, 0, 1], [0x02, 0, 0, 0, 0, 1]),
+                    Err(Error::Invalid)
+                );
+            }
+
+            #[test]
+            fn plan_rejects_non_link_local_ipv6() {
+                assert_eq!(
+                    plan_neighbor(5, [0x20, 0x01, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0xff, 0xfe, 0, 0, 1], [0x02, 0, 0, 0, 0, 1]),
+                    Err(Error::Invalid)
+                );
+            }
+
+            #[test]
+            fn plan_accepts_link_local_mapping() {
+                let ipv6 = [
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0xaa, 0xbb, 0xff, 0xfe, 0xcc, 0xdd, 0xee,
+                ];
+                let req = plan_neighbor(7, ipv6, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+                    .expect("valid neighbor request");
+                assert_eq!(req.ifindex, 7);
+                assert_eq!(req.ipv6, ipv6);
+            }
+
+            #[test]
+            fn build_payload_add_encodes_ndmsg_with_nud_permanent() {
+                let ipv6 = [
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0xaa, 0xbb, 0xff, 0xfe, 0xcc, 0xdd, 0xee,
+                ];
+                let req = plan_neighbor(7, ipv6, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]).unwrap();
+                let (msg_type, payload) = build_neighbor_payload(&req, false);
+
+                assert_eq!(msg_type, RTM_NEWNEIGH);
+                // ndmsg: family=AF_INET6, pad1=0, pad2=0, ifindex=7, state=NUD_PERMANENT
+                assert_eq!(payload[0], AF_INET6);
+                assert_eq!(payload[1], 0);
+                assert_eq!(u16::from_ne_bytes([payload[2], payload[3]]), 0);
+                assert_eq!(i32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]), 7);
+                assert_eq!(
+                    u16::from_ne_bytes([payload[8], payload[9]]),
+                    NUD_PERMANENT
+                );
+            }
+
+            #[test]
+            fn build_payload_delete_uses_delneigh_message_type() {
+                let ipv6 = [
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0xaa, 0xbb, 0xff, 0xfe, 0xcc, 0xdd, 0xee,
+                ];
+                let req = plan_neighbor(7, ipv6, [0; 6]).unwrap();
+                let (msg_type, _) = build_neighbor_payload(&req, true);
+                assert_eq!(msg_type, RTM_DELNEIGH);
+            }
+
+            #[test]
+            fn build_payload_includes_dst_and_lladdr_attrs() {
+                let ipv6 = [
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0xaa, 0xbb, 0xff, 0xfe, 0xcc, 0xdd, 0xee,
+                ];
+                let mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+                let req = plan_neighbor(7, ipv6, mac).unwrap();
+                let (_msg_type, payload) = build_neighbor_payload(&req, false);
+
+                // The NDA_DST attr (kind=1) must contain the 16-byte IPv6.
+                let dst = find_attr(&payload, NDA_DST).expect("NDA_DST present");
+                assert_eq!(dst, &ipv6);
+                // The NDA_LLADDR attr (kind=2) must contain the 6-byte MAC.
+                let lladdr = find_attr(&payload, NDA_LLADDR).expect("NDA_LLADDR present");
+                assert_eq!(&lladdr[..6], &mac);
+            }
+
+            /// Scan the rtattrs in a payload (after the 12-byte ndmsg) and
+            /// return the value slice for the first attr of `kind`.
+            fn find_attr(payload: &[u8], kind: u16) -> Option<&[u8]> {
+                let mut attrs = &payload[12..];
+                while attrs.len() >= 4 {
+                    let len = u16::from_ne_bytes([attrs[0], attrs[1]]) as usize;
+                    let k = u16::from_ne_bytes([attrs[2], attrs[3]]);
+                    if len < 4 || len > attrs.len() {
+                        return None;
+                    }
+                    if k == kind {
+                        return Some(&attrs[4..len]);
+                    }
+                    let aligned = (len + 3) & !3;
+                    if aligned > attrs.len() {
+                        return None;
+                    }
+                    attrs = &attrs[aligned..];
+                }
+                None
+            }
+        }
+    }
 }
 
 pub mod introspect {
