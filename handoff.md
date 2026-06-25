@@ -90,6 +90,24 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 17 (data path: Mac won't peer w/ filin; prime suspect = missing TX radiotap header).
+- Added periodic PSF/MIF self-announce TX (gpt-5.5 commit 1932ad2) + pcap dump
+  (--pcap/FILIN_PCAP, commit 9b44793). filin still SYNCS.
+- RETEST: still awdl0 RX=0 / Mac "Waiting". pcap of dropped frames = 55 Action, 3 Probe,
+  2 Request, 1 Response, and ZERO frames addressed to our MAC bc:05:43:0d:50:a1 — the
+  Mac sends filin NOTHING. So peer relationship never forms.
+- Can't sniff our own TX (monitor-mode loopback unreliable; tcpdump saw 0 of owl's
+  frames even though owl logs 'send MIF'). owl DOES peer with this Mac (its log shows
+  RX Service Responses). So the diff must be done at SOURCE level.
+- DELEGATED (gpt-5.5, pty-2): source-level owl-vs-filin TX diff -> FILIN_TX_DIAGNOSIS.md
+  + fix. PRIME SUSPECT: filin's frame injection likely writes RAW 802.11 with NO
+  radiotap TX header, so the carl9170 driver never actually transmits filin's frames
+  (inject 'succeeds' but nothing goes on air) -> Mac never hears filin -> no peering.
+  Check owl/src/io.c + tx.c (owl prepends a radiotap TX header) vs filin os::packet
+  send + runtime TX. Secondary: PSF/MIF TLV byte-correctness, AW timing, election.
+- If TX-radiotap-header is the fix, retest should make awdl0 RX climb >0 and complete
+  the transfer = FULL Rust stack validated.
+--- PRIOR cycle-16 below ---
 Last updated: cycle 16 (LIVE: filin SYNCS! data-path TX self-announce is the last gap).
 *** LIVE VALIDATION milestones so far ***
 - ✅ luftlift received a real photo over a C-owl link (Stage 1). Bug fixed: /Ask
