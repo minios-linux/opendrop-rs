@@ -136,11 +136,31 @@ pub mod ieee80211 {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum ParseError {
-        Unsupported,
+        TooShort,
     }
 
-    pub fn parse_mac_header(_frame: &[u8]) -> Result<MacHeader<'_>, ParseError> {
-        Err(ParseError::Unsupported)
+    pub fn parse_mac_header(frame: &[u8]) -> Result<MacHeader<'_>, ParseError> {
+        if frame.len() < 24 {
+            return Err(ParseError::TooShort);
+        }
+
+        Ok(MacHeader {
+            frame_control: u16::from_le_bytes([frame[0], frame[1]]),
+            duration_id: u16::from_le_bytes([frame[2], frame[3]]),
+            destination: read_addr(frame, 4)?,
+            source: read_addr(frame, 10)?,
+            bssid: read_addr(frame, 16)?,
+            sequence_control: u16::from_le_bytes([frame[22], frame[23]]),
+            body: &frame[24..],
+        })
+    }
+
+    fn read_addr(frame: &[u8], offset: usize) -> Result<[u8; 6], ParseError> {
+        Ok(frame
+            .get(offset..offset + 6)
+            .ok_or(ParseError::TooShort)?
+            .try_into()
+            .expect("slice length matches mac address length"))
     }
 
     #[cfg(test)]
