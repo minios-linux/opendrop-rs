@@ -90,6 +90,22 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 33 (filin transfer-pin + hysteresis + chanseq-decode COMMITTED; stack rebuilt+restarted; AWAITING human photo retry).
+- COMMITS: 0674ad1 fix(filin) decode AWDL chanseq encoding to real channels; 4e91681 fix(filin) pin to active-
+  transfer peer channel + master-adoption hysteresis. Tree green: filin 99 tests, clippy clean, release built.
+- *** LOG-READING CORRECTION (important): the "adopted master channel sequence master=[174,7,157,222,152,95]"
+  INFO log prints the 6-byte MASTER MAC ADDRESS (?master), NOT channel numbers. So the earlier "bogus channels
+  174/232/245" was a MISREAD — those are randomized Apple master MACs. The real issue was filin FLIP-FLOPPING
+  between TWO competing Apple masters, not bad channel decode. Bug A chanseq-decode is still a valid tested fix;
+  actual hop channels are decoded separately (not shown in that log). ***
+- STACK REBUILT+RESTARTED on pty-7 (NEW pids): filin 1797272, luftlift 1797291 (RUST_LOG=luftlift_rs=debug,
+  LUFTLIFT_DUMP_UPLOAD=/tmp/ldrop_raw, -o /tmp/ldrop). Logs /tmp/fF.log + /tmp/lrF.log. VERIFIED: luftlift
+  re-announcing every 10s; HYSTERESIS WORKING — master re-adoptions dropped 44/min -> 6/min (still 2 masters
+  competing but the transfer-pin should hold channel during an active /Upload).
+- AWAITING HUMAN: retry the iPhone42 photo. SUCCESS = upload completes -> non-empty file in /tmp/ldrop (+ raw
+  capture /tmp/ldrop_raw/upload-<ts>-iPhone42.bin). If it still stalls, check /tmp/lrF.log for "EOF before
+  last-chunk" (still hopping mid-transfer -> transfer-pin not holding) vs a completed Upload.
+--- PRIOR cycle-32 below ---
 Last updated: cycle 32 (LIVE RE-TEST: picker+decode fixes WORK; NEW blocker = unicast /Upload stalls from filin chanseq thrash; dispatched pty-5).
 - LIVE RE-TEST RESULT (iPhone42 photo, new stack pids filin 1785176 + luftlift 1785200):
   - ✅ PICKER/DISCOVERY now reliable: multiple Discover + 2 Ask (file_count=1) from iPhone42; 10s re-announce
