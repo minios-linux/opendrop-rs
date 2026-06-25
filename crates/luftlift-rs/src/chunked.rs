@@ -33,9 +33,46 @@ pub enum ChunkedError {
 /// Stops at the last-chunk (`0\r\n`) and consumes any trailer lines. This is
 /// the pure counterpart to the Python `_read_request_body` chunked branch.
 pub fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, ChunkedError> {
-    let _ = input;
-    // RED: unimplemented — tests below must fail first.
-    Err(ChunkedError::Truncated { needed: 0 })
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        // Read the chunk-size line up to CRLF.
+        let line_end = find_crlf(&input[pos..]).ok_or(ChunkedError::MissingCrlf)?;
+        let size_line = &input[pos..pos + line_end];
+        pos += line_end + 2; // consume the line + CRLF
+
+        let size_str = core::str::from_utf8(size_line).map_err(|_| {
+            ChunkedError::InvalidSizeLine(String::from_utf8_lossy(size_line).into_owned())
+        })?;
+        // Strip any chunk-extension (";name=value") — only the leading hex token is the size.
+        let size_token = size_str.split(';').next().unwrap().trim();
+        let chunk_size =
+            usize::from_str_radix(size_token, 16).map_err(|_| ChunkedError::InvalidSizeLine(size_str.to_string()))?;
+
+        if chunk_size == 0 {
+            // last-chunk: consume optional trailer-part up to the final CRLF.
+            break;
+        }
+
+        // chunk-data
+        if pos + chunk_size > input.len() {
+            return Err(ChunkedError::Truncated {
+                needed: pos + chunk_size - input.len(),
+            });
+        }
+        out.extend_from_slice(&input[pos..pos + chunk_size]);
+        pos += chunk_size;
+
+        // trailing CRLF after chunk-data
+        let _ = find_crlf(&input[pos..]).ok_or(ChunkedError::MissingCrlf)?;
+        pos += 2;
+    }
+    Ok(out)
+}
+
+/// Find the offset of the first `\r\n` in `s`, or `None`.
+fn find_crlf(s: &[u8]) -> Option<usize> {
+    s.windows(2).position(|w| w == b"\r\n")
 }
 
 #[cfg(test)]
