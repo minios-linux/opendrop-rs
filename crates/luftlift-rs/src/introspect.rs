@@ -230,17 +230,32 @@ where
 {
     fn on_event(
         &self,
-        _event: &tracing::Event<'_>,
+        event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        todo!()
+        if self.state.trace_enabled.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        self.state.push_trace(event_to_trace(event));
     }
 }
 
 /// Build a [`TraceEvent`] from a `tracing::Event` by visiting its recorded
 /// fields. Pure (no I/O) so it's unit-testable in isolation.
-pub fn event_to_trace(_event: &tracing::Event<'_>) -> TraceEvent {
-    todo!()
+pub fn event_to_trace(event: &tracing::Event<'_>) -> TraceEvent {
+    let mut visitor = FieldVisitor::default();
+    event.record(&mut visitor);
+    let msg = visitor
+        .message
+        .take()
+        .unwrap_or_else(|| event.metadata().name().to_string());
+    TraceEvent {
+        ts: now_unix_ms(),
+        level: event.metadata().level().to_string(),
+        target: event.metadata().target().to_string(),
+        msg,
+        fields: serde_json::Value::Object(visitor.fields),
+    }
 }
 
 #[derive(Default)]
@@ -517,7 +532,6 @@ mod tests {
     fn trace_collector_captures_events_only_when_enabled() {
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::Layer;
 
         let state = Arc::new(IntrospectState::new());
         let collector = TraceCollector::new(state.clone());
@@ -554,7 +568,6 @@ mod tests {
     fn trace_collector_uses_target_from_event_metadata() {
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::Layer;
 
         let state = Arc::new(IntrospectState::new());
         let collector = TraceCollector::new(state.clone());
