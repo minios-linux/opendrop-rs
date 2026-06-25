@@ -14,20 +14,44 @@ use std::sync::Mutex;
 /// dropped on push. The spec calls for ~2000.
 pub const TRACE_RING_CAP: usize = 2000;
 
+/// UNIX epoch milliseconds, used as a coarse timestamp origin for
+/// `last_announce_ms_ago`. Stored once to avoid re-reading the clock on hot
+/// paths.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Live, lock-free-ish receiver state for `/status`. Counters are atomic so
 /// the AirDrop HTTPS handler thread can bump them without contending with the
-/// introspection HTTP thread's snapshot read.
+/// introspection HTTP thread's snapshot read. The receiver name and last
+/// peer are updated rarely, so a `Mutex<String>` is plenty.
 #[derive(Default)]
 pub struct IntrospectState {
+    /// `ReceiverComputerName` shown in the Apple AirDrop picker.
     pub receiver_name: Mutex<String>,
+    /// True once mDNS announce has succeeded.
     pub mdns_announced: AtomicBool,
+    /// Port the AirDrop HTTPS listener is bound to (8771).
     pub https_port: AtomicU16,
+    /// ms-since-epoch of the most recent successful mDNS (re-)announce.
     pub last_announce_unix_ms: AtomicU64,
+    /// Inbound mDNS queries observed. Best-effort — mdns-sd 0.11 does not
+    /// expose incoming queries on a registered service directly, so this
+    /// is incremented opportunistically and may stay 0 in practice.
     pub mdns_query_rx: AtomicU64,
+    /// Count of `/Discover` POSTs received from Apple senders.
     pub discover_count: AtomicU64,
+    /// Count of `/Ask` POSTs received.
     pub ask_count: AtomicU64,
+    /// Count of `/Upload` POSTs received.
     pub upload_count: AtomicU64,
+    /// Most recent peer's sender name (from `/Ask`), for "who tried us last".
     pub last_peer: Mutex<String>,
+    /// Whether the trace ring is accepting events (off by default).
+    /// 0 = off, 1 = on.
     pub trace_enabled: AtomicU8,
 }
 
@@ -36,28 +60,64 @@ impl IntrospectState {
         Self::default()
     }
 
-    pub fn record_announce(&self, _receiver_name: String, _https_port: u16) {
-        todo!()
+    /// Record a successful mDNS announce: sets the flag and the timestamp.
+    pub fn record_announce(&self, receiver_name: String, https_port: u16) {
+        if let Ok(mut n) = self.receiver_name.lock() {
+            *n = receiver_name;
+        }
+        self.https_port.store(https_port, Ordering::Release);
+        self.last_announce_unix_ms.store(now_unix_ms(), Ordering::Release);
+        self.mdns_announced.store(true, Ordering::Release);
     }
 
+    /// Bump the inbound mDNS-query counter by 1.
     pub fn bump_mdns_query_rx(&self) {
-        todo!()
+        self.mdns_query_rx.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a `/Discover` POST: bump the counter.
     pub fn bump_discover(&self) {
-        todo!()
+        self.discover_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn bump_ask(&self, _sender: Option<&str>) {
-        todo!()
+    /// Record an `/Ask` POST: bump the counter and stash the sender name.
+    pub fn bump_ask(&self, sender: Option<&str>) {
+        self.ask_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(s) = sender {
+            if let Ok(mut cell) = self.last_peer.lock() {
+                *cell = s.to_string();
+            }
+        }
     }
 
+    /// Record an `/Upload` POST: bump the counter.
     pub fn bump_upload(&self) {
-        todo!()
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Snapshot the status for `/status`. The ms-ago field is computed at
+    /// snapshot time so callers don't have to.
     pub fn snapshot(&self) -> StatusSnapshot {
-        todo!()
+        let last_announce_ms = self.last_announce_unix_ms.load(Ordering::Acquire);
+        let now = now_unix_ms();
+        let last_announce_ms_ago = now.saturating_sub(last_announce_ms);
+        let receiver_name = self
+            .receiver_name
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let last_peer = self.last_peer.lock().map(|s| s.clone()).unwrap_or_default();
+        StatusSnapshot {
+            receiver_name,
+            mdns_announced: self.mdns_announced.load(Ordering::Acquire),
+            https_port: self.https_port.load(Ordering::Acquire),
+            last_announce_ms_ago,
+            mdns_query_rx: self.mdns_query_rx.load(Ordering::Acquire),
+            discover_count: self.discover_count.load(Ordering::Acquire),
+            ask_count: self.ask_count.load(Ordering::Acquire),
+            upload_count: self.upload_count.load(Ordering::Acquire),
+            last_peer,
+        }
     }
 }
 
@@ -159,7 +219,7 @@ mod tests {
         let st = IntrospectState::new();
         st.record_announce("luftlift".into(), 8771);
         st.bump_discover();
-        let json = serde_json::to_value(&st.snapshot()).unwrap();
+        let json = serde_json::to_value(st.snapshot()).unwrap();
         let obj = json.as_object().expect("status is a JSON object");
         for key in [
             "receiver_name",
