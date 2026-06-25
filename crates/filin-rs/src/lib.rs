@@ -4847,6 +4847,7 @@ pub mod runtime {
         mut links: Links,
         introspect: std::sync::Arc<crate::introspect::Introspection>,
         http_addr: Option<std::net::SocketAddr>,
+        park: bool,
     ) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
         let mut awdl_state = crate::state::AwdlState::new(
@@ -4898,6 +4899,14 @@ pub mod runtime {
             }
         }
 
+        if park {
+            tracing::info!(
+                "park mode enabled — filin will stay fixed on the top master's anchor channel (no hopping)"
+            );
+        }
+        // Tracks the last park channel we committed (for change detection).
+        let mut current_park: Option<u8> = None;
+
         // Hot-loop introspection state. last_injected_seq tracks the most
         // recently injected AWDL sequence control for /status "master_seq".
         let mut last_injected_seq: u16 = 0;
@@ -4908,6 +4917,20 @@ pub mod runtime {
 
         loop {
             let now_us = host_time_us();
+
+            // --- FILIN_SYNC_QUALITY.md pivot: single-channel park mode.
+            //     Re-evaluate the park channel (the stable top master's
+            //     anchor) on the throttled cadence; update_channel below then
+            //     only fires when it actually changes. AW timing is kept so
+            //     announces still transmit during availability windows. ---
+            if park && now_us.wrapping_sub(last_refresh_us) >= REFRESH_PERIOD_US {
+                let desired_park = awdl_state.park_channel();
+                if current_park != Some(desired_park) {
+                    tracing::info!(park_channel = desired_park, "park channel (re)selected");
+                    awdl_state.enable_park(desired_park);
+                    current_park = Some(desired_park);
+                }
+            }
 
             // --- throttled introspection snapshot refresh (~10 Hz) ---
             if now_us.wrapping_sub(last_refresh_us) >= REFRESH_PERIOD_US {
