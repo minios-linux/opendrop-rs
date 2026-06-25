@@ -48,14 +48,15 @@ pub mod radiotap {
         let mut flags = None;
         let mut antenna_signal_dbm = None;
 
-        for (word_index, present) in present_words.into_iter().enumerate() {
+        'fields: for (word_index, present) in present_words.into_iter().enumerate() {
             for bit in 0..31 {
                 if present & (1 << bit) == 0 {
                     continue;
                 }
 
-                let field = field_layout(word_index, bit)
-                    .ok_or(RadiotapError::UnsupportedField((word_index * 32 + bit) as u8))?;
+                let Some(field) = field_layout(word_index, bit) else {
+                    break 'fields;
+                };
                 offset = align(offset, field.align);
                 let bytes = read_slice(frame, header_len, offset, field.size)?;
 
