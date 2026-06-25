@@ -4954,6 +4954,67 @@ pub mod state {
             assert!(!t2.master_addr_changed, "top master stable across re-parent");
             assert!(t2.sync_addr_changed, "parent changed on re-parent");
         }
+
+        // --- FILIN_NEIGHBOR_TABLE.md: neighbor table change decisions ---
+
+        #[test]
+        fn neighbor_change_adds_on_first_sight_of_a_mac() {
+            let mut table = NeighborTable::new();
+            let mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            // First sight → Add.
+            assert_eq!(
+                table.note_peer_seen(&mac),
+                NeighborChange::Add(mac, awdl::link_local_ipv6(mac))
+            );
+            // Second sight → NoChange (already in the table; don't churn).
+            assert_eq!(table.note_peer_seen(&mac), NeighborChange::NoChange);
+        }
+
+        #[test]
+        fn neighbor_change_evicts_removed_macs() {
+            let mut table = NeighborTable::new();
+            let mac_a = [0x02, 0xaa, 0, 0, 0, 1];
+            let mac_b = [0x02, 0xbb, 0, 0, 0, 2];
+            table.note_peer_seen(&mac_a);
+            table.note_peer_seen(&mac_b);
+
+            // Evicting a MAC that was present → Remove.
+            let removed = table.evict_stale(&[mac_a]);
+            assert_eq!(
+                removed,
+                vec![NeighborChange::Remove(mac_a, awdl::link_local_ipv6(mac_a))]
+            );
+            // Evicting a MAC not in the table → nothing.
+            let removed = table.evict_stale(&[mac_a]);
+            assert!(removed.is_empty());
+            // mac_b still in the table.
+            assert_eq!(table.note_peer_seen(&mac_b), NeighborChange::NoChange);
+        }
+
+        #[test]
+        fn neighbor_change_evicts_only_peers_no_longer_seen() {
+            let mut table = NeighborTable::new();
+            let mac_a = [0x02, 0xaa, 0, 0, 0, 1];
+            let mac_b = [0x02, 0xbb, 0, 0, 0, 2];
+            let mac_c = [0x02, 0xcc, 0, 0, 0, 3];
+            table.note_peer_seen(&mac_a);
+            table.note_peer_seen(&mac_b);
+            table.note_peer_seen(&mac_c);
+
+            // mac_b is still alive (in live set) → NOT evicted.
+            // mac_a and mac_c evicted.
+            let removed = table.evict_stale(&[mac_b]);
+            let removed_macs: Vec<[u8; 6]> = removed
+                .iter()
+                .filter_map(|c| match c {
+                    NeighborChange::Remove(mac, _) => Some(*mac),
+                    _ => None,
+                })
+                .collect();
+            assert!(removed_macs.contains(&mac_a));
+            assert!(removed_macs.contains(&mac_c));
+            assert!(!removed_macs.contains(&mac_b));
+        }
     }
 }
 
