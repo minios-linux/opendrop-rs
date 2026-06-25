@@ -1493,8 +1493,8 @@ pub mod runtime {
 
     fn ieee80211_payload_preview(frame: &[u8]) -> String {
         match radiotap::parse_header(frame) {
-            Ok(header) => hex_preview(header.payload, 16),
-            Err(_) => hex_preview(frame, 16),
+            Ok(header) => hex_preview(header.payload, 64),
+            Err(_) => hex_preview(frame, 64),
         }
     }
 
@@ -1581,13 +1581,15 @@ pub mod runtime {
 
         #[test]
         fn previews_payload_after_radiotap_header() {
-            let frame = [
+            let mut frame = vec![
                 0x00, 0x00, 0x08, 0x00, // radiotap version, pad, len
                 0x00, 0x00, 0x00, 0x00, // no present fields
-                0xd0, 0x00, 0xff, 0xff,
+                0xd0, 0x00,
             ];
+            frame.extend(0u8..80);
 
-            assert_eq!(ieee80211_payload_preview(&frame), "d0 00 ff ff");
+            assert_eq!(ieee80211_payload_preview(&frame).split(' ').count(), 64);
+            assert!(ieee80211_payload_preview(&frame).starts_with("d0 00 00 01"));
         }
     }
 }
