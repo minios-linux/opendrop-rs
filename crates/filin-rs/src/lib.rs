@@ -1136,3 +1136,36 @@ pub mod cli {
         }
     }
 }
+
+pub mod os {
+    pub mod tun {
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum Error {
+            InvalidName,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub struct IfReqPlan {
+            pub name: [u8; libc::IFNAMSIZ],
+            pub flags: libc::c_short,
+        }
+
+        pub fn plan_tap_ifreq(_name: &str) -> Result<IfReqPlan, Error> {
+            Err(Error::InvalidName)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn plans_tap_ifreq_for_awdl0_without_packet_info() {
+                let plan = plan_tap_ifreq("awdl0").expect("valid tap name");
+
+                assert_eq!(&plan.name[..5], b"awdl0");
+                assert_eq!(plan.name[5], 0);
+                assert_eq!(plan.flags, (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short);
+            }
+        }
+    }
+}
