@@ -116,7 +116,16 @@ Last updated: cycle 30 (DISPATCHED pty-3 to fix iPhone /Upload decode — chunke
   only hears it if filin TXes on the iPhone's listen channel at that instant. Misses -> 120s A/SRV TTL lapses ->
   drops from picker. FIXES: (a) luftlift quick = REANNOUNCE_SECS 60->~10 (mdns.rs const) for more chances;
   (b) filin deep = repeat multicast announce across the full master channel-hop cycle, not once on current chan.
-  ASKED HUMAN whether to queue (a) into the next rebuild + dispatch (b) to a filin agent — AWAITING ANSWER.
+  HUMAN APPROVED BOTH, wants TWO separate commits. DISPATCHED both this cycle:
+  - (a) pty-3 luftlift: queued AFTER its /Upload fix as a SEPARATE commit fix(luftlift): re-announce every 10s
+    (REANNOUNCE_SECS 60->10 in mdns.rs).
+  - (b) pty-5 filin (GLM, idle, fresh 45K ctx, authored 5e221db): FILIN_MULTICAST_SPREAD.md — enqueue each
+    multicast frame, TX it on every distinct channel of the adopted master chanseq across one hop cycle (fall
+    back to anchor when no master); bounded/aged queue; ONE commit fix(filin): spread multicast announce across
+    the channel hop cycle. Dispatched, pty-5 working.
+  NEXT HEARTBEAT: watch for THREE commits total — luftlift /Upload fix, luftlift REANNOUNCE 10s, filin multicast
+  spread. Then rebuild+restart full stack (filin then luftlift), have human re-send a PHOTO from iPhone, and
+  watch the picker stays populated + the file decodes non-empty.
 - STACK on pty-7: filin pid 1763226 + luftlift pid 1763244 (full-Rust). To restart: kill both; filin then luftlift.
 --- PRIOR cycle-29 below ---
 Last updated: cycle 29 (*** FULL-RUST STACK WORKS — but Upload decode yields empty file; live debug w/ human ***).
