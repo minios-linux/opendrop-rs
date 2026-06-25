@@ -4,11 +4,16 @@ Both agent crates (`awdl-rs`, `airdrop-rs`) are developed **test-first**, with a
 git commit at **each TDD stage**. This keeps the parallel work reviewable and
 lets the orchestrator (Claude) integrate confidently.
 
-## Branches (avoid stepping on each other)
-- gpt-5.5 works on branch **`feat/awdl-rs`**, only under `crates/awdl-rs/`.
-- GLM-5.2 works on branch **`feat/airdrop-rs`**, only under `crates/airdrop-rs/`.
-- Claude owns `main`, the workspace `Cargo.toml`, docs, and merges.
-- Do not edit files outside your crate without asking Claude (they're shared).
+## Subdirectory ownership (avoid stepping on each other)
+Everyone works in the one repo on `main`. Collisions are avoided by **strict
+subdirectory ownership** — touch only your own crate:
+- gpt-5.5 → **only** files under `crates/awdl-rs/`.
+- GLM-5.2 → **only** files under `crates/airdrop-rs/`.
+- Claude owns `main` integration, the workspace `Cargo.toml`, `crates/opendrop-rs/`, and `docs/`.
+- Do NOT edit files outside your crate (especially the workspace `Cargo.toml`,
+  the other crate, or docs) — if you need a change there, ask Claude.
+- `git pull --rebase` is unnecessary (one local repo), but before each commit run
+  `git status` and make sure every changed path is inside your crate dir.
 
 ## The TDD cycle — commit at every stage
 For each small unit of behavior:

@@ -65,6 +65,6 @@ peers; a `receive` should narrate the Discover→Ask→Upload phases. The Python
 stack hid all this at debug level — surface it.
 
 ## Workflow
-Follow `../../WORKFLOW.md`: branch `feat/airdrop-rs`, TDD with red/green/review
-commits, keep all code under `crates/airdrop-rs/`. Coordinate dep additions with
-Claude.
+Follow `../../WORKFLOW.md`: work on `main`, **only under `crates/airdrop-rs/`**,
+TDD with red/green/review commits. Coordinate workspace `Cargo.toml` dep
+additions with Claude.
