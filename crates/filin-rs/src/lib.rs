@@ -753,3 +753,63 @@ pub mod channel {
         }
     }
 }
+
+pub mod tx {
+    use std::collections::VecDeque;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum InjectError {
+        WouldBlock,
+        Failed,
+    }
+
+    pub trait Injector {
+        fn inject(&mut self, frame: &[u8]) -> Result<(), InjectError>;
+    }
+
+    #[derive(Debug, Default)]
+    pub struct TxQueue {
+        pending: VecDeque<Vec<u8>>,
+    }
+
+    impl TxQueue {
+        pub fn push(&mut self, frame: Vec<u8>) {
+            self.pending.push_back(frame);
+        }
+
+        pub fn pending_len(&self) -> usize {
+            self.pending.len()
+        }
+
+        pub fn flush<I: Injector>(&mut self, _injector: &mut I) -> Result<usize, InjectError> {
+            unimplemented!("RED: TX retry queue not implemented yet")
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        struct BlockingInjector {
+            calls: usize,
+        }
+
+        impl Injector for BlockingInjector {
+            fn inject(&mut self, _frame: &[u8]) -> Result<(), InjectError> {
+                self.calls += 1;
+                Err(InjectError::WouldBlock)
+            }
+        }
+
+        #[test]
+        fn keeps_frame_queued_when_inject_would_block() {
+            let mut queue = TxQueue::default();
+            queue.push(vec![1, 2, 3]);
+            let mut injector = BlockingInjector { calls: 0 };
+
+            assert_eq!(queue.flush(&mut injector), Ok(0));
+            assert_eq!(injector.calls, 1);
+            assert_eq!(queue.pending_len(), 1);
+        }
+    }
+}
