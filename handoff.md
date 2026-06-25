@@ -90,6 +90,28 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 18 (REFRAME: lower AWDL layers only superficially work; full owl-vs-filin audit underway).
+*** Human's call: filin's lower layers (election/sync/schedule/AW-timing/peer-table)
+    are hacky/stubbed — they produce plausible numbers but don't actually peer.
+    NOT a wrap-up; this is the real work. ***
+- TX radiotap header fix (gpt-5.5 commits 59d1fd3/d7680d0): filin now puts frames
+  on-air (it RXes its own injected frames = loopback, RX==TX==42). BUT confirmed via
+  `tcpdump -i awdl0 'not ether src <ourmac>'` = ZERO inbound from the Mac. So the Mac
+  still does NOT peer with filin. Earlier RX climb was filin's own loopback, not the Mac.
+- KNOWN-HACKY (from FILIN_TX_DIAGNOSIS.md): filin election uses fixed self-master vals +
+  fixed counters; TX timing is blind 110 TU (no availability-window gating); likely NO
+  peer table; MIF frames still fail AwdlTlv(TooShort).
+- DELEGATED to GLM (pty-5): systematic layer-by-layer owl-vs-filin audit -> FILIN_AUDIT.md,
+  then FIX each layer (priority: election -> peer table -> sync/AW schedule -> AW-gated TX
+  timing -> MIF TLV -> data path), commit per layer, TDD, keep green. gpt-5.5 (pty-2)
+  STOOD DOWN — only GLM edits filin now. Monitor via FILIN_AUDIT.md + git log, not terminal.
+- owl module map: election.c, sync.c, schedule.c, channel.c, peers.c, state.c, tx.c,
+  rx.c, wire.c, frame.c; daemon/core.c (timers/AW), daemon/io.c (inject w/ radiotap).
+- Diagnosis docs on disk (root *.md NOT gitignored but `git add` was being finicky —
+  retry committing FILIN_TX_DIAGNOSIS.md / FILIN_RX_DIAGNOSIS_GPT.md / FILIN_AUDIT.md).
+- Live test recipe + env unchanged (pty-7 filin+luftlift; pty-9 Mac osascript sheet;
+  carl9170 wlxbc05430d50a1 ch44). The transfer is NOT done; data path still broken.
+--- PRIOR cycle-17 below ---
 Last updated: cycle 17 (data path: Mac won't peer w/ filin; prime suspect = missing TX radiotap header).
 - Added periodic PSF/MIF self-announce TX (gpt-5.5 commit 1932ad2) + pcap dump
   (--pcap/FILIN_PCAP, commit 9b44793). filin still SYNCS.
