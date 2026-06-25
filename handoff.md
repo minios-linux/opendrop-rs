@@ -90,6 +90,18 @@ Send: `..._pty_send_keys(session_id, keys)` then a separate `[ENTER]`.
 - Deeper hardware/protocol findings are in project memory (awdl-wifi-hardware.md).
 
 ## CURRENT STATE (UPDATE THIS EACH CYCLE)
+Last updated: cycle 6 (filin ALL PORT.md milestones DONE + integrating; luftlift on mDNS).
+- filin (gpt-5.5): COMPLETE through PORT.md — parsers, election, sync, TSFT bridge,
+  sync-error, channel freq/slot, TX backpressure queue, iface config (awdl0/mon/ch44)
+  all green. Now writing INTEGRATED RX tests (radiotap+802.11+AWDL MIF end-to-end,
+  TSFT timestamp + RSSI carry-through). Essentially feature-complete; verifying.
+- luftlift (GLM-5.2): dvzip, CPIO, chunked, plist, HTTP parser, handlers, **TLS green**
+  (543ccd7). Now on mDNS announce (mdns-sd ServiceInfo API), then wire receive flow
+  in main.rs. ~2 milestones from feature-complete. Autonomous, no blocker.
+- APPROACHING TARGET: once luftlift finishes mDNS + receive-loop wiring, do a full
+  workspace integration pass (cargo build/test/clippy at root), wire opendrop-rs CLI
+  if needed, then write the success report (how to run + hardware-pass caveat).
+--- (prior cycle notes below) ---
 Last updated: cycle 5 (filin channel logic DONE; luftlift thrashing rustls 0.23 API — watch).
 - filin (gpt-5.5): + sync-error compute, channel<->frequency, channel-slot-for-EAW
   (with %16 wraparound) all green. Stack complete through CHANNEL. Remaining per
