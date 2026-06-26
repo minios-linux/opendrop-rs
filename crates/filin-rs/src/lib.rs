@@ -84,12 +84,29 @@ pub mod radiotap {
         })
     }
 
-    pub fn build_tx_header() -> Vec<u8> {
-        vec![
-            0x00, 0x00, 0x09, 0x00, // version, pad, length
-            0x04, 0x00, 0x00, 0x00, // present: rate
-            0x18, // 12 Mbps encoded as 500 kbps units
-        ]
+    /// Build the radiotap TX header. Adds the **TX-flags** (bit 15) and
+    /// **data-retries** (bit 17) fields on top of the rate (bit 2).
+    ///
+    /// For `want_ack` (UNICAST) frames we leave `NOACK` clear and request
+    /// retries, so the driver/hardware retransmits on a missing 802.11 ACK.
+    /// The peer DOES MAC-ACK our injected unicast frames (confirmed by RF
+    /// capture: 50k+ ACKs to our addr), but monitor injection was previously
+    /// fire-and-forget — 0 retries — so a lost frame near the end of a bulk
+    /// transfer was only recovered by slow TCP (the ~120s endgame stall). For
+    /// multicast/broadcast (`want_ack=false`) we set `NOACK` (never ACKed).
+    pub fn build_tx_header(want_ack: bool) -> Vec<u8> {
+        // IEEE80211_RADIOTAP_F_TX_NOACK = 0x0008.
+        let (tx_flags, retries): (u16, u8) = if want_ack { (0x0000, 7) } else { (0x0008, 0) };
+        let mut v = vec![
+            0x00, 0x00, // version, pad
+            0x0d, 0x00, // length = 13
+            0x04, 0x80, 0x02, 0x00, // present: rate(2) | TX flags(15) | data retries(17)
+            0x18, // rate: 12 Mbps (500 kbps units)
+            0x00, // pad to 2-byte-align the TX-flags field (offset 9 -> 10)
+        ];
+        v.extend_from_slice(&tx_flags.to_le_bytes());
+        v.push(retries);
+        v
     }
 
     fn align(offset: usize, alignment: usize) -> usize {
@@ -208,15 +225,21 @@ pub mod radiotap {
         }
 
         #[test]
-        fn builds_owl_compatible_tx_radiotap_header() {
+        fn builds_tx_radiotap_header_with_ack_and_retries() {
+            // Unicast: rate + TX flags (0 = expect ACK) + 7 data retries.
             assert_eq!(
-                build_tx_header(),
+                build_tx_header(true),
                 vec![
-                    0x00, 0x00, 0x09, 0x00, // version, pad, length
-                    0x04, 0x00, 0x00, 0x00, // present: rate
-                    0x18, // 12 Mbps encoded as 500 kbps units
+                    0x00, 0x00, 0x0d, 0x00, // version, pad, length=13
+                    0x04, 0x80, 0x02, 0x00, // present: rate | TX flags | data retries
+                    0x18, // 12 Mbps
+                    0x00, // align pad
+                    0x00, 0x00, // TX flags = 0 (NOACK clear → expect ACK + retry)
+                    0x07, // 7 data retries
                 ]
             );
+            // Multicast/broadcast: NOACK set (0x0008), 0 retries.
+            assert_eq!(&build_tx_header(false)[10..13], &[0x08, 0x00, 0x00]);
         }
     }
 }
@@ -3669,6 +3692,12 @@ pub mod iface {
         /// channels like 52). `None` = normal election. The contained value is
         /// the metric to advertise (see [`crate::election::force_self_master`]).
         pub force_master: Option<u32>,
+        /// `--tx-retransmits N`: blindly re-inject each UNICAST data frame this
+        /// many extra times (with the 802.11 Retry bit set so the peer de-dups),
+        /// compensating for the carl9170's lack of MAC-layer retransmission on
+        /// monitor injection (confirmed: 0 hardware retries). 0 = off (single
+        /// send). Default 2 → each unicast frame sent 1+2 = 3×.
+        pub tx_retransmits: u32,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -3713,6 +3742,7 @@ pub mod iface {
                 park: false,
                 disable_rssi_filter: false,
                 force_master: None,
+                tx_retransmits: 2,
             };
 
             assert_eq!(validate_config(config.clone()), Ok(config));
@@ -4121,6 +4151,14 @@ pub mod cli {
         /// refuses to switch. Ignored when `--no-force-master` is in effect.
         #[arg(long = "force-master-metric")]
         force_master_metric: Option<u32>,
+        /// Blind redundancy: re-inject each unicast data frame this many EXTRA
+        /// times (with the 802.11 Retry bit) to survive RF loss without MAC
+        /// retransmission. Default 0 (OFF) — on the carl9170, even 2x extra
+        /// during a high-rate upload overloads the half-duplex channel / inject
+        /// queue and WEDGES the transfer (airtime contention, not raw loss, is
+        /// the bottleneck). Enable cautiously, low values only.
+        #[arg(long = "tx-retransmits", default_value_t = 0)]
+        tx_retransmits: u32,
     }
 
     pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
@@ -4158,6 +4196,7 @@ pub mod cli {
             } else {
                 None
             },
+            tx_retransmits: args.tx_retransmits,
         })
         .map_err(|_| CliError::Invalid)
     }
@@ -4185,6 +4224,7 @@ pub mod cli {
                 disable_rssi_filter: false,
                     // Force-master is on by default now.
                     force_master: Some(crate::election::DEFAULT_FORCE_MASTER_METRIC),
+                    tx_retransmits: 0,
                 }
             );
         }
@@ -4306,6 +4346,7 @@ pub mod cli {
                 park: false,
                 disable_rssi_filter: false,
                 force_master: None,
+                tx_retransmits: 2,
             };
             assert_eq!(
                 iface::validate_config(bad),
@@ -5721,7 +5762,11 @@ pub mod runtime {
         park: bool,
         disable_rssi_filter: bool,
         force_master: Option<u32>,
+        tx_retransmits: u32,
     ) -> Result<(), Error> {
+        if tx_retransmits > 0 {
+            println!("tx-retransmits: re-injecting each unicast data frame {tx_retransmits}x extra (with Retry bit)");
+        }
         let mut bridge = TsftBridge::default();
         let mut awdl_state = crate::state::AwdlState::new(
             links.self_addr,
@@ -5932,7 +5977,7 @@ pub mod runtime {
 
             // --- data TX: retry pending frame if AW allows ---
             if let Some(frame) = pending_tx.take() {
-                match try_send_data(&links, &awdl_state, now_us, &frame) {
+                match try_send_data(&links, &awdl_state, now_us, &frame, tx_retransmits) {
                     TxOutcome::Sent => last_injected_seq = frame.seq,
                     // still can't send — keep it pending
                     TxOutcome::Hold => pending_tx = Some(frame),
@@ -6168,14 +6213,21 @@ pub mod runtime {
                     match awdl::encapsulate_ethernet_payload(&tap_buf[..len], awdl_state.tx_seq) {
                         Ok(body) => {
                             let seq = awdl_state.next_data_seq();
+                            // Unicast data frames (TCP/ACK traffic) request
+                            // 802.11 ACK + HW retries; multicast/broadcast
+                            // (mDNS announce, NDP) stay NOACK.
+                            let unicast = dst[0] & 0x01 == 0;
                             let frame = PendingFrame {
-                                radiotap_frame: radiotap_prefixed(ieee80211::build_data_frame(
-                                    dst,
-                                    src,
-                                    AWDL_BSSID,
-                                    seq << 4,
-                                    &body,
-                                )),
+                                radiotap_frame: radiotap_prefixed(
+                                    ieee80211::build_data_frame(
+                                        dst,
+                                        src,
+                                        AWDL_BSSID,
+                                        seq << 4,
+                                        &body,
+                                    ),
+                                    unicast,
+                                ),
                                 dst,
                                 seq,
                             };
@@ -6227,6 +6279,7 @@ pub mod runtime {
                                     &awdl_state,
                                     host_time_us(),
                                     &frame,
+                                    tx_retransmits,
                                 ) {
                                     TxOutcome::Sent => last_injected_seq = seq,
                                     TxOutcome::Hold => {
@@ -6290,6 +6343,7 @@ pub mod runtime {
         awdl_state: &crate::state::AwdlState,
         now_us: u64,
         frame: &PendingFrame,
+        tx_retransmits: u32,
     ) -> TxOutcome {
         let decision = crate::schedule::data_send_decision(
             &frame.dst,
@@ -6309,12 +6363,25 @@ pub mod runtime {
         }
         match links.packet.send(&frame.radiotap_frame) {
             Ok(sent) => {
+                let unicast = frame.dst[0] & 0x01 == 0;
                 tracing::trace!(
                     sent,
                     channel = awdl_state.current_channel,
-                    multicast = frame.dst[0] & 0x01 == 1,
+                    multicast = !unicast,
                     "injected awdl data frame"
                 );
+                // Blind redundancy: the carl9170 does NOT MAC-retransmit
+                // injected frames, so re-inject UNICAST frames a few extra
+                // times with the 802.11 Retry bit set. The peer's 802.11
+                // duplicate-detection (seqno + Retry bit) drops the copies, but
+                // if the first is lost on air a copy still arrives — avoiding
+                // the slow TCP-timeout recovery that stalled bulk uploads.
+                if unicast && tx_retransmits > 0 {
+                    let retry = with_retry_bit(&frame.radiotap_frame);
+                    for _ in 0..tx_retransmits {
+                        let _ = links.packet.send(&retry);
+                    }
+                }
                 TxOutcome::Sent
             }
             Err(err) => {
@@ -6324,6 +6391,22 @@ pub mod runtime {
                 TxOutcome::Hold
             }
         }
+    }
+
+    /// Return a copy of a radiotap-prefixed 802.11 frame with the **Retry**
+    /// bit (frame-control 0x0800) set, so a re-injected copy looks like a
+    /// MAC-layer retransmit and the peer de-dups it. The 802.11 frame-control
+    /// is the first 2 bytes after the radiotap header (whose length is the
+    /// little-endian u16 at offset 2-3); the Retry bit lives in the high byte.
+    fn with_retry_bit(radiotap_frame: &[u8]) -> Vec<u8> {
+        let mut copy = radiotap_frame.to_vec();
+        if copy.len() >= 4 {
+            let rt_len = u16::from_le_bytes([copy[2], copy[3]]) as usize;
+            if copy.len() > rt_len + 1 {
+                copy[rt_len + 1] |= 0x08; // frame-control bit 11 (Retry)
+            }
+        }
+        copy
     }
 
     /// Inject any pending multicast-spread frames whose remaining channels
@@ -6540,7 +6623,8 @@ pub mod runtime {
             sequence_control,
             &action,
         );
-        radiotap_prefixed(frame)
+        // AWDL action frames are broadcast → never ACKed.
+        radiotap_prefixed(frame, false)
     }
 
     fn build_announce_tlvs(
@@ -6583,8 +6667,8 @@ pub mod runtime {
         tlvs
     }
 
-    fn radiotap_prefixed(mut frame: Vec<u8>) -> Vec<u8> {
-        let mut prefixed = radiotap::build_tx_header();
+    fn radiotap_prefixed(mut frame: Vec<u8>, want_ack: bool) -> Vec<u8> {
+        let mut prefixed = radiotap::build_tx_header(want_ack);
         prefixed.append(&mut frame);
         prefixed
     }
@@ -6975,7 +7059,8 @@ pub mod runtime {
             let state = demo_state();
             let frame = build_announce_frame(awdl::ActionSubtype::Psf, &state, 0x0120, 1_000_000);
             let radiotap = radiotap::parse_header(&frame).expect("valid tx radiotap header");
-            assert_eq!(radiotap.header_len, 9);
+            // 13-byte TX header now (rate + TX-flags + data-retries fields).
+            assert_eq!(radiotap.header_len, 13);
             let mac = ieee80211::parse_mac_header(radiotap.payload).expect("valid action header");
             let action = awdl::parse_action_frame(mac.body).expect("valid awdl action");
             let tlvs = awdl::parse_tlvs(action.tlvs).expect("valid announce TLVs");

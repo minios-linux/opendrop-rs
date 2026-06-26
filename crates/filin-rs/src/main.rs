@@ -45,6 +45,7 @@ fn main() -> anyhow::Result<()> {
         config.park,
         config.disable_rssi_filter,
         config.force_master,
+        config.tx_retransmits,
     )
     .map_err(|err| anyhow::anyhow!("filin runtime stopped: {err:?}"))
 }
