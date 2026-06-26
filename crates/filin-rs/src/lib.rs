@@ -1681,17 +1681,23 @@ pub mod schedule {
 
     /// owl `awdl_can_send_in` (owl/src/schedule.c:48-55): returns 0 when it is
     /// safe to send now (inside the guard-free core of the AW), a positive
-    /// number of seconds to wait before the next safe window, or a negative
-    /// number of seconds meaning "we are in the trailing guard, wait this long
-    /// plus the guard before retrying".
+    /// wait meaning "we are in the leading edge of the next AW / trailing guard,
+    /// wait this long", or a negative wait meaning "we are inside the guard,
+    /// hold this long before retrying".
+    ///
+    /// owl returns the wait as fractional `double` *seconds*; filin returns it
+    /// as i64 *microseconds*. The sign and the zero/non-zero distinction are
+    /// preserved (the only properties callers depend on). Returning seconds via
+    /// integer division would floor every guard-sized quantity (≤ 16 TU ≈
+    /// 16_384 us) to 0, silently disabling the guard gate entirely.
     pub fn can_send_in(sync: &SyncState, now_us: u64, guard_tu: u16) -> i64 {
         let next_aw = sync.next_aw_us(now_us);
         let guard = tu_to_us(u64::from(guard_tu));
         let eaw = tu_to_us(64); // presence_mode(4) * aw_period(16) TU
         if next_aw < guard {
-            -(us_to_sec(guard - next_aw))
+            -((guard - next_aw) as i64)
         } else if eaw - next_aw < guard {
-            us_to_sec(guard - (eaw - next_aw))
+            (guard - (eaw - next_aw)) as i64
         } else {
             0
         }
@@ -1699,10 +1705,6 @@ pub mod schedule {
 
     fn tu_to_us(tu: u64) -> u64 {
         tu * TU_US
-    }
-
-    fn us_to_sec(us: u64) -> i64 {
-        us as i64 / 1_000_000
     }
 
     /// Decision returned by [`data_send_decision`]: whether the TX path
@@ -2277,6 +2279,24 @@ pub mod schedule {
             // (well clear of the 16 TU guard on both sides).
             let sync = synced();
             assert_eq!(can_send_in(&sync, 1_032_768, MULTICAST_GUARD_TU), 0);
+        }
+
+        #[test]
+        fn leading_guard_returns_negative() {
+            // last_update at 1_000_000; at 1_050_000 we are 50_000 us into the
+            // 65_536 us EAW, so next_aw = 15_536 us < the 16 TU (16_384 us)
+            // multicast guard. owl returns a negative wait; the gate must be
+            // non-zero so the frame is held, not sent through the guard.
+            let sync = synced();
+            assert!(can_send_in(&sync, 1_050_000, MULTICAST_GUARD_TU) < 0);
+        }
+
+        #[test]
+        fn trailing_guard_returns_positive() {
+            // At the AW boundary (1_000_000) we sit in the trailing guard:
+            // eaw - next_aw = 0 < guard, so owl returns a positive wait.
+            let sync = synced();
+            assert!(can_send_in(&sync, 1_000_000, MULTICAST_GUARD_TU) > 0);
         }
 
         #[test]
