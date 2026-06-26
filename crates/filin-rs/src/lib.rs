@@ -5453,12 +5453,20 @@ pub mod runtime {
     }
 
     pub fn open_links(config: &Config) -> Result<Links, Error> {
-        let tap = os::tun::open_tap(&config.host_iface).map_err(|_| Error::Tap)?;
+        println!("trying to open tap");
+        let tap = os::tun::open_tap(&config.host_iface).map_err(|e| {
+            eprintln!("open_tap({}) failed: {:?}", config.host_iface, e);
+            Error::Tap
+        })?;
+        println!("Opened tap");
         let monitor_addr =
             os::netdev::get_hwaddr(&config.monitor_iface).map_err(|_| Error::Netdev)?;
+        println!("Monitor addr: {:?}", &monitor_addr);
         os::netdev::set_hwaddr(&config.host_iface, monitor_addr).map_err(|_| Error::Netdev)?;
+        println!("set addr: {:?}", &monitor_addr);
         os::netdev::set_mtu(&config.host_iface, 1450).map_err(|_| Error::Netdev)?;
         os::netdev::set_up(&config.host_iface).map_err(|_| Error::Netdev)?;
+        println!("setup host {:?}", &config.host_iface);
         let frequency_mhz =
             channel::channel_to_frequency_mhz(config.anchor_channel).ok_or(Error::Channel)?;
         os::nl80211::set_channel(&config.monitor_iface, u32::from(frequency_mhz))
