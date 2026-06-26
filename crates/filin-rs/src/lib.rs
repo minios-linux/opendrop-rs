@@ -4176,6 +4176,13 @@ pub mod state {
             tlvs: &[awdl::Tlv<'_>],
             rx_time_us: u64,
         ) {
+            // Monitor mode reflects our own injected frames back to us. owl
+            // drops frames sourced from self (rx.c); filin must too, or it
+            // registers its own MAC as a peer and elects itself master,
+            // flapping the election and wrecking sync with real peers.
+            if src == self.self_addr {
+                return;
+            }
             self.peers.touch(src, rx_time_us);
             let mut sync_update: Option<(u16, u16)> = None;
             if let Some(peer) = self.peers.get_mut(&src) {
@@ -5636,13 +5643,15 @@ pub mod runtime {
                                         rx::RSSI_GRACE_DEFAULT,
                                     )
                                 };
-                                if rssi_ok {
+                                if rssi_ok && src != links.self_addr {
                                     awdl_state.apply_action(src, subtype, &frame.tlvs, rx_time_us);
                                 // FILIN_NEIGHBOR_TABLE.md: install a static
                                 // neighbor entry for this peer so unicast
                                 // awdl0 connections work. AWDL does not use
                                 // NDP — derive IPv6 from MAC (RFC 4291) and
-                                // add to the kernel neighbor table.
+                                // add to the kernel neighbor table. (Self-sourced
+                                // monitor reflections are excluded above so we
+                                // never install a neighbor for our own MAC.)
                                 match neighbor_table.note_peer_seen(&src) {
                                     crate::state::NeighborChange::Add(mac, ipv6) => {
                                         if let Err(err) =
