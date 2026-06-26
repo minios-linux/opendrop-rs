@@ -5299,6 +5299,51 @@ pub mod runtime {
         })
     }
 
+    /// Poll `revents` bits that mean a fd is in an error / hang-up state rather
+    /// than merely readable. `poll(2)` reports these even when only `POLLIN`
+    /// was requested, and they are sticky until the error is consumed (e.g. via
+    /// `recv`). The RX loop originally acted only on `POLLIN`, so a monitor
+    /// socket that entered `POLLERR` (e.g. after a carl9170 USB reset / firmware
+    /// -110) made `poll` return immediately every iteration with no `POLLIN`
+    /// bit — a silent 100% CPU busy-spin with no RX and no progress.
+    pub const POLL_ERR_BITS: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+
+    /// True when a pollfd's `revents` signals an error/hang-up (not just data).
+    pub fn poll_revents_is_error(revents: libc::c_short) -> bool {
+        revents & POLL_ERR_BITS != 0
+    }
+
+    /// Consecutive error-only poll iterations on the monitor socket tolerated
+    /// before filin gives up and exits. A brief transient (rx-ring overflow, a
+    /// single device-reset blip) clears well within this; a wedged radio
+    /// (carl9170 firmware -110) never recovers on its own, so we exit loudly so
+    /// the operator/supervisor can recover the card and restart, rather than
+    /// linger as a zombie. With `POLL_ERROR_BACKOFF` this is ~1s of solid error.
+    pub const POLL_ERROR_FATAL_THRESHOLD: u32 = 200;
+
+    /// Backoff slept after each error-only poll iteration so a persistently
+    /// failed socket cannot spin the CPU while we wait for it to recover or
+    /// reach the fatal threshold.
+    pub const POLL_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub enum PollErrorAction {
+        /// Keep running — drain the error and retry (transient).
+        Continue,
+        /// Sustained failure — stop the RX loop so the daemon can be restarted.
+        Fatal,
+    }
+
+    /// Escalation policy for a monitor-socket error: tolerate transients up to
+    /// `threshold` consecutive error iterations, then declare it fatal.
+    pub fn poll_error_action(consecutive_errors: u32, threshold: u32) -> PollErrorAction {
+        if consecutive_errors >= threshold {
+            PollErrorAction::Fatal
+        } else {
+            PollErrorAction::Continue
+        }
+    }
+
     pub fn run(
         mut links: Links,
         introspect: std::sync::Arc<crate::introspect::Introspection>,
@@ -5379,6 +5424,11 @@ pub mod runtime {
         // write happens at most every 100 ms — cheap, never blocks the loop.
         let mut last_refresh_us: u64 = 0;
         const REFRESH_PERIOD_US: u64 = 100_000;
+
+        // Consecutive iterations the monitor socket has reported POLLERR/POLLHUP
+        // without POLLIN. Reset to 0 on any successful POLLIN read; used to
+        // escalate a stuck socket to a clean exit instead of a silent spin.
+        let mut consecutive_packet_errors: u32 = 0;
 
         loop {
             let now_us = host_time_us();
@@ -5539,6 +5589,7 @@ pub mod runtime {
             }
 
             if fds[0].revents & libc::POLLIN != 0 {
+                consecutive_packet_errors = 0;
                 match links.packet.recv(&mut wlan_buf) {
                     Ok(len) => {
                         let now_us = host_time_us();
@@ -5695,6 +5746,31 @@ pub mod runtime {
                     }
                     Err(err) => tracing::trace!(?err, "packet recv failed"),
                 }
+            } else if poll_revents_is_error(fds[0].revents) {
+                // Monitor socket in POLLERR/POLLHUP/POLLNVAL (e.g. carl9170 USB
+                // reset / firmware -110). poll() returns this immediately every
+                // iteration; the old loop ignored it and spun the CPU at 100%
+                // with no RX. Drain the pending socket error so a transient
+                // condition can clear, back off so we never spin, and exit if
+                // it persists past the fatal threshold.
+                consecutive_packet_errors = consecutive_packet_errors.saturating_add(1);
+                let drained = links.packet.recv(&mut wlan_buf);
+                tracing::warn!(
+                    revents = fds[0].revents,
+                    consecutive = consecutive_packet_errors,
+                    drained = ?drained,
+                    "monitor packet socket error (POLLERR/POLLHUP); draining and backing off"
+                );
+                std::thread::sleep(POLL_ERROR_BACKOFF);
+                if poll_error_action(consecutive_packet_errors, POLL_ERROR_FATAL_THRESHOLD)
+                    == PollErrorAction::Fatal
+                {
+                    tracing::error!(
+                        consecutive = consecutive_packet_errors,
+                        "monitor packet socket stuck in error state; exiting so the radio can be recovered and filin restarted"
+                    );
+                    return Err(Error::Packet);
+                }
             }
 
             if fds[1].revents & libc::POLLIN != 0 {
@@ -5776,6 +5852,16 @@ pub mod runtime {
                         Err(err) => tracing::trace!(?err, len, "ignored host tap frame"),
                     }
                 }
+            } else if poll_revents_is_error(fds[1].revents) {
+                // awdl0 TAP reported error/hangup (the interface was removed or
+                // the fd is invalid). Unlike the monitor socket this cannot
+                // recover in place — the TAP is gone — so surface it loudly and
+                // exit rather than ignore it and spin (same silent-spin class).
+                tracing::error!(
+                    revents = fds[1].revents,
+                    "awdl0 TAP error/hangup; exiting so filin can be restarted"
+                );
+                return Err(Error::Tap);
             }
         }
     }
@@ -6458,8 +6544,11 @@ pub mod runtime {
             // At/above threshold: fatal — exit so the radio can be recovered.
             assert_eq!(poll_error_action(200, 200), PollErrorAction::Fatal);
             assert_eq!(poll_error_action(5_000, 200), PollErrorAction::Fatal);
-            // A sane default threshold ships in the constant.
-            assert!(POLL_ERROR_FATAL_THRESHOLD >= 1);
+            // The shipped default threshold uses the same Continue/Fatal split.
+            assert_eq!(
+                poll_error_action(POLL_ERROR_FATAL_THRESHOLD, POLL_ERROR_FATAL_THRESHOLD),
+                PollErrorAction::Fatal
+            );
         }
 
         #[test]
