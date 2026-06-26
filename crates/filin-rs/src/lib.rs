@@ -5673,6 +5673,32 @@ pub mod runtime {
         pcap: Option<pcap::Writer<File>>,
     }
 
+    /// Best-effort: tell NetworkManager to stop managing the monitor interface
+    /// so it can't fight filin's monitor-mode config or try to (re)connect it
+    /// in managed mode. After a USB unplug/replug the re-enumerated device
+    /// commonly reverts to NM-managed. Idempotent, and silently ignored if
+    /// nmcli / NetworkManager isn't present.
+    fn release_from_network_manager(iface: &str) {
+        match std::process::Command::new("nmcli")
+            .args(["device", "set", iface, "managed", "no"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(s) if s.success() => {
+                tracing::info!(iface, "released interface from NetworkManager (managed no)")
+            }
+            Ok(s) => tracing::debug!(
+                iface,
+                code = ?s.code(),
+                "nmcli 'managed no' non-zero (NetworkManager may be absent)"
+            ),
+            Err(e) => {
+                tracing::debug!(iface, ?e, "could not run nmcli (NetworkManager not installed?)")
+            }
+        }
+    }
+
     pub fn open_links(config: &Config) -> Result<Links, Error> {
         println!("trying to open tap");
         let tap = os::tun::open_tap(&config.host_iface).map_err(|e| {
@@ -5698,6 +5724,10 @@ pub mod runtime {
         // `-N` skips the mode change (assume it's configured externally), e.g.
         // when something else owns the radio's mode.
         if !config.assume_monitor {
+            // Steal the iface from NetworkManager first, or NM will keep
+            // re-managing it (managed mode) and fight our monitor config —
+            // especially after a USB replug re-enumerates it as managed.
+            release_from_network_manager(&config.monitor_iface);
             let _ = os::netdev::set_down(&config.monitor_iface); // best-effort
             os::nl80211::set_monitor(&config.monitor_iface).map_err(|_| Error::Netdev)?;
             println!("set monitor mode {:?}", &config.monitor_iface);
