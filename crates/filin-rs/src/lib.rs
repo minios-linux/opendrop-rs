@@ -5875,8 +5875,29 @@ pub mod runtime {
         // escalate a stuck socket to a clean exit instead of a silent spin.
         let mut consecutive_packet_errors: u32 = 0;
 
+        // Liveness check for the monitor interface. A card flap can leave the
+        // iface administratively DOWN *without* the AF_PACKET socket reporting
+        // POLLERR — the loop would then just see "no data" forever and never
+        // recover. Poll IFF_UP ~once/second; if the monitor went down (or
+        // vanished), return so main()'s retry loop re-runs open_links (which
+        // reconfigures monitor mode + up + channel). Same MAC → awdl0 keeps its
+        // address, so luftlift isn't disturbed.
+        let mut last_iface_check_us: u64 = 0;
+        const IFACE_CHECK_PERIOD_US: u64 = 1_000_000;
+
         loop {
             let now_us = host_time_us();
+
+            if now_us.wrapping_sub(last_iface_check_us) >= IFACE_CHECK_PERIOD_US {
+                last_iface_check_us = now_us;
+                if !os::netdev::is_up(&links.monitor_iface) {
+                    tracing::warn!(
+                        iface = %links.monitor_iface,
+                        "monitor interface is down/gone (card flap?); reopening links"
+                    );
+                    return Err(Error::Netdev);
+                }
+            }
 
             // --- FILIN_SYNC_QUALITY.md pivot: single-channel park mode.
             //     Re-evaluate the park channel (the stable top master's
@@ -7700,6 +7721,28 @@ pub mod os {
                 return Err(last_errno());
             }
             Ok(())
+        }
+
+        /// True if the interface exists and is administratively UP (IFF_UP).
+        /// Returns false on any error (missing iface, ioctl failure) so callers
+        /// can treat "can't tell / gone" the same as "down" and recover.
+        pub fn is_up(iface: &str) -> bool {
+            let socket = match control_socket() {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let mut request = match IfReqFlags::new(iface, 0) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCGIFFLAGS.
+            let rc = unsafe {
+                libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request as *mut IfReqFlags)
+            };
+            if rc < 0 {
+                return false;
+            }
+            request.flags & (libc::IFF_UP as libc::c_short) != 0
         }
 
         /// Bring an interface administratively DOWN (clears IFF_UP). Needed
