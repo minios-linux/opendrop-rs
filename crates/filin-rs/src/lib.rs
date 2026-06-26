@@ -4517,21 +4517,30 @@ pub mod state {
             let top = self.election.master_addr;
             let mut counts: BTreeMap<u8, usize> = BTreeMap::new();
             for peer in self.peers.iter() {
-                if peer.election.master_addr == top && peer.sequence[0][0] != 0 {
-                    *counts.entry(peer.sequence[0][0]).or_default() += 1;
+                let ch = peer.sequence[0][0];
+                // Skip No-IR/DFS anchors: the carl9170 can't TX there, so we
+                // must never park there (we'd be unable to announce or answer
+                // /Discover|/Ask). A No-IR-anchored cluster still visits the
+                // social channels, where we CAN reach it.
+                if peer.election.master_addr == top
+                    && ch != 0
+                    && !crate::channel::is_no_ir_channel(ch)
+                {
+                    *counts.entry(ch).or_default() += 1;
                 }
             }
             if let Some((&ch, _)) = counts.iter().max_by_key(|(_, c)| *c) {
                 return ch;
             }
-            // No peers reporting the top master's slot-0: if the top master is
-            // itself a peer, use its anchor.
+            // No TX-capable slot-0 among peers reporting the top master: if the
+            // top master is itself a peer and its anchor is TX-capable, use it.
             if let Some(top_peer) = self.peers.get(&top) {
-                if top_peer.sequence[0][0] != 0 {
-                    return top_peer.sequence[0][0];
+                let ch = top_peer.sequence[0][0];
+                if ch != 0 && !crate::channel::is_no_ir_channel(ch) {
+                    return ch;
                 }
             }
-            // Last resort: the configured anchor channel.
+            // Last resort: the configured anchor channel (always TX-capable).
             self.anchor_channel as u8
         }
 
@@ -5145,8 +5154,10 @@ pub mod state {
         #[test]
         fn park_channel_picks_top_master_anchor_from_peers() {
             // Two peers report the SAME top master_addr; their slot-0 channels
-            // are 52 and 52 (and one says 44). The dominant slot-0 across
-            // peers reporting the elected master_addr is 52 → park there.
+            // are 149 and 149 (one says 44). The dominant TX-capable slot-0
+            // across peers reporting the elected master_addr is 149 → park
+            // there. (TX-capable channels only; No-IR avoidance is covered by
+            // park_channel_never_parks_on_a_no_ir_channel.)
             let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
             let top = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
             state.election.master_addr = top;
@@ -5158,14 +5169,14 @@ pub mod state {
             {
                 let peer = state.peers.get_mut(&p1).unwrap();
                 peer.election.master_addr = top;
-                peer.sequence[0] = [52, 0x80];
+                peer.sequence[0] = [149, 0x80];
             }
             {
                 let peer = state.peers.get_mut(&p2).unwrap();
                 peer.election.master_addr = top;
-                peer.sequence[0] = [52, 0x80];
+                peer.sequence[0] = [149, 0x80];
             }
-            assert_eq!(state.park_channel(), 52);
+            assert_eq!(state.park_channel(), 149);
         }
 
         #[test]
