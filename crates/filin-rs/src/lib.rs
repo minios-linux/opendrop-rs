@@ -4572,13 +4572,31 @@ pub mod state {
             }
             let master = self.committed_master;
             if master == self.self_addr {
-                // self-master: use static anchor sequence
-                let opclass = chan_opclass(self.anchor_channel);
-                let anchor_seq = [[self.anchor_channel as u8, opclass]; CHANSEQ_LEN];
-                if self.channel_sequence != anchor_seq {
-                    self.channel_sequence = anchor_seq;
+                let desired = if self.election.force_master {
+                    // force-master: advertise the FULL social rotation (6/44/149,
+                    // biased toward our anchor) rather than a single anchor, so
+                    // the cluster we pull in hops across every AWDL social
+                    // channel — including 149 where iPhones scan for AirDrop.
+                    // All three are non-DFS / TX-capable (see
+                    // channel::is_no_ir_channel: DFS is 52-64 / 100-144 only).
+                    let mut seq = [[0u8, 0u8]; CHANSEQ_LEN];
+                    crate::schedule::ensure_social_coverage(
+                        &mut seq,
+                        self.anchor_channel as u8,
+                    );
+                    seq
+                } else {
+                    // self-master: use static anchor sequence
+                    let opclass = chan_opclass(self.anchor_channel);
+                    [[self.anchor_channel as u8, opclass]; CHANSEQ_LEN]
+                };
+                if self.channel_sequence != desired {
+                    self.channel_sequence = desired;
                     self.master_anchor = 0; // no external master
-                    tracing::debug!("reverted to static anchor channel sequence");
+                    tracing::debug!(
+                        force_master = self.election.force_master,
+                        "set self-master channel sequence"
+                    );
                 }
             } else if let Some(peer) = self.peers.get(&master) {
                 // adopted master: copy its sequence if it has any non-null slots
@@ -4979,6 +4997,30 @@ pub mod state {
             assert_eq!(state.channel_sequence[0], [44, 0x80]);
             assert_eq!(state.version, AWDL_VERSION);
             assert_eq!(state.dev_class, AWDL_DEVCLASS_MACOS);
+        }
+
+        #[test]
+        fn force_master_self_sequence_covers_all_social_channels() {
+            // In force-master mode the self-master sequence must rotate over
+            // ALL three social channels (6/44/149) — not just the -c anchor —
+            // since 149 (non-DFS) is where iPhones scan for AirDrop.
+            let mut state = AwdlState::new([0x02, 1, 2, 3, 4, 5], "filin".into(), 44, 0);
+            state.election.force_self_master(crate::election::DEFAULT_FORCE_MASTER_METRIC);
+            // Trigger sync_channel_sequence (runs inside clean_peers).
+            state.clean_peers(0);
+            let chans: std::collections::BTreeSet<u8> =
+                state.channel_sequence.iter().map(|s| s[0]).collect();
+            for ch in [6u8, 44, 149] {
+                assert!(chans.contains(&ch), "force-master seq must include ch{ch}");
+            }
+            // No DFS/No-IR channel should ever appear in our advertised seq.
+            for s in state.channel_sequence.iter() {
+                assert!(
+                    !crate::channel::is_no_ir_channel(s[0]),
+                    "force-master seq must not contain No-IR ch{}",
+                    s[0]
+                );
+            }
         }
 
         #[test]
