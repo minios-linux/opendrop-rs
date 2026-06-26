@@ -54,17 +54,26 @@ pub fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, ChunkedError> {
             break;
         }
 
-        // chunk-data
-        if pos + chunk_size > input.len() {
-            return Err(ChunkedError::Truncated {
-                needed: pos + chunk_size - input.len(),
-            });
-        }
-        out.extend_from_slice(&input[pos..pos + chunk_size]);
-        pos += chunk_size;
+        // chunk-data. Use checked_add: an attacker-supplied size near
+        // usize::MAX would otherwise overflow pos + chunk_size — panicking on
+        // the add (debug) or wrapping to a small value that slips past the
+        // bounds check and panics on the slice (release). Either is a remote
+        // crash, since this runs on the live server's untrusted request body.
+        let end = pos
+            .checked_add(chunk_size)
+            .filter(|&e| e <= input.len())
+            .ok_or(ChunkedError::Truncated {
+                needed: chunk_size.saturating_sub(input.len() - pos),
+            })?;
+        out.extend_from_slice(&input[pos..end]);
+        pos = end;
 
-        // trailing CRLF after chunk-data
-        let _ = find_crlf(&input[pos..]).ok_or(ChunkedError::MissingCrlf)?;
+        // trailing CRLF must immediately follow the chunk-data, not appear
+        // somewhere later (which find_crlf would scan forward to, silently
+        // mis-decoding). Require it at exactly `pos`.
+        if input.get(pos..pos + 2) != Some(b"\r\n") {
+            return Err(ChunkedError::MissingCrlf);
+        }
         pos += 2;
     }
     Ok(out)
@@ -133,6 +142,28 @@ mod tests {
         assert!(matches!(
             decode_chunked(body),
             Err(ChunkedError::InvalidSizeLine(_))
+        ));
+    }
+
+    #[test]
+    fn decode_chunked_rejects_overflowing_size() {
+        // A chunk size near usize::MAX must not overflow pos + chunk_size
+        // (which panics on the add or the slice). Reject it as truncated.
+        let body = b"ffffffffffffffff\r\nWiki\r\n0\r\n\r\n";
+        assert!(matches!(
+            decode_chunked(body),
+            Err(ChunkedError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_chunked_rejects_misaligned_chunk_crlf() {
+        // The CRLF must immediately follow the chunk-data; extra bytes before
+        // it are a malformed body, not silently skipped.
+        let body = b"4\r\nWikiXX\r\n0\r\n\r\n";
+        assert!(matches!(
+            decode_chunked(body),
+            Err(ChunkedError::MissingCrlf)
         ));
     }
 
