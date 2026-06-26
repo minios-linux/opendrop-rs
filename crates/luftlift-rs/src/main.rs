@@ -19,7 +19,8 @@ use luftlift_rs::{
     plist_impl::ReceiverConfig,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -127,9 +128,7 @@ fn receive(
     http_addr: String,
     introspect: Arc<IntrospectState>,
 ) -> Result<()> {
-    let addr = netutil::get_ipv6_for_interface(interface)
-        .ok_or_else(|| anyhow::anyhow!("interface {interface} has no IPv6 address — is filin-rs/awdl0 running?"))?;
-    tracing::info!(interface, %addr, flags = format!("0x{flags:02x}"), "starting AirDrop receiver");
+    tracing::info!(interface, flags = format!("0x{flags:02x}"), "starting AirDrop receiver");
 
     let cert = tls::generate_self_signed_cert()?;
     let tls_config = tls::build_server_config(&cert)?;
@@ -150,18 +149,6 @@ fn receive(
         computer_model: "MacBookPro".into(),
         record_data: None,
     };
-    let mdns_cfg = mdns::MdnsConfig {
-        computer_name: base_name,
-        port: 8771,
-        flags,
-    };
-    let (daemon, info) = mdns::announce(interface, &mdns_cfg, addr.into())?;
-    let fullname = info.get_fullname().to_string();
-    tracing::info!(service = %fullname, "mDNS announced — receiver visible in AirDrop picker");
-
-    // Surface the announce in /status. record_announce sets the name/port,
-    // the announce flag, and a fresh timestamp for last_announce_ms_ago.
-    introspect.record_announce(receiver_name, 8771);
 
     // Spawn the loopback introspect HTTP server unless explicitly disabled.
     // Bound to 127.0.0.1 only — never reachable over the AWDL link. The
@@ -182,36 +169,128 @@ fn receive(
         tracing::info!("introspect HTTP server disabled (--http-addr off)");
     }
 
-    // mdns-sd's A/SRV TTL is 120s; if no announcement or query-answer crosses
-    // the AWDL link within that window the receiver disappears from the Apple
-    // AirDrop picker (confirmed live). Spawn a background thread that
-    // proactively re-announces every REANNOUNCE_SECS (60) so the records stay
-    // fresh independent of query traffic.
-    let daemon = Arc::new(daemon);
-    let (reannounce_stop, _reannounce_handle) =
-        mdns::spawn_reannouncer(daemon.clone(), info);
+    // RESILIENCE: the awdl0 tap is owned by filin and is destroyed/recreated
+    // (with a new MAC → new IPv6) whenever filin restarts or the USB Wi-Fi card
+    // is bounced. The HTTPS listener below is bound to [::]:8771 (dual-stack)
+    // and survives that, but the mDNS announce is tied to awdl0's specific
+    // address. A supervisor thread (re)announces whenever awdl0's address
+    // appears or changes, checking once per second — so the receiver
+    // automatically reappears in the AirDrop picker after a card bounce
+    // instead of advertising a dead/old address.
+    let goodbye: Arc<Mutex<Option<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(None));
+    {
+        let interface = interface.to_string();
+        let base_name = default_base_name();
+        let receiver_name = receiver_name.clone();
+        let introspect = introspect.clone();
+        let goodbye = goodbye.clone();
+        std::thread::spawn(move || {
+            mdns_announce_supervisor(
+                &interface,
+                flags,
+                &base_name,
+                &receiver_name,
+                introspect,
+                goodbye,
+            );
+        });
+    }
 
-    // Install a SIGINT/SIGTERM handler that sends the mDNS TTL=0 goodbye so
-    // Apple devices remove us from their AirDrop picker immediately, instead
-    // of leaving a ghost entry lingering after Ctrl+C. The PID-suffixed
-    // instance name (set in build_airdrop_service_info) further lets you tell
-    // a fresh run from any stale ghost that survives a crash. The stop flag
-    // lets the re-announcer thread wind down cleanly before exit.
-    let goodbye_daemon = daemon.clone();
-    let goodbye_fullname = fullname.clone();
-    let goodbye_stop = reannounce_stop.clone();
-    ctrlc::set_handler(move || {
-        tracing::info!(service = %goodbye_fullname, "signal received — sending mDNS goodbye");
-        goodbye_stop.store(true, std::sync::atomic::Ordering::Release);
-        let _ = mdns::goodbye(&goodbye_daemon, &goodbye_fullname);
-        std::process::exit(0);
-    })?;
+    // SIGINT/SIGTERM: send the current mDNS TTL=0 goodbye (the supervisor keeps
+    // it up to date for whatever address is currently announced) so Apple
+    // devices drop us from their picker immediately, then exit.
+    {
+        let goodbye = goodbye.clone();
+        ctrlc::set_handler(move || {
+            tracing::info!("signal received — sending mDNS goodbye");
+            if let Ok(g) = goodbye.lock() {
+                if let Some(f) = g.as_ref() {
+                    f();
+                }
+            }
+            std::process::exit(0);
+        })?;
+    }
 
     let listener = server::bind_listener(8771)?;
     tracing::info!(output = %output.display(), "saving received files to output dir");
 
     server::serve_forever(listener, Arc::new(tls_config), cfg, Some(output), introspect);
     Ok(())
+}
+
+/// Keep an mDNS `_airdrop._tcp` announcement alive on the CURRENT awdl0
+/// address, re-announcing whenever that address appears or changes. Runs
+/// forever, polling once per second. Tearing down the previous announcement
+/// (stop its re-announcer, TTL=0 goodbye, shut the daemon down) before making
+/// a new one avoids advertising a stale/old address after a card bounce.
+fn mdns_announce_supervisor(
+    interface: &str,
+    flags: u32,
+    base_name: &str,
+    receiver_name: &str,
+    introspect: Arc<IntrospectState>,
+    goodbye: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
+) {
+    let mdns_cfg = mdns::MdnsConfig {
+        computer_name: base_name.to_string(),
+        port: 8771,
+        flags,
+    };
+    // Teardown for the currently-active announce, and the address it advertises.
+    let mut teardown: Option<Box<dyn Fn()>> = None;
+    let mut last_addr: Option<std::net::Ipv6Addr> = None;
+
+    loop {
+        match netutil::get_ipv6_for_interface(interface) {
+            // New or changed awdl0 address → (re)announce.
+            Some(addr) if Some(addr) != last_addr => {
+                if let Some(td) = teardown.take() {
+                    td();
+                }
+                match mdns::announce(interface, &mdns_cfg, addr.into()) {
+                    Ok((daemon, info)) => {
+                        let daemon = Arc::new(daemon);
+                        let fullname = info.get_fullname().to_string();
+                        let (stop, _handle) = mdns::spawn_reannouncer(daemon.clone(), info);
+                        introspect.record_announce(receiver_name.to_string(), 8771);
+                        tracing::info!(%addr, service = %fullname, "mDNS (re)announced on awdl0");
+
+                        // Update the ctrl-c goodbye to point at this daemon.
+                        if let Ok(mut g) = goodbye.lock() {
+                            let d = daemon.clone();
+                            let fname = fullname.clone();
+                            *g = Some(Box::new(move || {
+                                let _ = mdns::goodbye(&d, &fname);
+                            }));
+                        }
+                        // Teardown: stop re-announcer, goodbye, shut daemon down.
+                        let d = daemon.clone();
+                        let fname = fullname.clone();
+                        teardown = Some(Box::new(move || {
+                            stop.store(true, Ordering::Release);
+                            let _ = mdns::goodbye(&d, &fname);
+                            let _ = d.shutdown();
+                        }));
+                        last_addr = Some(addr);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, %addr, "mDNS announce failed; retrying in 1s");
+                    }
+                }
+            }
+            // awdl0 lost its address → tear down so we re-announce on return.
+            None if last_addr.is_some() => {
+                if let Some(td) = teardown.take() {
+                    td();
+                }
+                last_addr = None;
+                tracing::warn!(interface, "awdl0 address gone; will re-announce when it returns");
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn find(interface: &str, duration: u64) -> Result<()> {

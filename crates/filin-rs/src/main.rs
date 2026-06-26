@@ -35,17 +35,48 @@ fn main() -> anyhow::Result<()> {
         http_addr = ?config.http_addr,
         "validated filin configuration"
     );
-    let links = filin_rs::runtime::open_links(&config)
-        .map_err(|err| anyhow::anyhow!("failed to open filin links: {err:?}"))?;
-    tracing::info!("filin links are up");
-    filin_rs::runtime::run(
-        links,
-        introspect,
-        config.http_addr,
-        config.park,
-        config.disable_rssi_filter,
-        config.force_master,
-        config.tx_retransmits,
-    )
-    .map_err(|err| anyhow::anyhow!("filin runtime stopped: {err:?}"))
+    // Resilience: the USB Wi-Fi card can be bounced (USB reset / replug /
+    // firmware -110), which takes the monitor interface and our AF_PACKET
+    // socket down. Rather than exit, retry open_links + run forever with a ~1s
+    // backoff so filin recovers automatically when the card returns. `run`
+    // already returns Err within ~1s once the monitor socket is stuck in
+    // POLLERR (see POLL_ERROR_FATAL_THRESHOLD), so this loop reacts promptly.
+    //
+    // The introspection HTTP server is a detached thread spawned inside `run`;
+    // we pass the bind address only on the FIRST run() so retries never try to
+    // re-bind the (still-listening) port. `http_addr.take()` yields Some once,
+    // then None — and only when open_links succeeds, so the server spawns on
+    // the first run that actually starts, not the first attempt.
+    let mut http_addr = config.http_addr;
+    loop {
+        match filin_rs::runtime::open_links(&config) {
+            Ok(links) => {
+                tracing::info!("filin links are up");
+                match filin_rs::runtime::run(
+                    links,
+                    introspect.clone(),
+                    http_addr.take(),
+                    config.park,
+                    config.disable_rssi_filter,
+                    config.force_master,
+                    config.tx_retransmits,
+                ) {
+                    Ok(()) => {
+                        tracing::info!("filin runtime exited cleanly");
+                        return Ok(());
+                    }
+                    Err(err) => tracing::warn!(
+                        ?err,
+                        "filin runtime stopped (monitor iface gone?); reopening links in 1s"
+                    ),
+                }
+            }
+            Err(err) => tracing::warn!(
+                ?err,
+                iface = %config.monitor_iface,
+                "failed to open filin links (card not present?); retrying in 1s"
+            ),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }

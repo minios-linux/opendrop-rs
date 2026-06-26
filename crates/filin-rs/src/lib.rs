@@ -4112,7 +4112,12 @@ pub mod cli {
         anchor_channel: u16,
         #[arg(short = 'h', default_value = "awdl0")]
         host_iface: String,
-        #[arg(short = 'N')]
+        /// Assume the monitor interface is already in monitor mode: SKIP filin's
+        /// monitor-mode configuration (down → type monitor). filin still brings
+        /// the iface up and sets the channel. Without -N (default), filin forces
+        /// monitor mode so it auto-recovers a card that re-enumerated in managed
+        /// mode after a USB bounce.
+        #[arg(short = 'N', long = "assume-monitor")]
         assume_monitor: bool,
         #[arg(long = "pcap")]
         pcap_path: Option<String>,
@@ -5683,6 +5688,24 @@ pub mod runtime {
         os::netdev::set_mtu(&config.host_iface, 1450).map_err(|_| Error::Netdev)?;
         os::netdev::set_up(&config.host_iface).map_err(|_| Error::Netdev)?;
         println!("setup host {:?}", &config.host_iface);
+        // Configure the MONITOR interface so filin auto-recovers a card that was
+        // bounced (USB reset / replug). After a bounce the adapter often
+        // re-enumerates either in managed mode or administratively DOWN, which
+        // breaks `set_channel` and the AF_PACKET socket.
+        //
+        // Unless `-N` (assume_monitor) is given, force monitor mode first
+        // (down -> type monitor): this recovers a card that came back managed.
+        // `-N` skips the mode change (assume it's configured externally), e.g.
+        // when something else owns the radio's mode.
+        if !config.assume_monitor {
+            let _ = os::netdev::set_down(&config.monitor_iface); // best-effort
+            os::nl80211::set_monitor(&config.monitor_iface).map_err(|_| Error::Netdev)?;
+            println!("set monitor mode {:?}", &config.monitor_iface);
+        }
+        // Always bring it up before tuning (idempotent if already up); this
+        // alone recovers a DOWN-but-still-monitor card even with `-N`.
+        os::netdev::set_up(&config.monitor_iface).map_err(|_| Error::Netdev)?;
+        println!("monitor up {:?}", &config.monitor_iface);
         let frequency_mhz =
             channel::channel_to_frequency_mhz(config.anchor_channel).ok_or(Error::Channel)?;
         os::nl80211::set_channel(&config.monitor_iface, u32::from(frequency_mhz))
@@ -7594,6 +7617,10 @@ pub mod os {
             existing | (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short
         }
 
+        pub fn down_flags(existing: libc::c_short) -> libc::c_short {
+            existing & !(libc::IFF_UP as libc::c_short)
+        }
+
         pub fn get_hwaddr(iface: &str) -> Result<[u8; 6], Error> {
             let socket = control_socket()?;
             let mut request = IfReqHwAddr::new(iface)?;
@@ -7668,6 +7695,30 @@ pub mod os {
                     libc::SIOCSIFFLAGS,
                     &mut request as *mut IfReqFlags,
                 )
+            };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+            Ok(())
+        }
+
+        /// Bring an interface administratively DOWN (clears IFF_UP). Needed
+        /// before changing the interface type (nl80211 rejects a type change
+        /// on an up interface).
+        pub fn set_down(iface: &str) -> Result<(), Error> {
+            let socket = control_socket()?;
+            let mut request = IfReqFlags::new(iface, 0)?;
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCGIFFLAGS.
+            let rc = unsafe {
+                libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request as *mut IfReqFlags)
+            };
+            if rc < 0 {
+                return Err(last_errno());
+            }
+            request.flags = down_flags(request.flags);
+            // SAFETY: request is a valid ifreq-compatible buffer for SIOCSIFFLAGS.
+            let rc = unsafe {
+                libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS, &mut request as *mut IfReqFlags)
             };
             if rc < 0 {
                 return Err(last_errno());
@@ -7831,6 +7882,34 @@ pub mod os {
                 return Err(last_errno());
             }
             set_channel_ifindex(ifindex as libc::c_int, frequency_mhz)
+        }
+
+        const NL80211_CMD_SET_INTERFACE: u8 = 6;
+        const NL80211_ATTR_IFTYPE: u16 = 5;
+        const NL80211_IFTYPE_MONITOR: u32 = 6;
+
+        /// Set an interface to monitor mode (nl80211 SET_INTERFACE,
+        /// iftype=MONITOR). The interface must be DOWN first (see
+        /// `netdev::set_down`). Recovers a card that re-enumerated in managed
+        /// mode after a USB bounce.
+        pub fn set_monitor(iface: &str) -> Result<(), Error> {
+            let cs = CString::new(iface).map_err(|_| Error::InvalidName)?;
+            // SAFETY: cs is a valid NUL-terminated C string.
+            let ifindex = unsafe { libc::if_nametoindex(cs.as_ptr()) };
+            if ifindex == 0 {
+                return Err(last_errno());
+            }
+            let socket = NetlinkSocket::open()?;
+            let family_id = socket.resolve_family("nl80211")?;
+            let mut payload = vec![NL80211_CMD_SET_INTERFACE, 1, 0, 0];
+            push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, ifindex);
+            push_attr_u32(&mut payload, NL80211_ATTR_IFTYPE, NL80211_IFTYPE_MONITOR);
+            socket.request(
+                family_id,
+                libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16,
+                &payload,
+            )?;
+            Ok(())
         }
 
         pub fn set_channel_ifindex(ifindex: libc::c_int, frequency_mhz: u32) -> Result<(), Error> {
