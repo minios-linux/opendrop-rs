@@ -6433,6 +6433,36 @@ pub mod runtime {
         use super::*;
 
         #[test]
+        fn poll_revents_error_bits_detected() {
+            // POLLERR/POLLHUP/POLLNVAL each signal an error/hangup, not data.
+            assert!(poll_revents_is_error(libc::POLLERR));
+            assert!(poll_revents_is_error(libc::POLLHUP));
+            assert!(poll_revents_is_error(libc::POLLNVAL));
+            // Error bits combined with POLLIN still count as an error.
+            assert!(poll_revents_is_error(libc::POLLIN | libc::POLLERR));
+            // POLL_ERR_BITS is exactly the union of the three error bits.
+            assert_eq!(POLL_ERR_BITS, libc::POLLERR | libc::POLLHUP | libc::POLLNVAL);
+        }
+
+        #[test]
+        fn poll_revents_plain_pollin_is_not_error() {
+            assert!(!poll_revents_is_error(libc::POLLIN));
+            assert!(!poll_revents_is_error(0));
+        }
+
+        #[test]
+        fn poll_error_action_tolerates_transients_then_escalates() {
+            // Below threshold: keep running (drain + retry the transient).
+            assert_eq!(poll_error_action(0, 200), PollErrorAction::Continue);
+            assert_eq!(poll_error_action(199, 200), PollErrorAction::Continue);
+            // At/above threshold: fatal — exit so the radio can be recovered.
+            assert_eq!(poll_error_action(200, 200), PollErrorAction::Fatal);
+            assert_eq!(poll_error_action(5_000, 200), PollErrorAction::Fatal);
+            // A sane default threshold ships in the constant.
+            assert!(POLL_ERROR_FATAL_THRESHOLD >= 1);
+        }
+
+        #[test]
         fn scheduler_fires_psf_before_mif() {
             // MIF is armed immediately (now) then rescheduled to mid next-EAW.
             // PSF fires one PSF_INTERVAL (110 TU = 112640 us) after start.
