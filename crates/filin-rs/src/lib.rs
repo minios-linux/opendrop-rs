@@ -6869,12 +6869,16 @@ pub mod os {
 
             pub fn open_bound_ifindex(ifindex: libc::c_int) -> Result<Self, Error> {
                 let plan = plan_bind(ifindex)?;
+                // The protocol arg is a __be16 (htons), not a byte-swapped
+                // 32-bit int: libc::ETH_P_ALL.to_be() would yield 0x0300_0000,
+                // truncated by the kernel to protocol 0. Use the htons-of-u16
+                // value (same as the bind below).
                 // SAFETY: socket arguments are constants for an AF_PACKET raw socket.
                 let fd = unsafe {
                     libc::socket(
                         libc::AF_PACKET,
                         libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                        libc::ETH_P_ALL.to_be(),
+                        libc::c_int::from(plan.protocol_be),
                     )
                 };
                 if fd < 0 {
