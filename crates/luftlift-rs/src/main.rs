@@ -114,7 +114,7 @@ fn main() -> Result<()> {
         Command::Receive { output, flags, name, http_addr } => {
             receive(&cli.interface, output, flags, name, http_addr, introspect)
         }
-        Command::Find { duration } => find(duration),
+        Command::Find { duration } => find(&cli.interface, duration),
         Command::Send { recipient, file } => send(&cli.interface, &recipient, file),
     }
 }
@@ -155,7 +155,7 @@ fn receive(
         port: 8771,
         flags,
     };
-    let (daemon, info) = mdns::announce(&mdns_cfg, addr.into())?;
+    let (daemon, info) = mdns::announce(interface, &mdns_cfg, addr.into())?;
     let fullname = info.get_fullname().to_string();
     tracing::info!(service = %fullname, "mDNS announced — receiver visible in AirDrop picker");
 
@@ -214,9 +214,9 @@ fn receive(
     Ok(())
 }
 
-fn find(duration: u64) -> Result<()> {
-    tracing::info!(duration, "browsing for _airdrop._tcp");
-    let peers = mdns::browse(Duration::from_secs(duration))?;
+fn find(interface: &str, duration: u64) -> Result<()> {
+    tracing::info!(interface, duration, "browsing for _airdrop._tcp");
+    let peers = mdns::browse(interface, Duration::from_secs(duration))?;
     if peers.is_empty() {
         println!("No AirDrop senders found.");
         println!("Tip: Apple devices announce only while their sharing pane is open.");
@@ -267,7 +267,7 @@ fn send(interface: &str, recipient: &str, file: PathBuf) -> Result<()> {
 
     // Resolve the recipient via mDNS (browse briefly, pick the matching peer).
     tracing::info!(recipient, "browsing for receiver");
-    let peers = mdns::browse(Duration::from_secs(5))?;
+    let peers = mdns::browse(interface, Duration::from_secs(5))?;
     // Match the recipient by name ONLY. Do NOT fall back to "the first peer
     // discovered" — that silently targets whatever turned up first (typically
     // our own co-located `luftlift receive` service), sending the file to the

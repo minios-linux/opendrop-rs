@@ -7,7 +7,7 @@
 //! `get_properties`).
 
 use anyhow::Result;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, UnregisterStatus};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo, UnregisterStatus};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,12 +88,28 @@ pub fn build_airdrop_service_info(cfg: &MdnsConfig, addr: IpAddr) -> Result<Serv
 
 /// Register the AirDrop service on the local network. Returns the daemon
 /// (keep alive to maintain the announcement) and the registered info.
-pub fn announce(cfg: &MdnsConfig, addr: IpAddr) -> Result<(ServiceDaemon, ServiceInfo)> {
-    let daemon = ServiceDaemon::new()?;
+pub fn announce(
+    interface: &str,
+    cfg: &MdnsConfig,
+    addr: IpAddr,
+) -> Result<(ServiceDaemon, ServiceInfo)> {
+    let daemon = scoped_daemon(interface)?;
     let info = build_airdrop_service_info(cfg, addr)?;
     daemon.register(info.clone())?;
-    info!(name = %cfg.computer_name, addr = %addr, port = cfg.port, "mDNS _airdrop._tcp announced");
+    info!(name = %cfg.computer_name, addr = %addr, port = cfg.port, interface, "mDNS _airdrop._tcp announced");
     Ok((daemon, info))
+}
+
+/// Create a `ServiceDaemon` restricted to a single interface (e.g. `awdl0`).
+/// AirDrop lives entirely on the AWDL link; announcing/browsing on every host
+/// interface leaks the service onto the regular LAN (the receiver then shows up
+/// twice — once over awdl0, once over Wi-Fi) and pollutes discovery with
+/// non-AWDL noise. Disable all interfaces, then re-enable only `interface`.
+fn scoped_daemon(interface: &str) -> Result<ServiceDaemon> {
+    let daemon = ServiceDaemon::new()?;
+    daemon.disable_interface(IfKind::All)?;
+    daemon.enable_interface(IfKind::Name(interface.to_string()))?;
+    Ok(daemon)
 }
 
 /// Re-announce an already-registered service: calling `register` again on the
@@ -190,8 +206,8 @@ pub struct DiscoveredPeer {
 
 /// Browse for `_airdrop._tcp` services for `duration`. Returns discovered peers.
 /// Apple devices appear only while their sharing pane is open.
-pub fn browse(duration: Duration) -> Result<Vec<DiscoveredPeer>> {
-    let daemon = ServiceDaemon::new()?;
+pub fn browse(interface: &str, duration: Duration) -> Result<Vec<DiscoveredPeer>> {
+    let daemon = scoped_daemon(interface)?;
     let receiver = daemon.browse("_airdrop._tcp.local.")?;
     let deadline = Instant::now() + duration;
     let mut peers = Vec::new();
@@ -258,7 +274,7 @@ mod tests {
 
     #[test]
     fn announce_registers_without_error() {
-        let (daemon, info) = announce(&cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         assert!(info.get_fullname().contains("_airdrop._tcp"));
         // Clean shutdown via graceful goodbye.
         goodbye(&daemon, info.get_fullname()).expect("goodbye");
@@ -266,7 +282,7 @@ mod tests {
 
     #[test]
     fn goodbye_unregisters_a_registered_service() {
-        let (daemon, info) = announce(&cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         let fullname = info.get_fullname().to_string();
         // goodbye must return Ok and send the TTL=0 multicast promptly (the
         // unregister status receiver resolves well within the 2s timeout).
@@ -310,7 +326,7 @@ mod tests {
         // the canonical mdns-sd refresh (emits fresh A/SRV/PTR/TXT + the
         // RFC 6762 §8.3 1s retransmit, no TTL=0 goodbye). Verify it accepts
         // the second register without error.
-        let (daemon, info) = announce(&cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         reannounce(&daemon, &info).expect("re-announce must succeed on same daemon");
         // A second re-announce should also be fine (idempotent refresh).
         reannounce(&daemon, &info).expect("second re-announce must succeed");
@@ -322,7 +338,7 @@ mod tests {
         // The re-announcer thread must observe the stop flag within ~1 tick
         // (REANNOUNCE_TICK = 1s), so the SIGINT handler can wind it down
         // cleanly. Verifies the join handle resolves promptly after stop.
-        let (daemon, info) = announce(&cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
+        let (daemon, info) = announce("lo", &cfg(), "127.0.0.1".parse().unwrap()).expect("announce");
         let fullname = info.get_fullname().to_string();
         let daemon = Arc::new(daemon);
         let (stop, handle) = spawn_reannouncer(daemon.clone(), info);
