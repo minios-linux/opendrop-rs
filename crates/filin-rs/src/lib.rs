@@ -2273,12 +2273,17 @@ pub mod schedule {
 
     /// Idle window after the last received unicast data frame from a peer
     /// during which filin keeps the radio PINNED to that peer's channel and
-    /// suppresses channel hopping + master re-adoption. A bulk AirDrop
-    /// /Upload is a sustained TCP/TLS stream: it cannot survive filin
-    /// leaving the channel mid-body. Two EAWs (~128 ms) of silence is long
-    /// enough to ride gaps between TCP segments while releasing quickly once
-    /// the transfer truly ends.
-    pub const TRANSFER_IDLE_TIMEOUT_US: u64 = 2 * 64 * TU_US;
+    /// suppresses channel hopping + master re-adoption.
+    ///
+    /// This must cover not just gaps between TCP segments of a bulk /Upload,
+    /// but the **user-interaction gap between AirDrop's `/Discover` (browsing,
+    /// fills the picker) and `/Ask` (fires when the user taps send)** — which
+    /// is seconds, not milliseconds. The original ~131 ms (2 EAW) released the
+    /// pin long before the `/Ask` arrived, so filin hopped away and the `/Ask`
+    /// connection never reached the host (observed live: `/Discover` lands,
+    /// `/Ask` never does, sender shows "declined"). 6 s holds the peer's
+    /// channel across a normal tap while still releasing promptly once idle.
+    pub const TRANSFER_IDLE_TIMEOUT_US: u64 = 6_000_000;
 
     /// Record of the most recent unicast data RX used to pin the radio to
     /// the active-transfer peer's channel (Bug C).
