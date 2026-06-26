@@ -1232,6 +1232,11 @@ pub mod election {
                 if peer.sync_addr == self.self_addr {
                     continue; // reject: would form a cycle in the sync tree
                 }
+                if crate::channel::is_no_ir_channel(peer.anchor_channel) {
+                    // reject: anchored on a No-IR/DFS channel we can't TX on —
+                    // following it would strand us off the social channels.
+                    continue;
+                }
                 let cmp = (peer.master_counter, peer.master_metric)
                     .cmp(&(best_counter, best_metric));
                 match cmp {
@@ -1283,6 +1288,10 @@ pub mod election {
         pub master_metric: u32,
         pub master_counter: u32,
         pub is_valid: bool,
+        /// The peer's chanseq anchor (slot-0 primary) channel. Used to reject
+        /// masters anchored on a No-IR channel we cannot transmit on. 0 = no
+        /// decoded sequence yet (treated as eligible).
+        pub anchor_channel: u8,
     }
 
     #[cfg(test)]
@@ -1309,6 +1318,22 @@ pub mod election {
                 master_metric,
                 master_counter,
                 is_valid: true,
+                anchor_channel: 0,
+            }
+        }
+
+        /// Like `peer_master` but with an explicit chanseq anchor channel, for
+        /// testing the No-IR master rejection.
+        fn peer_master_on_channel(
+            self_addr: [u8; 6],
+            master_counter: u32,
+            master_metric: u32,
+            height: u32,
+            anchor_channel: u8,
+        ) -> PeerElection {
+            PeerElection {
+                anchor_channel,
+                ..peer_master(self_addr, master_counter, master_metric, height)
             }
         }
 
@@ -1613,6 +1638,20 @@ pub mod sync {
 }
 
 pub mod channel {
+    /// True if `channel` is a 5GHz DFS channel that is **No-IR** (No Initiate
+    /// Radiation): a station may not transmit there until it has detected an
+    /// existing master (radar-avoidance regulatory rule). The carl9170 honours
+    /// this and silently drops injects on these channels, so filin must not
+    /// follow a master anchored here — it could never TX (announce/data) and
+    /// would be stranded off the AirDrop social channels (6/44/149).
+    ///
+    /// DFS set: UNII-2A (52,56,60,64) and UNII-2C (100–144 in steps of 4).
+    /// Channel 0 means "unknown/no anchor" and is treated as not No-IR so an
+    /// as-yet-undecoded peer is still eligible.
+    pub fn is_no_ir_channel(channel: u8) -> bool {
+        matches!(channel, 52 | 56 | 60 | 64 | 100..=144 if channel.is_multiple_of(4))
+    }
+
     pub fn channel_to_frequency_mhz(channel: u16) -> Option<u16> {
         match channel {
             0 => None,
@@ -1637,6 +1676,19 @@ pub mod channel {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn no_ir_channels_are_the_dfs_set_only() {
+            // DFS / No-IR: UNII-2A 52-64 and UNII-2C 100-144 (step 4).
+            for ch in [52, 56, 60, 64, 100, 104, 120, 140, 144] {
+                assert!(is_no_ir_channel(ch), "ch{ch} should be No-IR");
+            }
+            // TX-capable: social channels and the UNII-1/UNII-3 non-DFS set,
+            // plus 0 (unknown anchor) and non-grid numbers.
+            for ch in [0, 6, 36, 40, 44, 48, 149, 153, 157, 161, 165, 96, 148] {
+                assert!(!is_no_ir_channel(ch), "ch{ch} should be TX-capable");
+            }
+        }
 
         #[test]
         fn converts_common_awdl_channels_to_frequency() {
@@ -3227,6 +3279,7 @@ pub mod peers {
                 master_metric: self.election.master_metric,
                 master_counter: self.election.master_counter,
                 is_valid: self.is_valid,
+                anchor_channel: crate::schedule::master_anchor_channel(&self.sequence),
             }
         }
     }
