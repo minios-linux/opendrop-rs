@@ -5875,13 +5875,18 @@ pub mod runtime {
         // escalate a stuck socket to a clean exit instead of a silent spin.
         let mut consecutive_packet_errors: u32 = 0;
 
-        // Liveness check for the monitor interface. A card flap can leave the
-        // iface administratively DOWN *without* the AF_PACKET socket reporting
-        // POLLERR — the loop would then just see "no data" forever and never
-        // recover. Poll IFF_UP ~once/second; if the monitor went down (or
-        // vanished), return so main()'s retry loop re-runs open_links (which
-        // reconfigures monitor mode + up + channel). Same MAC → awdl0 keeps its
-        // address, so luftlift isn't disturbed.
+        // Liveness check for the monitor interface. Two failure shapes that the
+        // AF_PACKET socket does NOT surface as POLLERR:
+        //   * card FLAP — iface left administratively DOWN (no carrier), and
+        //   * card UNPLUG/REPLUG — USB re-enumerates, the netdev is recreated
+        //     with the SAME name but a NEW ifindex, so our socket (bound to the
+        //     old index) is dead even though the iface looks "up" (often
+        //     DORMANT). IFF_UP can't see this; the ifindex change can.
+        // Poll ~once/second; if the monitor is down, gone, or re-enumerated,
+        // return so main()'s retry loop re-runs open_links (reconfigure mode +
+        // up + channel, rebind the socket on the new index). Same MAC → awdl0
+        // keeps its address, so luftlift isn't disturbed.
+        let monitor_ifindex = os::netdev::ifindex(&links.monitor_iface);
         let mut last_iface_check_us: u64 = 0;
         const IFACE_CHECK_PERIOD_US: u64 = 1_000_000;
 
@@ -5890,10 +5895,16 @@ pub mod runtime {
 
             if now_us.wrapping_sub(last_iface_check_us) >= IFACE_CHECK_PERIOD_US {
                 last_iface_check_us = now_us;
-                if !os::netdev::is_up(&links.monitor_iface) {
+                let cur_ifindex = os::netdev::ifindex(&links.monitor_iface);
+                if cur_ifindex == 0
+                    || cur_ifindex != monitor_ifindex
+                    || !os::netdev::is_up(&links.monitor_iface)
+                {
                     tracing::warn!(
                         iface = %links.monitor_iface,
-                        "monitor interface is down/gone (card flap?); reopening links"
+                        was_ifindex = monitor_ifindex,
+                        now_ifindex = cur_ifindex,
+                        "monitor interface down/gone/re-enumerated (flap or replug); reopening links"
                     );
                     return Err(Error::Netdev);
                 }
@@ -7721,6 +7732,20 @@ pub mod os {
                 return Err(last_errno());
             }
             Ok(())
+        }
+
+        /// Current kernel ifindex for `iface`, or 0 if it doesn't exist. A
+        /// USB unplug/replug re-enumerates the device → the netdev is destroyed
+        /// and recreated with a NEW ifindex (even though udev gives it the same
+        /// name), which silently invalidates any AF_PACKET socket bound to the
+        /// old index. Comparing the ifindex detects that "same name, new
+        /// device" case that IFF_UP cannot.
+        pub fn ifindex(iface: &str) -> u32 {
+            match std::ffi::CString::new(iface) {
+                // SAFETY: cs is a valid NUL-terminated C string.
+                Ok(cs) => unsafe { libc::if_nametoindex(cs.as_ptr()) },
+                Err(_) => 0,
+            }
         }
 
         /// True if the interface exists and is administratively UP (IFF_UP).
