@@ -7433,11 +7433,17 @@ pub mod os {
             Ok(NeighborRequest { ifindex, ipv6, mac })
         }
 
-        /// Build the netlink message payload for an RTM_NEWNEIGH (add/replace)
-        /// or RTM_DELNEIGH (remove) request. Pure (no I/O), so unit-testable.
-        /// The payload starts with the `ndmsg` struct (12 bytes) followed by
+        /// Build the netlink message header flags + payload for an RTM_NEWNEIGH
+        /// (add/replace) or RTM_DELNEIGH (remove) request. Pure (no I/O), so
+        /// unit-testable. Returns `(msg_type, nlmsg_flags, payload)`; the
+        /// payload starts with the `ndmsg` struct (12 bytes) followed by
         /// rtattrs (NDA_DST = 16-byte IPv6, NDA_LLADDR = 6-byte MAC).
-        pub fn build_neighbor_payload(req: &NeighborRequest, remove: bool) -> (u16, Vec<u8>) {
+        ///
+        /// The flags MUST be forwarded to the netlink send: RTM_NEWNEIGH
+        /// without NLM_F_CREATE makes the kernel `neigh_add` return -ENOENT for
+        /// a not-yet-existing entry, so the static AWDL neighbor would never be
+        /// installed.
+        pub fn build_neighbor_payload(req: &NeighborRequest, remove: bool) -> (u16, u16, Vec<u8>) {
             let msg_type = if remove { RTM_DELNEIGH } else { RTM_NEWNEIGH };
             let flags = if remove {
                 libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16
@@ -7464,8 +7470,7 @@ pub mod os {
             // the dst alone but including lladdr is harmless and keeps the
             // builder symmetric.
             push_attr(&mut payload, NDA_LLADDR, &req.mac);
-            let _ = flags; // flags are applied by the caller's netlink send
-            (msg_type, payload)
+            (msg_type, flags, payload)
         }
 
         fn push_attr(buf: &mut Vec<u8>, kind: u16, value: &[u8]) {
@@ -7493,8 +7498,8 @@ pub mod os {
             mac: [u8; 6],
         ) -> Result<(), Error> {
             let req = plan_neighbor(ifindex, ipv6, mac)?;
-            let (msg_type, payload) = build_neighbor_payload(&req, false);
-            send_rtnl(msg_type, &payload)
+            let (msg_type, flags, payload) = build_neighbor_payload(&req, false);
+            send_rtnl(msg_type, flags, &payload)
         }
 
         /// Remove the static neighbor entry for `ipv6` on `iface`.
@@ -7507,8 +7512,8 @@ pub mod os {
             // DELNEIGH keys on (ifindex, dst) — the mac is not required, but
             // build_neighbor_payload wants one; pass zeros (ignored on delete).
             let req = plan_neighbor(ifindex, ipv6, [0; 6])?;
-            let (msg_type, payload) = build_neighbor_payload(&req, true);
-            send_rtnl(msg_type, &payload)
+            let (msg_type, flags, payload) = build_neighbor_payload(&req, true);
+            send_rtnl(msg_type, flags, &payload)
         }
 
         fn resolve_ifindex(iface: &str) -> Result<libc::c_int, Error> {
@@ -7521,13 +7526,9 @@ pub mod os {
             Ok(ifindex as libc::c_int)
         }
 
-        fn send_rtnl(msg_type: u16, payload: &[u8]) -> Result<(), Error> {
+        fn send_rtnl(msg_type: u16, flags: u16, payload: &[u8]) -> Result<(), Error> {
             let socket = RtnlSocket::open()?;
-            socket.request(
-                msg_type,
-                libc::NLM_F_REQUEST as u16 | libc::NLM_F_ACK as u16,
-                payload,
-            )?;
+            socket.request(msg_type, flags, payload)?;
             Ok(())
         }
 
@@ -7672,7 +7673,7 @@ pub mod os {
                     0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0xaa, 0xbb, 0xff, 0xfe, 0xcc, 0xdd, 0xee,
                 ];
                 let req = plan_neighbor(7, ipv6, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]).unwrap();
-                let (msg_type, payload) = build_neighbor_payload(&req, false);
+                let (msg_type, _flags, payload) = build_neighbor_payload(&req, false);
 
                 assert_eq!(msg_type, RTM_NEWNEIGH);
                 // ndmsg: family=AF_INET6, pad1=0, pad2=0, ifindex=7, state=NUD_PERMANENT
@@ -7692,8 +7693,30 @@ pub mod os {
                     0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0xaa, 0xbb, 0xff, 0xfe, 0xcc, 0xdd, 0xee,
                 ];
                 let req = plan_neighbor(7, ipv6, [0; 6]).unwrap();
-                let (msg_type, _) = build_neighbor_payload(&req, true);
+                let (msg_type, _flags, _) = build_neighbor_payload(&req, true);
                 assert_eq!(msg_type, RTM_DELNEIGH);
+            }
+
+            #[test]
+            fn add_request_sets_create_and_replace_flags() {
+                // RTM_NEWNEIGH without NLM_F_CREATE makes the kernel reject a
+                // not-yet-existing entry with -ENOENT, so the static AWDL
+                // neighbor would never be installed. The builder must return
+                // CREATE|REPLACE (and the sender must forward them).
+                let ipv6 = [
+                    0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0xaa, 0xbb, 0xff, 0xfe, 0xcc, 0xdd, 0xee,
+                ];
+                let req = plan_neighbor(7, ipv6, [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]).unwrap();
+                let (_msg_type, flags, _payload) = build_neighbor_payload(&req, false);
+                assert_ne!(flags & libc::NLM_F_CREATE as u16, 0, "NLM_F_CREATE must be set");
+                assert_ne!(flags & libc::NLM_F_REPLACE as u16, 0, "NLM_F_REPLACE must be set");
+                assert_ne!(flags & libc::NLM_F_ACK as u16, 0, "NLM_F_ACK must be set");
+
+                // Delete must NOT carry CREATE/REPLACE.
+                let dreq = plan_neighbor(7, ipv6, [0; 6]).unwrap();
+                let (_t, dflags, _p) = build_neighbor_payload(&dreq, true);
+                assert_eq!(dflags & libc::NLM_F_CREATE as u16, 0);
+                assert_eq!(dflags & libc::NLM_F_REPLACE as u16, 0);
             }
 
             #[test]
@@ -7703,7 +7726,7 @@ pub mod os {
                 ];
                 let mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
                 let req = plan_neighbor(7, ipv6, mac).unwrap();
-                let (_msg_type, payload) = build_neighbor_payload(&req, false);
+                let (_msg_type, _flags, payload) = build_neighbor_payload(&req, false);
 
                 // The NDA_DST attr (kind=1) must contain the 16-byte IPv6.
                 let dst = find_attr(&payload, NDA_DST).expect("NDA_DST present");
