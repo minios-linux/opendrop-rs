@@ -4706,6 +4706,27 @@ pub mod state {
         }
 
         #[test]
+        fn apply_action_ignores_own_self_addressed_frame() {
+            // In monitor mode the card hears its own injected frames. owl drops
+            // frames sourced from self (rx.c); filin must too, or it registers
+            // itself as a peer and elects itself master — observed live as
+            // violent master flapping (own MAC in last_master_macs) that
+            // destroys sync with real peers. A self-sourced frame, even one
+            // advertising a strong master, must NOT register a peer or move the
+            // election off self-master.
+            let self_addr = [0x02, 0, 0, 0, 0, 1];
+            let mut state = AwdlState::new(self_addr, "filin".into(), 44, 1_000_000);
+            let tlvs = vec![election_v2_tlv(50, 200), version_tlv(0x34, 1)];
+
+            state.apply_action(self_addr, mif(), &tlvs, 1_100_000);
+
+            // No self-peer registered, and the node stays its own master.
+            assert!(state.peers.get(&self_addr).is_none());
+            assert_eq!(state.election.sync_addr, self_addr);
+            assert_eq!(state.election.master_counter, 0);
+        }
+
+        #[test]
         fn sync_only_adopted_from_elected_master() {
             let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 1_000_000);
             let master_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
