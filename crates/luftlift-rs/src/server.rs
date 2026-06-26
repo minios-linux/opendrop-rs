@@ -206,72 +206,103 @@ fn handle_tls_connection(
     // `reader.get_mut()` (the underlying `&mut tls`) because `BufReader`
     // only buffers reads.
     let mut reader = BufReader::new(&mut tls);
-    let header_bytes = read_headers(&mut reader)?;
-    let head_str = std::str::from_utf8(&header_bytes).unwrap_or("");
-    if let Some(expect) = parse_header_value(head_str, "expect") {
-        if expect.eq_ignore_ascii_case("100-continue") {
-            reader.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-            // CRITICAL: flush the 100 Continue through the TLS encryption
-            // layer so it reaches the Apple sender. Without this, rustls
-            // buffers the plaintext and the sender never sees the 100,
-            // deadlocking the /Upload (sender waits for 100, server waits
-            // for body). This was the regression introduced when the
-            // Expect:100-continue support was added without a flush.
-            reader.get_mut().flush()?;
+    let mut served = 0usize;
+    loop {
+        // Read the next request on this (keep-alive) connection. A clean close
+        // after we've already served ≥1 request is normal end-of-connection,
+        // not an error.
+        let header_bytes = match read_headers(&mut reader) {
+            Ok(h) => h,
+            Err(_) if served > 0 => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let head_str = std::str::from_utf8(&header_bytes).unwrap_or("");
+        if let Some(expect) = parse_header_value(head_str, "expect") {
+            if expect.eq_ignore_ascii_case("100-continue") {
+                reader.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                // CRITICAL: flush the 100 Continue through the TLS encryption
+                // layer so it reaches the Apple sender. Without this, rustls
+                // buffers the plaintext and the sender never sees the 100,
+                // deadlocking the /Upload (sender waits for 100, server waits
+                // for body).
+                reader.get_mut().flush()?;
+            }
         }
-    }
-    let body = read_body(&mut reader, &header_bytes)?;
-    let mut raw = header_bytes;
-    raw.extend_from_slice(&body);
+        let body = read_body(&mut reader, &header_bytes)?;
+        let mut raw = header_bytes;
+        raw.extend_from_slice(&body);
 
-    let req = parse_request(&raw)?;
+        let req = parse_request(&raw)?;
 
-    // Track the sender name across the per-connection AirDrop flow so the
-    // raw-upload dump (on the /Upload connection) can be named after the
-    // device that sent the preceding /Ask. AirDrop opens a fresh TLS
-    // connection per POST, so we hold this in a shared cell.
-    if req.path == "/Ask" {
-        if let Ok(ask) = crate::plist_impl::parse_ask_request(&req.body) {
-            if !ask.sender_computer_name.is_empty() {
-                if let Ok(mut cell) = last_sender.lock() {
-                    *cell = ask.sender_computer_name.clone();
+        // Track the sender name across the AirDrop flow (Discover/Ask/Upload
+        // share one keep-alive connection, or reconnect) so the raw-upload
+        // dump can be named after the device that sent the preceding /Ask.
+        if req.path == "/Ask" {
+            if let Ok(ask) = crate::plist_impl::parse_ask_request(&req.body) {
+                if !ask.sender_computer_name.is_empty() {
+                    if let Ok(mut cell) = last_sender.lock() {
+                        *cell = ask.sender_computer_name.clone();
+                    }
                 }
             }
         }
-    }
-    let sender_snapshot = last_sender
-        .lock()
-        .map(|cell| cell.clone())
-        .unwrap_or_default();
+        let sender_snapshot = last_sender
+            .lock()
+            .map(|cell| cell.clone())
+            .unwrap_or_default();
 
-    // Bump the introspection counters before dispatching so /status reflects
-    // how far the Apple sender got (Discover -> Ask -> Upload) even if the
-    // handler errors out.
-    bump_introspect_for_request(&introspect, &req);
+        // Bump the introspection counters before dispatching so /status
+        // reflects how far the Apple sender got (Discover -> Ask -> Upload)
+        // even if the handler errors out.
+        bump_introspect_for_request(&introspect, &req);
 
-    let result = handle_post(&req, &cfg);
+        let result = handle_post(&req, &cfg);
 
-    // Env-gated raw /Upload capture for offline decode diffing against the
-    // Python reference (opendrop-patch/dvzip.py). Off by default.
-    if req.path == "/Upload" {
-        if let Some(dir) = dump_dir.as_ref() {
-            dump_raw_upload(dir, &sender_snapshot, &req.body);
-        }
-    }
-
-    let response_bytes = format_response(&result.response);
-    tls.write_all(&response_bytes)?;
-    for f in &result.received_files {
-        info!(file = %f.name, bytes = f.bytes.len(), "received file");
-        if let Some(dir) = output_dir.as_ref() {
-            let path = dir.join(&f.name);
-            match std::fs::write(&path, &f.bytes) {
-                Ok(_) => info!(file = %f.name, path = %path.display(), "saved file"),
-                Err(e) => warn!(file = %f.name, error = %e, "failed to save file"),
+        // Env-gated raw /Upload capture for offline decode diffing against the
+        // Python reference (opendrop-patch/dvzip.py). Off by default.
+        if req.path == "/Upload" {
+            if let Some(dir) = dump_dir.as_ref() {
+                dump_raw_upload(dir, &sender_snapshot, &req.body);
             }
         }
+        // Also dump the raw /Ask body under the same env var — some sends carry
+        // the payload in /Ask, so this is the only way to see what was shared.
+        if req.path == "/Ask" {
+            if let Some(dir) = dump_dir.as_ref() {
+                dump_raw_body(dir, "ask", &sender_snapshot, &req.body);
+            }
+        }
+
+        // Keep-alive decision: close only if the handler ended the connection
+        // (/Upload success, 406 — they set `Connection: close`) or the client
+        // asked to. Otherwise loop to read the pipelined next request — this is
+        // what lets a web-link Upload arrive on the same connection as its Ask.
+        let resp_closes = result.response.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")
+        });
+        let req_closes = req
+            .header("connection")
+            .map(|v| v.eq_ignore_ascii_case("close"))
+            .unwrap_or(false);
+
+        let response_bytes = format_response(&result.response);
+        reader.get_mut().write_all(&response_bytes)?;
+        reader.get_mut().flush()?;
+        for f in &result.received_files {
+            info!(file = %f.name, bytes = f.bytes.len(), "received file");
+            if let Some(dir) = output_dir.as_ref() {
+                let path = dir.join(&f.name);
+                match std::fs::write(&path, &f.bytes) {
+                    Ok(_) => info!(file = %f.name, path = %path.display(), "saved file"),
+                    Err(e) => warn!(file = %f.name, error = %e, "failed to save file"),
+                }
+            }
+        }
+        served += 1;
+        if resp_closes || req_closes {
+            return Ok(());
+        }
     }
-    Ok(())
 }
 
 /// Bind a TCP listener on `[::]:port` (IPv6, dual-stack).
@@ -391,6 +422,12 @@ pub fn sanitize_sender_for_filename(sender: &str) -> String {
 /// Best-effort: logs a warning on failure but never propagates the error —
 /// the dump is a debugging aid, not part of the receive path.
 pub fn dump_raw_upload(dir: &std::path::Path, sender: &str, body: &[u8]) {
+    dump_raw_body(dir, "upload", sender, body);
+}
+
+/// Dump a raw request body to `dir` as `<kind>-<ts>-<sender>.bin`. Used for the
+/// env-gated capture of /Upload and /Ask bodies (LUFTLIFT_DUMP_UPLOAD).
+pub fn dump_raw_body(dir: &std::path::Path, kind: &str, sender: &str, body: &[u8]) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -400,15 +437,16 @@ pub fn dump_raw_upload(dir: &std::path::Path, sender: &str, body: &[u8]) {
     } else {
         sanitize_sender_for_filename(sender)
     };
-    let filename = format!("upload-{ts}-{sender_part}.bin");
+    let filename = format!("{kind}-{ts}-{sender_part}.bin");
     let path = dir.join(&filename);
     match std::fs::write(&path, body) {
         Ok(_) => info!(
             path = %path.display(),
             bytes = body.len(),
-            "dumped raw /Upload body (LUFTLIFT_DUMP_UPLOAD)"
+            kind,
+            "dumped raw request body (LUFTLIFT_DUMP_UPLOAD)"
         ),
-        Err(e) => warn!(path = %path.display(), error = %e, "failed to dump raw /Upload body"),
+        Err(e) => warn!(path = %path.display(), error = %e, kind, "failed to dump raw request body"),
     }
 }
 

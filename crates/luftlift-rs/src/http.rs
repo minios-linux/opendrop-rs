@@ -124,13 +124,12 @@ pub fn format_response(resp: &HttpResponse) -> Vec<u8> {
     for (k, v) in &resp.headers {
         out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
     }
-    let has_connection = resp
-        .headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("connection"));
-    if !has_connection {
-        out.extend_from_slice(b"Connection: close\r\n");
-    }
+    // HTTP/1.1 defaults to keep-alive. We do NOT auto-add `Connection: close`:
+    // the AirDrop sender runs Discover -> Ask -> Upload over a single persistent
+    // connection, so closing after Discover/Ask drops the pipelined Upload
+    // (this is why web-link sends — which pipeline the Upload — were lost while
+    // file sends, which reconnect, worked). Handlers that genuinely end the
+    // connection (/Upload success, 406) set `Connection: close` explicitly.
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&resp.body);
     out
@@ -285,7 +284,8 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Type: text/plain\r\n"));
         assert!(text.contains("Content-Length: 2\r\n"));
-        assert!(text.contains("Connection: close\r\n"), "Connection: close is auto-added");
+        // Keep-alive default: no Connection header unless explicitly set.
+        assert!(!text.contains("Connection:"), "Connection not auto-added (HTTP/1.1 keep-alive default)");
         assert!(text.ends_with("\r\n\r\nok"));
     }
 
@@ -296,6 +296,16 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.starts_with("HTTP/1.1 404 "));
         assert!(text.contains("Content-Length: 0\r\n"));
+        // No auto Connection: close — keep-alive by default.
+        assert!(!text.contains("Connection:"));
+    }
+
+    #[test]
+    fn format_response_emits_explicit_close() {
+        let mut resp = HttpResponse::new(200);
+        resp.headers.push(("Connection".into(), "close".into()));
+        let bytes = format_response(&resp);
+        let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains("Connection: close\r\n"));
     }
 
