@@ -268,13 +268,25 @@ fn send(interface: &str, recipient: &str, file: PathBuf) -> Result<()> {
     // Resolve the recipient via mDNS (browse briefly, pick the matching peer).
     tracing::info!(recipient, "browsing for receiver");
     let peers = mdns::browse(Duration::from_secs(5))?;
+    // Match the recipient by name ONLY. Do NOT fall back to "the first peer
+    // discovered" — that silently targets whatever turned up first (typically
+    // our own co-located `luftlift receive` service), sending the file to the
+    // wrong host. If nothing matches, fail loudly and list what WAS found.
     let peer = peers
         .iter()
         .find(|p| p.name.contains(recipient))
-        .or_else(|| peers.first())
         .ok_or_else(|| {
+            let found = if peers.is_empty() {
+                "<none>".to_string()
+            } else {
+                peers
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             anyhow::anyhow!(
-                "no AirDrop receiver matching '{recipient}' found \
+                "no AirDrop receiver matching '{recipient}' found; discovered: [{found}] \
                  (Apple devices announce only while their sharing pane is open)"
             )
         })?;
