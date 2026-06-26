@@ -5968,8 +5968,11 @@ pub mod runtime {
                     let dst = mac_from_slice(&tap_buf[0..6]);
                     let src = mac_from_slice(&tap_buf[6..12]);
                     // Count outgoing mDNS announces from luftlift (self) so
-                    // /status can show our own announce cadence.
-                    if let Some(true) = classify_mdns(&tap_buf[..len], links.self_addr) {
+                    // /status can show our own announce cadence. Also used
+                    // below to gate the re-broadcast cache to mDNS only.
+                    let is_self_mdns =
+                        matches!(classify_mdns(&tap_buf[..len], links.self_addr), Some(true));
+                    if is_self_mdns {
                         introspect.counters.inc_mdns_rx_self();
                     }
                     match awdl::encapsulate_ethernet_payload(&tap_buf[..len], awdl_state.tx_seq) {
@@ -5992,12 +5995,22 @@ pub mod runtime {
                             // peer listening on any channel hears them.
                             // Unicast keeps owl's AW-gated single-send path.
                             if frame.dst[0] & 0x01 == 1 {
-                                // Part A: cache the latest multicast mDNS
-                                // frame for periodic re-broadcast on social
-                                // channels, decoupling discovery from
-                                // luftlift's 10s cadence.
-                                announce_cache
-                                    .refresh(frame.radiotap_frame.clone(), host_time_us());
+                                // Part A: cache the latest mDNS announce for
+                                // periodic re-broadcast on social channels,
+                                // decoupling discovery from luftlift's 10s
+                                // cadence. Cache ONLY mDNS — caching every
+                                // multicast frame let lldpd's ~1 Hz LLDP on
+                                // awdl0 overwrite the 0.1 Hz mDNS in this
+                                // single-slot cache, so the re-broadcast (and
+                                // thus discovery) was almost always LLDP, not
+                                // the AirDrop announce (live: Mac saw our LLDP
+                                // every 1s but mDNS only occasionally).
+                                if is_self_mdns {
+                                    announce_cache.refresh(
+                                        frame.radiotap_frame.clone(),
+                                        host_time_us(),
+                                    );
+                                }
                                 if mcast_spread.enqueue(
                                     frame.radiotap_frame,
                                     &awdl_state.channel_sequence,
