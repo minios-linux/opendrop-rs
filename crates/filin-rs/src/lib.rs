@@ -5176,6 +5176,28 @@ pub mod state {
         }
 
         #[test]
+        fn park_channel_never_parks_on_a_no_ir_channel() {
+            // The top master anchors on ch52 (No-IR/DFS). Parking there would
+            // strand filin on a channel the carl9170 can't TX on — it could
+            // neither announce nor answer /Discover|/Ask (observed live: parked
+            // on 52, every transfer failed). park_channel must skip No-IR and
+            // fall back to a TX-capable channel (the configured anchor 44).
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 44, 0);
+            let top = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            state.election.master_addr = top;
+            let p1 = [0x02, 0xc1, 0, 0, 0, 1];
+            state.peers.touch(p1, 0);
+            {
+                let peer = state.peers.get_mut(&p1).unwrap();
+                peer.election.master_addr = top;
+                peer.sequence[0] = [52, 0x80]; // No-IR anchor
+            }
+            let ch = state.park_channel();
+            assert!(!crate::channel::is_no_ir_channel(ch), "must not park on No-IR ch{ch}");
+            assert_eq!(ch, 44); // falls back to the TX-capable configured anchor
+        }
+
+        #[test]
         fn desired_channel_in_park_mode_ignores_eaw_slot() {
             // In park mode desired_channel returns the parked channel for
             // EVERY slot — no hopping. Even a null slot in the sequence must
