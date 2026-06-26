@@ -1713,8 +1713,15 @@ pub mod schedule {
     pub enum DataSendDecision {
         /// Inject the frame now on the current channel/availability window.
         Send,
-        /// Hold the frame and retry on the next availability window.
+        /// Hold the frame and retry on the next availability window. The
+        /// condition is transient (wrong slot / inside guard / peer not yet
+        /// co-channel) and expected to clear within an AW cycle.
         Hold,
+        /// Discard the frame — it can never become sendable. owl's
+        /// `awdl_send_unicast` frees (drops) a unicast frame addressed to a
+        /// non-peer; holding it instead would block the host TAP indefinitely
+        /// (the retry loop stops reading new host frames while one is pending).
+        Drop,
     }
 
     /// Pure TX-gate decision that ports owl's split between
@@ -1762,7 +1769,9 @@ pub mod schedule {
         } else {
             // owl awdl_send_unicast (core.c:222-223): per-peer gate.
             let Some(peer) = peers.get(dst) else {
-                return DataSendDecision::Hold; // non-peer unicast: drop/hold
+                // owl awdl_send_unicast frees a non-peer frame. Drop, don't
+                // hold — a held non-peer frame would block the TAP forever.
+                return DataSendDecision::Drop;
             };
             if !same_channel_as_peer(own_seq, &peer.sequence, sync, now_us) {
                 return DataSendDecision::Hold; // peer is on a different channel
@@ -2435,8 +2444,10 @@ pub mod schedule {
         }
 
         #[test]
-        fn unicast_dst_with_no_peer_is_held() {
-            // owl `awdl_send_unicast` drops/holds unicast to non-peers.
+        fn unicast_dst_with_no_peer_is_dropped() {
+            // owl `awdl_send_unicast` frees (drops) unicast to a non-peer.
+            // It must NOT be held: a held frame stops the runtime from
+            // reading further host frames, stalling the TAP permanently.
             let sync = synced();
             let own_seq = [[44u8, 0x80u8]; CHANSEQ_LEN];
             assert_eq!(
@@ -2448,7 +2459,7 @@ pub mod schedule {
                     &sync,
                     1_032_768,
                 ),
-                DataSendDecision::Hold,
+                DataSendDecision::Drop,
             );
         }
 
@@ -5493,14 +5504,13 @@ pub mod runtime {
             }
 
             // --- data TX: retry pending frame if AW allows ---
-            if pending_tx.is_some() {
-                if let Some(frame) = pending_tx.take() {
-                    if try_send_data(&links, &awdl_state, now_us, &frame) {
-                        last_injected_seq = frame.seq;
-                    } else {
-                        // still can't send — keep it pending
-                        pending_tx = Some(frame);
-                    }
+            if let Some(frame) = pending_tx.take() {
+                match try_send_data(&links, &awdl_state, now_us, &frame) {
+                    TxOutcome::Sent => last_injected_seq = frame.seq,
+                    // still can't send — keep it pending
+                    TxOutcome::Hold => pending_tx = Some(frame),
+                    // non-peer unicast — discard so the TAP isn't blocked
+                    TxOutcome::Drop => {}
                 }
             }
 
@@ -5743,19 +5753,24 @@ pub mod runtime {
                                         &introspect,
                                     );
                                 }
-                            } else if !try_send_data(
-                                &links,
-                                &awdl_state,
-                                host_time_us(),
-                                &frame,
-                            ) {
-                                pending_tx = Some(frame);
-                                tracing::trace!(
-                                    pending = true,
-                                    "buffered data frame for later AW-gated TX"
-                                );
                             } else {
-                                last_injected_seq = seq;
+                                match try_send_data(
+                                    &links,
+                                    &awdl_state,
+                                    host_time_us(),
+                                    &frame,
+                                ) {
+                                    TxOutcome::Sent => last_injected_seq = seq,
+                                    TxOutcome::Hold => {
+                                        pending_tx = Some(frame);
+                                        tracing::trace!(
+                                            pending = true,
+                                            "buffered data frame for later AW-gated TX"
+                                        );
+                                    }
+                                    // non-peer unicast — discard, don't block the TAP
+                                    TxOutcome::Drop => {}
+                                }
                             }
                         }
                         Err(err) => tracing::trace!(?err, len, "ignored host tap frame"),
@@ -5776,15 +5791,28 @@ pub mod runtime {
         seq: u16,
     }
 
+    /// Outcome of an attempt to inject a pending data frame.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TxOutcome {
+        /// Injected (or the send failed transiently) — clear the pending slot.
+        Sent,
+        /// Not sendable yet — keep the frame pending and retry next AW.
+        Hold,
+        /// Never sendable (non-peer unicast) — discard the frame.
+        Drop,
+    }
+
     /// owl `awdl_can_send_unicast_in` decision (owl/src/schedule.c:57-79):
-    /// returns true if we are inside the guard-free core of an AW AND on the
-    /// same channel as the destination peer (owl awdl_same_channel_as_peer).
+    /// sends if we are inside the guard-free core of an AW AND on the same
+    /// channel as the destination peer (owl awdl_same_channel_as_peer). A
+    /// non-peer unicast destination is dropped (owl frees the buffer), never
+    /// held — see [`TxOutcome::Drop`].
     fn try_send_data(
         links: &Links,
         awdl_state: &crate::state::AwdlState,
         now_us: u64,
         frame: &PendingFrame,
-    ) -> bool {
+    ) -> TxOutcome {
         let decision = crate::schedule::data_send_decision(
             &frame.dst,
             awdl_state.current_channel,
@@ -5793,8 +5821,13 @@ pub mod runtime {
             &awdl_state.sync,
             now_us,
         );
-        if decision != crate::schedule::DataSendDecision::Send {
-            return false;
+        match decision {
+            crate::schedule::DataSendDecision::Drop => {
+                tracing::trace!(dst = ?frame.dst, "dropped non-peer unicast data frame");
+                return TxOutcome::Drop;
+            }
+            crate::schedule::DataSendDecision::Hold => return TxOutcome::Hold,
+            crate::schedule::DataSendDecision::Send => {}
         }
         match links.packet.send(&frame.radiotap_frame) {
             Ok(sent) => {
@@ -5804,11 +5837,13 @@ pub mod runtime {
                     multicast = frame.dst[0] & 0x01 == 1,
                     "injected awdl data frame"
                 );
-                true
+                TxOutcome::Sent
             }
             Err(err) => {
+                // Transient send error — retry on the next AW rather than
+                // dropping (the frame is still valid for a known peer).
                 tracing::trace!(?err, "data send failed");
-                false
+                TxOutcome::Hold
             }
         }
     }
