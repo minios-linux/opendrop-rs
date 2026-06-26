@@ -4107,12 +4107,18 @@ pub mod cli {
         /// Force filin to win the AWDL master election: advertise an inflated
         /// election metric and never adopt a peer, so the cluster follows
         /// filin's social-channel sequence (pulls Apple peers off DFS/No-IR
-        /// channels such as 52). Use the non-DFS anchor you want via `-c`.
+        /// channels such as 52). ON BY DEFAULT — this flag is now redundant
+        /// (kept for backward compatibility) but still forces it on even if
+        /// `--no-force-master` is also given. Use the non-DFS anchor via `-c`.
         #[arg(short = 'M', long = "force-master")]
         force_master: bool,
-        /// Override the election metric/counter advertised in `--force-master`
-        /// mode (default `DEFAULT_FORCE_MASTER_METRIC`). Raise it if a cluster
-        /// refuses to switch. Ignored unless `--force-master` is set.
+        /// Opt out of force-master mode: run the normal AWDL election (adopt the
+        /// best peer as master). Overridden by an explicit `-M/--force-master`.
+        #[arg(long = "no-force-master")]
+        no_force_master: bool,
+        /// Override the election metric/counter advertised in force-master mode
+        /// (default `DEFAULT_FORCE_MASTER_METRIC`). Raise it if a cluster
+        /// refuses to switch. Ignored when `--no-force-master` is in effect.
         #[arg(long = "force-master-metric")]
         force_master_metric: Option<u32>,
     }
@@ -4142,7 +4148,9 @@ pub mod cli {
             http_addr,
             park: args.park,
             disable_rssi_filter: args.disable_rssi_filter,
-            force_master: if args.force_master {
+            // Force-master is ON BY DEFAULT. `--no-force-master` opts out, but
+            // an explicit `-M/--force-master` always wins (forces it on).
+            force_master: if args.force_master || !args.no_force_master {
                 Some(
                     args.force_master_metric
                         .unwrap_or(crate::election::DEFAULT_FORCE_MASTER_METRIC),
@@ -4175,7 +4183,8 @@ pub mod cli {
                     http_addr: Some(iface::default_http_addr()),
                     park: false,
                 disable_rssi_filter: false,
-                    force_master: None,
+                    // Force-master is on by default now.
+                    force_master: Some(crate::election::DEFAULT_FORCE_MASTER_METRIC),
                 }
             );
         }
@@ -4234,15 +4243,8 @@ pub mod cli {
         }
 
         #[test]
-        fn force_master_defaults_off() {
+        fn force_master_defaults_on() {
             let config = parse_config_from(["filin", "-i", "wlan0mon"])
-                .expect("valid CLI args");
-            assert_eq!(config.force_master, None);
-        }
-
-        #[test]
-        fn force_master_flag_enables_default_metric() {
-            let config = parse_config_from(["filin", "-i", "wlan0mon", "--force-master"])
                 .expect("valid CLI args");
             assert_eq!(
                 config.force_master,
@@ -4251,16 +4253,34 @@ pub mod cli {
         }
 
         #[test]
-        fn force_master_metric_override_applies_only_when_enabled() {
+        fn no_force_master_flag_opts_out() {
+            let config = parse_config_from(["filin", "-i", "wlan0mon", "--no-force-master"])
+                .expect("valid CLI args");
+            assert_eq!(config.force_master, None);
+        }
+
+        #[test]
+        fn explicit_force_master_overrides_opt_out() {
+            let config =
+                parse_config_from(["filin", "-i", "wlan0mon", "--no-force-master", "-M"])
+                    .expect("valid CLI args");
+            assert_eq!(
+                config.force_master,
+                Some(crate::election::DEFAULT_FORCE_MASTER_METRIC)
+            );
+        }
+
+        #[test]
+        fn force_master_metric_override_applies_by_default() {
             let with = parse_config_from([
-                "filin", "-i", "wlan0mon", "-M", "--force-master-metric", "123456",
+                "filin", "-i", "wlan0mon", "--force-master-metric", "123456",
             ])
             .expect("valid CLI args");
             assert_eq!(with.force_master, Some(123456));
 
-            // Override without the enabling flag is ignored.
+            // Opted out: the metric override is ignored.
             let without = parse_config_from([
-                "filin", "-i", "wlan0mon", "--force-master-metric", "123456",
+                "filin", "-i", "wlan0mon", "--no-force-master", "--force-master-metric", "123456",
             ])
             .expect("valid CLI args");
             assert_eq!(without.force_master, None);
