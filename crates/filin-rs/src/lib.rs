@@ -1338,6 +1338,24 @@ pub mod election {
         }
 
         #[test]
+        fn rejects_master_anchored_on_no_ir_channel() {
+            // ce:47-style peer: strong master metric but anchored on ch52, a
+            // No-IR/DFS channel the carl9170 cannot transmit on. Following it
+            // would strand filin on a channel where it can't TX (and off the
+            // iPhone's 44/149/6 schedule), so it must NOT be adopted despite
+            // outranking self. A social-anchored peer with the same metric IS
+            // adopted, proving it's the No-IR anchor — not the metric — gating.
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            let no_ir = peer_master_on_channel([0x02, 0xce, 0x47, 0, 0, 0], 100, 5000, 0, 52);
+            state.run(std::slice::from_ref(&no_ir));
+            assert_eq!(state.sync_addr, state.self_addr); // not adopted — stays self
+
+            let social = peer_master_on_channel([0x02, 0xd2, 0xef, 0, 0, 0], 100, 5000, 0, 44);
+            state.run(std::slice::from_ref(&social));
+            assert_eq!(state.sync_addr, [0x02, 0xd2, 0xef, 0, 0, 0]); // adopted
+        }
+
+        #[test]
         fn rejects_peer_with_lower_master_than_self() {
             let mut state = local([0x02, 0, 0, 0, 0, 1]);
             // self advertises (counter=0, metric=60); peer advertises metric 10 < 60
