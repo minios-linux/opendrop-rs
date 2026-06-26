@@ -16,10 +16,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Default AirDrop `flags` TXT value: matches opendrop's verified default
-/// (`--flags 0x06`), proven to make the receiver appear in iOS 18's AirDrop
-/// picker. `0x06 = 0b110` sets the receiver-capability + discoverability bits.
-pub const DEFAULT_FLAGS: u32 = 0x06;
+/// Default AirDrop `flags` TXT value, matching the reference opendrop
+/// (`config.py`: `SUPPORTS_MIXED_TYPES | SUPPORTS_DISCOVER_MAYBE`).
+/// `0x88 = 0x08 | 0x80`: MIXED_TYPES marks the node a valid receiver, and
+/// DISCOVER_MAYBE signals the sender it may run `/Discover` — without 0x80 an
+/// iOS sender can decline to surface the receiver in the picker. (Was 0x06,
+/// which omitted DISCOVER_MAYBE; see LUFTLIFT_MDNS_AWDL_FIX.md.)
+pub const DEFAULT_FLAGS: u32 = 0x88;
 
 /// Interval between proactive mDNS re-announcements while `receive` runs.
 ///
@@ -54,10 +57,10 @@ pub struct MdnsConfig {
     /// bits to the sender; if the wrong bits are set the sender never
     /// surfaces us in its AirDrop picker.
     ///
-    /// The opendrop default (verified against iOS 18.6.2) is **`0x06`** =
-    /// `0b110` — sets the "supports receiving" and discoverability bits
-    /// Apple's sender checks. `0x01` (a single bit) is NOT enough for
-    /// current iOS to surface us. Override via `--flags` for experimentation.
+    /// The reference opendrop default is **`0x88`** = `SUPPORTS_MIXED_TYPES
+    /// (0x08) | SUPPORTS_DISCOVER_MAYBE (0x80)`. MIXED_TYPES marks us a valid
+    /// receiver; DISCOVER_MAYBE tells the sender it may run `/Discover`.
+    /// Override via `--flags` for experimentation.
     pub flags: u32,
 }
 
@@ -225,15 +228,17 @@ mod tests {
             build_airdrop_service_info(&cfg(), "127.0.0.1".parse().unwrap()).expect("build info");
         assert_eq!(info.get_port(), 8771);
         assert!(info.get_fullname().contains("_airdrop._tcp"));
-        // flags TXT property must be present and carry the opendrop default 0x06.
+        // flags TXT property must be present and carry the opendrop default
+        // 0x88, advertised as its decimal string "136".
         let props = info.get_properties();
-        assert_eq!(props.get("flags").map(|v| v.val_str()), Some("6"));
+        assert_eq!(props.get("flags").map(|v| v.val_str()), Some("136"));
     }
 
     #[test]
-    fn default_flags_is_opendrop_value_0x06() {
-        // Guards against regressing back to 1 (which didn't surface us on iOS 18).
-        assert_eq!(DEFAULT_FLAGS, 0x06);
+    fn default_flags_is_opendrop_value_0x88() {
+        // Reference opendrop config.py: SUPPORTS_MIXED_TYPES | DISCOVER_MAYBE.
+        // Guards against regressing to 0x06 (omits DISCOVER_MAYBE) or 1.
+        assert_eq!(DEFAULT_FLAGS, 0x88);
     }
 
     #[test]
