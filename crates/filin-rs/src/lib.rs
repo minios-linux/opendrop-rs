@@ -1944,6 +1944,26 @@ pub mod schedule {
         set.into_iter().collect()
     }
 
+    /// Rewrite every No-IR/DFS channel slot in `seq` to a TX-capable social
+    /// channel (6/44/149, round-robin by occurrence). filin may adopt a master
+    /// that hops/anchors on No-IR channels (for AW *timing*), but the carl9170
+    /// can neither transmit nor usefully receive there, so the monitor must
+    /// never be tuned to them — we substitute a social channel so our announce
+    /// still goes out in-window. Null slots (0) are left untouched for
+    /// [`ensure_social_coverage`]. Returns the No-IR channels that were
+    /// replaced (in slot order), empty if there were none.
+    pub fn replace_no_ir_slots(seq: &mut [[u8; 2]; CHANSEQ_LEN]) -> Vec<u8> {
+        let mut replaced = Vec::new();
+        for slot in seq.iter_mut() {
+            if slot[0] != 0 && crate::channel::is_no_ir_channel(slot[0]) {
+                let (ch, opclass) = AWDL_SOCIAL_CHANNELS[replaced.len() % AWDL_SOCIAL_CHANNELS.len()];
+                replaced.push(slot[0]);
+                *slot = [ch, opclass];
+            }
+        }
+        replaced
+    }
+
     /// Ensure every AWDL social channel (6, 44, 149) appears at least once
     /// in the channel sequence by injecting any missing social channels into
     /// null or duplicate slots. This guarantees filin physically visits 149
@@ -4407,8 +4427,16 @@ pub mod state {
                     let decoded: Vec<u8> =
                         peer.sequence.iter().map(|s| s[0]).collect();
                     self.channel_sequence = peer.sequence;
+                    // We adopt this master for AW *timing*, but the carl9170
+                    // can't TX/RX on its No-IR/DFS slots — rewrite those to
+                    // TX-capable social channels so the monitor never tunes
+                    // there and our announce still lands in-window.
+                    let no_ir = crate::schedule::replace_no_ir_slots(
+                        &mut self.channel_sequence,
+                    );
                     // Extract the master's anchor (slot-0 / dominant channel)
-                    // so filin can re-broadcast + dwell on it adaptively.
+                    // so filin can re-broadcast + dwell on it adaptively. Taken
+                    // AFTER No-IR rewrite so the anchor is always TX-capable.
                     let anchor = crate::schedule::master_anchor_channel(
                         &self.channel_sequence,
                     );
@@ -4427,6 +4455,7 @@ pub mod state {
                     tracing::info!(
                         master = ?master,
                         decoded = ?decoded,
+                        no_ir_replaced = ?no_ir,
                         injected = ?injected,
                         final = ?final_seq,
                         "adopted master channel sequence"
