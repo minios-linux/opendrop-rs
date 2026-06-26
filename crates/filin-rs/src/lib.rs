@@ -1176,6 +1176,14 @@ pub mod election {
     /// owl `AWDL_ELECTION_TREE_MAX_HEIGHT` (owl/src/election.h:25).
     pub const TREE_MAX_HEIGHT: u32 = 10;
 
+    /// Default `(self_counter, self_metric)` advertised in `--force-master`
+    /// mode. High enough to beat any real Apple master's election parameters
+    /// so peers adopt filin and follow its (all-social-channel) sequence, but
+    /// deliberately below `u32::MAX` so it still looks like a plausible metric
+    /// rather than an obvious sentinel. Crank it via `--force-master-metric`
+    /// if a cluster refuses to switch.
+    pub const DEFAULT_FORCE_MASTER_METRIC: u32 = 0x4000_0000;
+
     /// owl `struct awdl_election_state` (owl/src/election.h:31-40).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ElectionState {
@@ -1187,6 +1195,12 @@ pub mod election {
         pub self_metric: u32,
         pub master_counter: u32,
         pub self_counter: u32,
+        /// `--force-master`: when set, [`run`](ElectionState::run) never adopts
+        /// a peer, so filin stays its own master (`master_addr == self_addr`,
+        /// `height == 0`) and advertises its own (inflated) election params.
+        /// This is what forces a DFS/No-IR-anchored Apple cluster onto filin's
+        /// social-channel sequence (see [`force_self_master`]).
+        pub force_master: bool,
     }
 
     impl ElectionState {
@@ -1201,7 +1215,28 @@ pub mod election {
                 self_metric: METRIC_INIT,
                 master_counter: COUNTER_INIT,
                 self_counter: COUNTER_INIT,
+                force_master: false,
             }
+        }
+
+        /// Enable `--force-master`: advertise an inflated `(self_counter,
+        /// self_metric)` and refuse to adopt any peer, so filin becomes — and
+        /// stays — the cluster's elected master. Peers that hear filin's
+        /// announce adopt it and follow filin's channel sequence (which, with a
+        /// non-DFS anchor, is all social channels), pulling them off any
+        /// No-IR/DFS channel the previous master had anchored on. `metric` is
+        /// used for both the counter (election primary key) and the metric.
+        pub fn force_self_master(&mut self, metric: u32) {
+            self.force_master = true;
+            self.self_metric = metric;
+            self.self_counter = metric;
+            // Reflect immediately so an announce sent before the first `run`
+            // already carries the winning params with self as master.
+            self.master_addr = self.self_addr;
+            self.sync_addr = self.self_addr;
+            self.height = 0;
+            self.master_metric = metric;
+            self.master_counter = metric;
         }
 
         /// owl `awdl_election_is_sync_master` (owl/src/election.c:35-37).
@@ -1214,6 +1249,13 @@ pub mod election {
         /// place. `peers` need not be sorted; iteration order matches owl's.
         pub fn run(&mut self, peers: &[PeerElection]) {
             self.reset_self();
+
+            // `--force-master`: reset_self() has restored self as master with
+            // the inflated params; skip adoption entirely so no peer (even one
+            // advertising a higher counter) can displace us.
+            if self.force_master {
+                return;
+            }
 
             // `master_state` starts as self (owl/src/election.c:71).
             let mut best_counter = self.self_counter;
@@ -1361,6 +1403,38 @@ pub mod election {
             assert_eq!(state.master_metric, 200);
             assert_eq!(state.master_counter, 10);
             assert_eq!(state.height, 1);
+        }
+
+        #[test]
+        fn force_master_never_adopts_even_higher_counter_peer() {
+            // --force-master: a peer advertising a far higher (counter, metric)
+            // than our inflated values must NOT displace us. filin stays its
+            // own master at height 0 so it imposes its own channel sequence.
+            let mut state = local([0x02, 0, 0, 0, 0, 1]);
+            state.force_self_master(DEFAULT_FORCE_MASTER_METRIC);
+            let strong_peer = peer_master([0x02, 0xce, 0x47, 0, 0, 0], u32::MAX, u32::MAX, 0);
+
+            state.run(std::slice::from_ref(&strong_peer));
+
+            assert_eq!(state.master_addr, [0x02, 0, 0, 0, 0, 1]); // self
+            assert_eq!(state.sync_addr, [0x02, 0, 0, 0, 0, 1]); // self
+            assert_eq!(state.height, 0);
+            assert_eq!(state.master_counter, DEFAULT_FORCE_MASTER_METRIC);
+            assert_eq!(state.master_metric, DEFAULT_FORCE_MASTER_METRIC);
+        }
+
+        #[test]
+        fn force_master_advertises_winning_params_before_first_run() {
+            // The announce builder reads master_* directly; force_self_master
+            // must populate them immediately (an announce can go out before the
+            // first election run).
+            let mut state = local([0x02, 0, 0, 0, 0, 7]);
+            state.force_self_master(0x1234_5678);
+            assert_eq!(state.master_addr, [0x02, 0, 0, 0, 0, 7]);
+            assert_eq!(state.master_counter, 0x1234_5678);
+            assert_eq!(state.master_metric, 0x1234_5678);
+            assert_eq!(state.self_counter, 0x1234_5678);
+            assert_eq!(state.self_metric, 0x1234_5678);
         }
 
         #[test]
@@ -3588,6 +3662,13 @@ pub mod iface {
         /// regardless of signal strength). Useful for testing; defaults to
         /// filtering ON (owl's default, FILIN_AUDIT_FIXES.md #1).
         pub disable_rssi_filter: bool,
+        /// `--force-master`: when `Some(metric)`, filin advertises that metric
+        /// as its election `(self_counter, self_metric)` and never adopts a
+        /// peer, forcing the AWDL cluster to elect filin as master and follow
+        /// its social-channel sequence (pulling Apple peers off DFS/No-IR
+        /// channels like 52). `None` = normal election. The contained value is
+        /// the metric to advertise (see [`crate::election::force_self_master`]).
+        pub force_master: Option<u32>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -3631,6 +3712,7 @@ pub mod iface {
                 http_addr: Some(default_http_addr()),
                 park: false,
                 disable_rssi_filter: false,
+                force_master: None,
             };
 
             assert_eq!(validate_config(config.clone()), Ok(config));
@@ -4022,6 +4104,17 @@ pub mod cli {
         /// signal strength). Equivalent to owl's `-f`.
         #[arg(short = 'f', long = "no-rssi-filter")]
         disable_rssi_filter: bool,
+        /// Force filin to win the AWDL master election: advertise an inflated
+        /// election metric and never adopt a peer, so the cluster follows
+        /// filin's social-channel sequence (pulls Apple peers off DFS/No-IR
+        /// channels such as 52). Use the non-DFS anchor you want via `-c`.
+        #[arg(short = 'M', long = "force-master")]
+        force_master: bool,
+        /// Override the election metric/counter advertised in `--force-master`
+        /// mode (default `DEFAULT_FORCE_MASTER_METRIC`). Raise it if a cluster
+        /// refuses to switch. Ignored unless `--force-master` is set.
+        #[arg(long = "force-master-metric")]
+        force_master_metric: Option<u32>,
     }
 
     pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
@@ -4049,6 +4142,14 @@ pub mod cli {
             http_addr,
             park: args.park,
             disable_rssi_filter: args.disable_rssi_filter,
+            force_master: if args.force_master {
+                Some(
+                    args.force_master_metric
+                        .unwrap_or(crate::election::DEFAULT_FORCE_MASTER_METRIC),
+                )
+            } else {
+                None
+            },
         })
         .map_err(|_| CliError::Invalid)
     }
@@ -4074,6 +4175,7 @@ pub mod cli {
                     http_addr: Some(iface::default_http_addr()),
                     park: false,
                 disable_rssi_filter: false,
+                    force_master: None,
                 }
             );
         }
@@ -4132,6 +4234,39 @@ pub mod cli {
         }
 
         #[test]
+        fn force_master_defaults_off() {
+            let config = parse_config_from(["filin", "-i", "wlan0mon"])
+                .expect("valid CLI args");
+            assert_eq!(config.force_master, None);
+        }
+
+        #[test]
+        fn force_master_flag_enables_default_metric() {
+            let config = parse_config_from(["filin", "-i", "wlan0mon", "--force-master"])
+                .expect("valid CLI args");
+            assert_eq!(
+                config.force_master,
+                Some(crate::election::DEFAULT_FORCE_MASTER_METRIC)
+            );
+        }
+
+        #[test]
+        fn force_master_metric_override_applies_only_when_enabled() {
+            let with = parse_config_from([
+                "filin", "-i", "wlan0mon", "-M", "--force-master-metric", "123456",
+            ])
+            .expect("valid CLI args");
+            assert_eq!(with.force_master, Some(123456));
+
+            // Override without the enabling flag is ignored.
+            let without = parse_config_from([
+                "filin", "-i", "wlan0mon", "--force-master-metric", "123456",
+            ])
+            .expect("valid CLI args");
+            assert_eq!(without.force_master, None);
+        }
+
+        #[test]
         fn no_http_flag_disables_introspection_server() {
             let config = parse_config_from(["filin", "-i", "wlan0mon", "--no-http"])
                 .expect("valid CLI args");
@@ -4150,6 +4285,7 @@ pub mod cli {
                 http_addr: Some(non_loopback),
                 park: false,
                 disable_rssi_filter: false,
+                force_master: None,
             };
             assert_eq!(
                 iface::validate_config(bad),
@@ -5545,6 +5681,7 @@ pub mod runtime {
         http_addr: Option<std::net::SocketAddr>,
         park: bool,
         disable_rssi_filter: bool,
+        force_master: Option<u32>,
     ) -> Result<(), Error> {
         let mut bridge = TsftBridge::default();
         let mut awdl_state = crate::state::AwdlState::new(
@@ -5553,6 +5690,12 @@ pub mod runtime {
             links.anchor_channel,
             host_time_us(),
         );
+        // --force-master: seed the election so filin wins and stays master,
+        // forcing the cluster onto filin's social-channel sequence.
+        if let Some(metric) = force_master {
+            awdl_state.election.force_self_master(metric);
+            println!("force-master enabled: advertising election metric {metric}");
+        }
         let mut announce = AnnounceScheduler::new(host_time_us());
         let mut wlan_buf = vec![0u8; 4096];
         let mut tap_buf = vec![0u8; 2048];
