@@ -1232,11 +1232,12 @@ pub mod election {
                 if peer.sync_addr == self.self_addr {
                     continue; // reject: would form a cycle in the sync tree
                 }
-                if crate::channel::is_no_ir_channel(peer.anchor_channel) {
-                    // reject: anchored on a No-IR/DFS channel we can't TX on —
-                    // following it would strand us off the social channels.
-                    continue;
-                }
+                // NOTE: a master anchored on a No-IR/DFS channel is still
+                // adopted here — we follow it for AW *timing*. We just never
+                // tune the monitor to its No-IR slots: sync_channel_sequence
+                // rewrites those to TX-capable social channels so our announce
+                // lands in-window on 44/149/6 (the No-IR channels are where we
+                // could neither TX nor usefully RX anyway).
                 let cmp = (peer.master_counter, peer.master_metric)
                     .cmp(&(best_counter, best_metric));
                 match cmp {
@@ -1363,21 +1364,15 @@ pub mod election {
         }
 
         #[test]
-        fn rejects_master_anchored_on_no_ir_channel() {
-            // ce:47-style peer: strong master metric but anchored on ch52, a
-            // No-IR/DFS channel the carl9170 cannot transmit on. Following it
-            // would strand filin on a channel where it can't TX (and off the
-            // iPhone's 44/149/6 schedule), so it must NOT be adopted despite
-            // outranking self. A social-anchored peer with the same metric IS
-            // adopted, proving it's the No-IR anchor — not the metric — gating.
+        fn adopts_no_ir_anchored_master_for_timing() {
+            // A No-IR/DFS-anchored master (ce:47 on ch52) IS adopted — we
+            // follow it for AW timing. The No-IR slots are rewritten to
+            // TX-capable social channels later (sync_channel_sequence /
+            // schedule::replace_no_ir_slots), not rejected at election time.
             let mut state = local([0x02, 0, 0, 0, 0, 1]);
             let no_ir = peer_master_on_channel([0x02, 0xce, 0x47, 0, 0, 0], 100, 5000, 0, 52);
             state.run(std::slice::from_ref(&no_ir));
-            assert_eq!(state.sync_addr, state.self_addr); // not adopted — stays self
-
-            let social = peer_master_on_channel([0x02, 0xd2, 0xef, 0, 0, 0], 100, 5000, 0, 44);
-            state.run(std::slice::from_ref(&social));
-            assert_eq!(state.sync_addr, [0x02, 0xd2, 0xef, 0, 0, 0]); // adopted
+            assert_eq!(state.sync_addr, [0x02, 0xce, 0x47, 0, 0, 0]); // adopted
         }
 
         #[test]
@@ -2685,6 +2680,32 @@ pub mod schedule {
         fn rebroadcast_set_for_zero_anchor_is_socials_only() {
             // No master adopted (anchor 0): just the three socials.
             assert_eq!(rebroadcast_channels(0), vec![6, 44, 149]);
+        }
+
+        #[test]
+        fn replace_no_ir_slots_rewrites_dfs_to_social() {
+            // A master may anchor/hop on No-IR/DFS channels (52, 60, ...) the
+            // carl9170 can't TX on. We adopt it for timing but must never tune
+            // the monitor there: every No-IR slot is rewritten to a TX-capable
+            // social channel; TX-capable and null slots are left alone.
+            let mut seq = [[0u8, 0]; CHANSEQ_LEN];
+            seq[0] = [52, 0x80]; // No-IR
+            seq[2] = [44, 0x80]; // TX-capable, keep
+            seq[3] = [60, 0x80]; // No-IR
+            seq[8] = [6, 0x51]; // TX-capable, keep
+
+            let replaced = replace_no_ir_slots(&mut seq);
+
+            assert_eq!(replaced, vec![52, 60]); // both No-IR channels reported
+            assert!(
+                seq.iter().all(|s| !crate::channel::is_no_ir_channel(s[0])),
+                "no slot may remain a No-IR channel"
+            );
+            assert_eq!(seq[2][0], 44); // untouched
+            assert_eq!(seq[8][0], 6); // untouched
+            assert_eq!(seq[1][0], 0); // null left for ensure_social_coverage
+            assert!(AWDL_SOCIAL_CHANNEL_NUMS.contains(&seq[0][0]));
+            assert!(AWDL_SOCIAL_CHANNEL_NUMS.contains(&seq[3][0]));
         }
 
         #[test]
