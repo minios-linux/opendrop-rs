@@ -49,7 +49,7 @@ EMA + clamp was stable. Start with EMA + clamp.)
   loss on USB). Raise `SO_SNDBUF` / `net.core.wmem_*`, raise the iface txqueuelen,
   and queue/retry rather than drop.
 - **Hardware**: Atheros `carl9170` clean; Realtek `rtw88` clones marginal + crash
-  under injection (see `../rtw88-patch/`). USB adapters drop off the bus under
+  under injection. USB adapters drop off the bus under
   load and may need a driver reload.
 
 ## Verification

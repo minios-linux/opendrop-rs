@@ -30,7 +30,7 @@ Safari link share):
 TransferID:          <uuid>
 TransferType:        links
 SenderID:            <hex>
-SenderComputerName:  iPhone42
+SenderComputerName:  iPhone
 SenderModelName:     iPhone
 BundleID:            com.apple.mobilesafari
 Files: [ { FileName: "bsky-app.webloc",

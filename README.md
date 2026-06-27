@@ -1,35 +1,38 @@
 # opendrop-rs — AWDL + AirDrop for Linux, in Rust
 
-A clean-room Rust port of [owl](https://github.com/seemoo-lab/owl) (Apple Wireless
-Direct Link / AWDL) and [opendrop](https://github.com/seemoo-lab/opendrop) (AirDrop)
-for Linux. The goal is a working, tested AirDrop send/receive stack on commodity
-Linux Wi-Fi hardware, without depending on the original C/Python implementations.
+A Rust implementation of Apple Wireless Direct Link (AWDL) and AirDrop for Linux,
+**derived from** the SEEMOO Lab [owl](https://github.com/seemoo-lab/owl) and
+[opendrop](https://github.com/seemoo-lab/opendrop) projects (the AWDL layer was
+written by studying and translating owl). Because it is a derivative of those
+GPLv3 works, **this project is licensed under the GNU GPL v3.0** (see
+[`LICENSE`](LICENSE)).
 
 The workspace is split into two independent binaries:
 
 | Crate                | Binary     | Role |
 |----------------------|------------|------|
-| `crates/filin-rs`    | `filin`    | AWDL link layer — creates `awdl0`, drives a Wi-Fi monitor interface, runs election/sync, bridges Ethernet ↔ AWDL frames. (port of *owl*) |
-| `crates/luftlift-rs` | `luftlift` | AirDrop application — mDNS discovery, TLS/HTTPS, the `/Discover` `/Ask` `/Upload` protocol; can **send**, **receive**, and **find** peers. (port of *opendrop*) |
+| `crates/filin-rs`    | `filin`    | AWDL link layer — creates `awdl0`, drives a Wi-Fi monitor interface, runs election/sync, bridges Ethernet ↔ AWDL frames. |
+| `crates/luftlift-rs` | `luftlift` | AirDrop application — mDNS discovery, TLS/HTTPS, the `/Discover` `/Ask` `/Upload` protocol; **send**, **receive**, **find**. |
 | `crates/opendrop-rs` | —          | Reserved for an optional unified CLI wrapper; currently a stub. |
-
-The names are trademark-safe riffs on the originals: **filin** (Russian "филин",
-eagle-owl) for the owl layer, **luftlift** (German "air lift") for AirDrop.
 
 ## Status
 
-The pure-software stack is **feature-complete, unit-tested, and clippy-clean**:
+**Validated end-to-end against real Apple devices** — files have been received from
+an iPhone (iOS 18) to Linux over AWDL via this stack. The pure-software layers are
+unit-tested and clippy-clean:
 
 - `cargo build --release` — both binaries build clean.
-- `cargo test --workspace` — 92 tests passing.
+- `cargo test --workspace` — 360+ tests passing.
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 
-What is **not** yet done: live interop against a real Apple device. AWDL sync over a
-USB monitor interface is timing-sensitive and needs real hardware (see
-[Hardware](#hardware)). Everything feeding that path — the radiotap TSFT bridge,
-AWDL parsers, election/sync/channel logic, and the OS-level TAP/AF_PACKET/nl80211
-wrappers — is implemented and tested, but the end-to-end radio path has not been
-validated live. Treat the first hardware run as bring-up, not regression.
+Known limits (hardware/protocol, not bugs — see the design notes in `docs/dev/`):
+
+- **Sending to an idle iPhone isn't supported** — AirDrop discovery is triggered by
+  a BLE advertisement we don't emit; the supported direction is *Apple → luftlift*.
+- **Shared web links don't transfer** to an unauthenticated receiver — iOS withholds
+  the payload without an Apple-signed identity record. Photos/files/notes work.
+- **Very large uploads** can stall at the endgame on a single half-duplex monitor
+  radio (no MAC-layer retransmission on injected frames).
 
 ## Architecture
 
@@ -50,9 +53,9 @@ validated live. Treat the first hardware run as bring-up, not regression.
 ```
 
 `filin` brings up the AWDL link and exposes it as an ordinary `awdl0` network
-interface; `luftlift` then speaks AirDrop over `awdl0` (or any interface) like any
-other IPv6 link-local service. The two are decoupled — `luftlift find` works on a
-normal LAN without `filin` running.
+interface; `luftlift` then speaks AirDrop over `awdl0` like any other IPv6
+link-local service. The two are decoupled — `luftlift find` works on a normal LAN
+without `filin` running.
 
 Design notes worth knowing:
 
@@ -62,161 +65,112 @@ Design notes worth knowing:
 - **AirDrop bodies are `application/x-dvzip`**: framed `[u32 BE len][zlib]` blocks
   wrapping an ODC CPIO archive (magic `070707`). POSTs are chunked (no
   `Content-Length`). See `docs/airdrop-protocol.md`.
-- Built TDD: every feature landed as a `red` → `green` (→ `refactor`) commit triple.
+
+## Prerequisites
+
+- **Linux** (uses `AF_PACKET` monitor sockets and TAP interfaces).
+- A recent **stable Rust** toolchain (`rustup`); edition 2021. No system libraries
+  to install — the only native dependency is `libc`, and TLS is pure-Rust `rustls`.
+- **`filin` needs root** (or `CAP_NET_RAW`+`CAP_NET_ADMIN`) and a Wi-Fi adapter that
+  supports **monitor mode with frame injection** — see [Hardware](#hardware).
+- `luftlift` alone (`find`, or `receive`/`send` over a normal LAN) needs no root and
+  no special hardware.
 
 ## Build
 
 ```bash
-cargo build --release
-# binaries: target/release/filin, target/release/luftlift
-cargo test --workspace      # 92 tests
+cargo build --release          # -> target/release/{filin,luftlift}
+cargo test --workspace
 ```
 
 ## Usage
 
-### luftlift (AirDrop) — works on a normal network today
+### luftlift (AirDrop) — works on a normal network without filin
 
 ```bash
-# Discover AirDrop senders on the local link (no root, no filin needed)
-luftlift find -d 5
-
-# Receive files (announces via mDNS, runs the HTTPS server)
-luftlift receive -o ./incoming
-
-# Send a file to a discovered receiver (instance name from `find`)
-luftlift send "<recipient-instance-name>" ./photo.jpg
+luftlift find -d 5                              # discover AirDrop receivers
+luftlift receive -o ./incoming                 # receive (mDNS announce + HTTPS)
+luftlift send "<recipient-instance-name>" file # send to a discovered receiver
 ```
 
-Set `RUST_LOG` for detail, e.g. `RUST_LOG=luftlift=debug luftlift receive`.
+Set `RUST_LOG=luftlift_rs=debug` for detail. The receiver tolerates the awdl0
+interface coming and going (it re-announces when the link returns).
 
-> Note: real AirDrop interop with Apple devices requires AWDL to be up, which is
-> what `filin` provides. `luftlift` against another `luftlift` works over any
-> shared link.
-
-### filin (AWDL) — requires root + Wi-Fi monitor hardware
+### filin (AWDL) — requires root + a Wi-Fi monitor-capable adapter
 
 ```bash
-sudo filin -i <monitor_iface> -c 44 -h awdl0 -N
+sudo ./target/release/filin -i <wifi_iface> -c 44 -h awdl0
 ```
+
+`filin` self-configures the radio by default: it releases the interface from
+NetworkManager, sets monitor mode, brings it up, and tunes the channel — and it
+**auto-recovers** if the card is flapped, unplugged/replugged, or grabbed back by
+NetworkManager (it reopens within ~1s). Key flags:
 
 | Flag | Meaning |
 |------|---------|
-| `-i <iface>` | Wi-Fi monitor interface for raw 802.11 RX/TX |
-| `-c 44`      | anchor/social channel (44 for modern Apple; also 6, 149) |
-| `-h awdl0`   | name of the TAP interface to create |
-| `-N`         | assume the interface is already in monitor mode |
+| `-i <iface>` | Wi-Fi interface to use as the raw 802.11 monitor |
+| `-c 44` | anchor/social channel (44 for modern Apple; also 6, 149) |
+| `-h awdl0` | name of the TAP interface to create |
+| `-N` / `--assume-monitor` | skip monitor-mode config (something else owns the radio's mode) |
+| `--force-master` / `--no-force-master` | win the AWDL election so peers follow filin's channel (on by default) |
+| `--tx-retransmits N` | re-inject each unicast data frame N extra times (default 0; see notes) |
 
-At startup `filin` creates the `awdl0` TAP, copies the monitor MAC, sets MTU 1450
-and brings it up, sets the channel via nl80211, then enters the RX/TX poll loop.
-Full operator guide — including how to verify sync and inspect `awdl0` traffic — is
-in **[`crates/filin-rs/RUN.md`](crates/filin-rs/RUN.md)**.
+Full operator guide: **[`crates/filin-rs/RUN.md`](crates/filin-rs/RUN.md)**.
 
-## Bringing up AirDrop end-to-end
-
-In two terminals on the Linux box:
+### End-to-end (Apple → Linux)
 
 ```bash
-# 1. AWDL link up
-sudo filin -i <monitor_iface> -c 44 -h awdl0 -N
-
-# 2. AirDrop receiver bound to the awdl0 link
-luftlift receive -o ./incoming
+# terminal 1 — AWDL link up (self-configures the monitor)
+sudo ./target/release/filin -i <wifi_iface> -c 44 -h awdl0
+# terminal 2 — AirDrop receiver on the awdl0 link
+./target/release/luftlift -i awdl0 receive -o ./incoming
 ```
 
-Then, on an Apple device with the Sharing pane open, AirDrop a file to the Linux
-host. Watch `filin`'s `sync_error` log line settle to a low, stable value (that's
-the sign AWDL sync is usable) before expecting traffic on `awdl0`.
-
-## Concrete run sequence after a reboot (this box: ayourtch-x280)
-
-The exact commands to bring the live stack back up by hand. The carl9170 monitor
-interface is `wlxbc05430d50a1` (MAC `bc:05:43:0d:50:a1`). Run everything below as
-**root** (the filin/luftlift processes need raw sockets + TAP).
-
-```bash
-# 0. Verify the card enumerated and loaded firmware CLEANLY (no -110 errors).
-dmesg | grep -iE 'carl9170|firmware' | tail
-#   want a successful firmware load; if you see 'firmware upload failed (-110)' /
-#   'Failed to restart device (-110)', the card is wedged: try another USB port
-#   (a software re-auth `echo 0|1 > /sys/bus/usb/devices/<dev>/authorized` usually
-#   does NOT recover a -110; a fresh replug into a different port, or reboot, does).
-
-# 1. Put the card into plain monitor mode on channel 44.
-nmcli dev set wlxbc05430d50a1 managed no
-ip link set wlxbc05430d50a1 down
-iw dev wlxbc05430d50a1 set type monitor
-ip link set wlxbc05430d50a1 up
-iw dev wlxbc05430d50a1 set channel 44
-ip -br link show wlxbc05430d50a1          # expect: ... UP ...
-
-# 2. Repo + output dirs.
-cd /home/ayourtch/rust/opendrop
-mkdir -p /tmp/ldrop /tmp/ldrop_raw
-# (binaries are prebuilt in target/release; rebuild only if code changed:)
-# cargo build --release -p filin-rs -p luftlift-rs
-
-# 3. Kill any stragglers, then launch filin FIRST (it creates awdl0), then luftlift.
-pkill -9 -f target/release/filin; pkill -9 -f target/release/luftlift; sleep 2
-RUST_LOG=filin_rs=debug \
-  ./target/release/filin -i wlxbc05430d50a1 -c 44 -h awdl0 -N > /tmp/fF.log 2>&1 &
-sleep 4
-RUST_LOG=luftlift_rs=debug,luftlift=info LUFTLIFT_DUMP_UPLOAD=/tmp/ldrop_raw \
-  ./target/release/luftlift -i awdl0 receive -o /tmp/ldrop > /tmp/lrF.log 2>&1 &
-sleep 4
-pgrep -af 'target/release/(filin|luftlift)'   # both should be listed
-```
-
-Verify it's healthy (strip color codes with the `sed` below):
-
-```bash
-# filin is hopping and DOES visit ch149 (the AirDrop social channel):
-sed 's/\x1b\[[0-9;]*m//g' /tmp/fF.log | grep -oE 'channel=[0-9]+' | sort | uniq -c
-# the cached mDNS announce is re-broadcast ~1s on the social channels incl 149:
-sed 's/\x1b\[[0-9;]*m//g' /tmp/fF.log | grep 're-broadcast cached' \
-  | grep -oE 'channel=[0-9]+' | sort | uniq -c
-# luftlift announced + HTTPS listener bound + re-announcing every 10s:
-tail /tmp/lrF.log
-# announce is actually on-wire (run as root; needs CAP_NET_RAW):
-timeout 6 tcpdump -i awdl0 -nn -c4 udp port 5353
-```
-
-Now open the AirDrop sheet on the iPhone → `luftlift` should appear in the picker →
-send a **photo**. Watch the result:
-
-```bash
-# discovery + transfer progress:
-sed 's/\x1b\[[0-9;]*m//g' /tmp/lrF.log | grep -iE 'Discover|Ask|Upload|received|error'
-# the received file (should be non-empty) and the raw dvzip capture for offline diff:
-ls -l /tmp/ldrop/ /tmp/ldrop_raw/
-# cross-check a raw capture against the python reference decoder:
-python3 opendrop-patch/dvzip.py /tmp/ldrop_raw/upload-*.bin   # -> *.cpio
-```
-
-To restart just the stack later: `pkill -9 -f target/release/filin; pkill -9 -f
-target/release/luftlift`, then re-run step 3 (filin first, then luftlift).
+Then, on an Apple device with the Sharing pane open and AirDrop set to *Everyone*,
+send a photo/file to the Linux host — it should appear in the picker and the file
+lands in `./incoming`.
 
 ## Hardware
 
-AWDL sync over USB monitor interfaces is the flaky part and is best done with the
-human present.
+AWDL sync over USB monitor interfaces is the delicate part.
 
-- **Known-good:** Atheros `carl9170` USB in plain monitor mode on channel 44.
-- Realtek `rtw88` (patched) works but is marginal.
+- **Known-good injector:** Atheros `carl9170` USB in plain monitor mode on ch44 —
+  it injects both AWDL action *and* data frames and time-syncs well.
+- **Realtek `rtw88` (8822bu):** injects management/action frames only — it does
+  **not** transmit data frames in monitor mode, so it can't carry AirDrop traffic.
 - Use **plain** monitor mode; do not rely on active monitor mode.
 
-See project notes for more on which radios can inject AWDL frames reliably.
+More detail in `docs/dev/` (radio comparison, sync, channel-switch latency).
+
+## Reference: SEEMOO `owl`
+
+The original GPLv3 `owl` is not vendored. To check the port
+against it, fetch it on demand into a git-ignored `./owl/`:
+
+```bash
+scripts/fetch-owl.sh
+```
 
 ## Repository layout
 
 ```
-crates/filin-rs/      AWDL link layer (bin: filin)   + RUN.md operator guide
-crates/luftlift-rs/   AirDrop app    (bin: luftlift)
-crates/opendrop-rs/   reserved unified-CLI stub
-docs/awdl-sync.md     the TSFT-timestamp sync lesson
-docs/airdrop-protocol.md  reverse-engineered iOS AirDrop wire details
+crates/filin-rs/        AWDL link layer (bin: filin)  + RUN.md, PORT.md
+crates/luftlift-rs/     AirDrop app    (bin: luftlift) + PORT.md
+crates/opendrop-rs/     reserved unified-CLI stub
+docs/ARCHITECTURE.md    high-level design
+docs/awdl-sync.md       the TSFT-timestamp sync lesson
+docs/airdrop-protocol.md reverse-engineered iOS AirDrop wire details
+docs/book/              long-form write-up of AWDL + AirDrop
+docs/dev/               development notes / debugging history
+scripts/fetch-owl.sh    fetch the GPLv3 owl reference (not bundled)
 ```
 
 ## Credits & license
 
-Clean-room port inspired by the SEEMOO Lab `owl` and `opendrop` projects and the
-AWDL/AirDrop reverse-engineering literature. Dual-licensed under MIT or Apache-2.0.
+Derived from the SEEMOO Lab `owl` (AWDL) and `opendrop` (AirDrop) projects — the
+AWDL link layer here was written by studying and translating `owl`. All credit to
+the SEEMOO Lab and the AWDL/AirDrop reverse-engineering literature.
+
+Because this is a derivative of those GPLv3 works, **this project is licensed
+under the GNU General Public License v3.0** — see [`LICENSE`](LICENSE).

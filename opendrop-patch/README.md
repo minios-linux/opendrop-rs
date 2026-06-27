@@ -38,7 +38,7 @@ FullSizeRender.jpg: JPEG ... Apple iPhone 15 Pro Max, software=18.6.2, 1244x1838
 This only matters once the AWDL link is solid. The Realtek RTL8822BU clones gave
 too much sync jitter for discovery to complete; an **Atheros AR9170 / carl9170**
 USB adapter (`-N -c 44`) brought owl's sync to ~0.4% out-of-threshold and the
-phone immediately discovered the receiver. See `../rtw88-patch/` and the owl
+phone immediately discovered the receiver. See the owl
 `../owl/src/rx.c` hardware-TSF patch for the Realtek work. Discovery is still
 intermittent when multiple Apple devices nearby compete as AWDL master.
 
