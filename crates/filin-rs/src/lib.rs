@@ -4164,11 +4164,19 @@ pub mod cli {
         /// the bottleneck). Enable cautiously, low values only.
         #[arg(long = "tx-retransmits", default_value_t = 0)]
         tx_retransmits: u32,
+        /// Preflight only: probe the `-i` adapter's capabilities (does its
+        /// driver support monitor mode?), print a verdict, and exit WITHOUT
+        /// bringing any link up. Needs no root. Useful for checking whether a
+        /// given Wi-Fi adapter can be used as filin's radio.
+        #[arg(long = "check")]
+        check: bool,
     }
 
-    pub fn parse_config_from_env() -> Result<iface::Config, CliError> {
+    pub fn parse_config_from_env() -> Result<(iface::Config, bool), CliError> {
         let args = Args::parse();
-        config_from_args(args)
+        let check = args.check;
+        let config = config_from_args(args)?;
+        Ok((config, check))
     }
 
     pub fn parse_config_from<I, S>(args: I) -> Result<iface::Config, CliError>
@@ -5661,6 +5669,167 @@ pub mod runtime {
         Poll,
         Io,
         Pcap,
+        /// The monitor adapter is permanently unusable (e.g. its driver does
+        /// not support monitor mode). Carries a human-readable explanation.
+        /// Distinct from the transient errors above so the supervisor loop can
+        /// stop retrying and exit instead of spinning forever on a card that
+        /// will never work.
+        UnsupportedAdapter(String),
+    }
+
+    /// A capability assessment of a candidate monitor interface, produced by
+    /// [`probe_adapter`]. Kept separate from the probing I/O so the
+    /// message-formatting logic ([`AdapterReport::summary`]) is pure and
+    /// unit-testable.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct AdapterReport {
+        pub iface: String,
+        /// Whether the interface name currently resolves (is the card present?).
+        pub exists: bool,
+        /// The driver's supported iftypes, or `None` if the capability probe
+        /// itself failed (so we genuinely don't know).
+        pub iftypes: Option<Vec<u32>>,
+    }
+
+    impl AdapterReport {
+        /// `Some(true)`/`Some(false)` when we positively know; `None` if the
+        /// probe was inconclusive.
+        pub fn supports_monitor(&self) -> Option<bool> {
+            self.iftypes.as_ref().map(|t| t.contains(&6))
+        }
+
+        /// True only when we are CERTAIN the adapter can't work (missing, or
+        /// the driver advertises no monitor mode). Inconclusive probes return
+        /// `false` so filin still attempts the normal bring-up.
+        pub fn is_unusable(&self) -> bool {
+            !self.exists || self.supports_monitor() == Some(false)
+        }
+
+        /// A multi-line, operator-facing explanation of the verdict.
+        pub fn summary(&self) -> String {
+            use crate::os::nl80211::iftype_name;
+            if !self.exists {
+                return format!(
+                    "interface '{}' not found — is the adapter plugged in? (check `ip link`)",
+                    self.iface
+                );
+            }
+            match &self.iftypes {
+                None => format!(
+                    "'{}' exists but its capabilities could not be probed (nl80211 GET_WIPHY \
+                     failed); proceeding without a verdict",
+                    self.iface
+                ),
+                Some(types) => {
+                    let modes = types
+                        .iter()
+                        .map(|t| iftype_name(*t).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if types.contains(&6) {
+                        format!(
+                            "'{}' supports monitor mode (driver modes: {modes}).\n\
+                             NOTE: monitor support does NOT guarantee data-frame INJECTION. Some \
+                             adapters (notably Realtek rtw88 / 8822bu) accept monitor mode and \
+                             inject action frames but silently drop DATA frames, so AirDrop \
+                             payloads never transmit. The known-good injector is Atheros carl9170. \
+                             See the README 'Hardware' section.",
+                            self.iface
+                        )
+                    } else {
+                        format!(
+                            "'{}' does NOT support monitor mode — it cannot be used as filin's \
+                             radio. Its driver advertises only: {modes}.\n\
+                             Use a monitor- and injection-capable adapter; the known-good one is \
+                             Atheros carl9170. See the README 'Hardware' section.",
+                            self.iface
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Probe a candidate monitor interface's capabilities (existence + the
+    /// modes its driver supports). Read-only; safe to call without root.
+    pub fn probe_adapter(iface: &str) -> AdapterReport {
+        let exists = {
+            let cs = std::ffi::CString::new(iface).ok();
+            // SAFETY: cs (when Some) is a valid NUL-terminated C string.
+            cs.map(|c| unsafe { libc::if_nametoindex(c.as_ptr()) } != 0)
+                .unwrap_or(false)
+        };
+        let iftypes = if exists {
+            os::nl80211::supported_iftypes(iface).ok()
+        } else {
+            None
+        };
+        AdapterReport {
+            iface: iface.to_string(),
+            exists,
+            iftypes,
+        }
+    }
+
+    #[cfg(test)]
+    mod adapter_tests {
+        use super::{AdapterReport, Error};
+
+        fn report(exists: bool, iftypes: Option<Vec<u32>>) -> AdapterReport {
+            AdapterReport {
+                iface: "wlxtest".into(),
+                exists,
+                iftypes,
+            }
+        }
+
+        #[test]
+        fn missing_interface_is_unusable_and_says_so() {
+            let r = report(false, None);
+            assert!(r.is_unusable());
+            assert_eq!(r.supports_monitor(), None);
+            let s = r.summary();
+            assert!(s.contains("not found"), "summary: {s}");
+            assert!(s.contains("wlxtest"));
+        }
+
+        #[test]
+        fn no_monitor_mode_is_unusable_and_lists_modes() {
+            let r = report(true, Some(vec![2, 3])); // managed, ap
+            assert_eq!(r.supports_monitor(), Some(false));
+            assert!(r.is_unusable());
+            let s = r.summary();
+            assert!(s.contains("does NOT support monitor mode"), "summary: {s}");
+            assert!(s.contains("managed"));
+            assert!(s.contains("carl9170"));
+        }
+
+        #[test]
+        fn monitor_capable_is_usable_but_warns_about_injection() {
+            let r = report(true, Some(vec![2, 6])); // managed, monitor
+            assert_eq!(r.supports_monitor(), Some(true));
+            assert!(!r.is_unusable());
+            let s = r.summary();
+            assert!(s.contains("supports monitor mode"), "summary: {s}");
+            // The rtw88 "monitor OK but drops DATA frames" caveat must be loud.
+            assert!(s.contains("INJECTION"));
+            assert!(s.contains("rtw88"));
+        }
+
+        #[test]
+        fn inconclusive_probe_is_not_treated_as_unusable() {
+            let r = report(true, None);
+            assert_eq!(r.supports_monitor(), None);
+            assert!(!r.is_unusable(), "must still attempt bring-up when unsure");
+            assert!(r.summary().contains("could not be probed"));
+        }
+
+        #[test]
+        fn unsupported_adapter_error_carries_message() {
+            // The fatal variant must round-trip the operator-facing text.
+            let e = Error::UnsupportedAdapter("no monitor mode".into());
+            assert_eq!(e, Error::UnsupportedAdapter("no monitor mode".into()));
+        }
     }
 
     pub struct Links {
@@ -5700,20 +5869,33 @@ pub mod runtime {
     }
 
     pub fn open_links(config: &Config) -> Result<Links, Error> {
-        println!("trying to open tap");
+        let mon = config.monitor_iface.as_str();
         let tap = os::tun::open_tap(&config.host_iface).map_err(|e| {
-            eprintln!("open_tap({}) failed: {:?}", config.host_iface, e);
+            tracing::error!(
+                host_iface = %config.host_iface,
+                ?e,
+                "could not create TAP interface '{}' — filin needs root (or CAP_NET_ADMIN)",
+                config.host_iface
+            );
             Error::Tap
         })?;
-        println!("Opened tap");
-        let monitor_addr =
-            os::netdev::get_hwaddr(&config.monitor_iface).map_err(|_| Error::Netdev)?;
-        println!("Monitor addr: {:?}", &monitor_addr);
+        tracing::debug!(host_iface = %config.host_iface, "opened TAP");
+        let monitor_addr = os::netdev::get_hwaddr(mon).map_err(|e| {
+            // The most common cause is a missing interface; turn that into an
+            // actionable, adapter-aware message rather than a bare Netdev error.
+            let report = probe_adapter(mon);
+            tracing::error!(monitor_iface = %mon, ?e, "{}", report.summary());
+            if report.is_unusable() {
+                Error::UnsupportedAdapter(report.summary())
+            } else {
+                Error::Netdev
+            }
+        })?;
+        tracing::debug!(monitor_iface = %mon, addr = ?monitor_addr, "read monitor hwaddr");
         os::netdev::set_hwaddr(&config.host_iface, monitor_addr).map_err(|_| Error::Netdev)?;
-        println!("set addr: {:?}", &monitor_addr);
         os::netdev::set_mtu(&config.host_iface, 1450).map_err(|_| Error::Netdev)?;
         os::netdev::set_up(&config.host_iface).map_err(|_| Error::Netdev)?;
-        println!("setup host {:?}", &config.host_iface);
+        tracing::debug!(host_iface = %config.host_iface, "host iface configured (addr/mtu/up)");
         // Configure the MONITOR interface so filin auto-recovers a card that was
         // bounced (USB reset / replug). After a bounce the adapter often
         // re-enumerates either in managed mode or administratively DOWN, which
@@ -5727,19 +5909,48 @@ pub mod runtime {
             // Steal the iface from NetworkManager first, or NM will keep
             // re-managing it (managed mode) and fight our monitor config —
             // especially after a USB replug re-enumerates it as managed.
-            release_from_network_manager(&config.monitor_iface);
-            let _ = os::netdev::set_down(&config.monitor_iface); // best-effort
-            os::nl80211::set_monitor(&config.monitor_iface).map_err(|_| Error::Netdev)?;
-            println!("set monitor mode {:?}", &config.monitor_iface);
+            release_from_network_manager(mon);
+            let _ = os::netdev::set_down(mon); // best-effort
+            os::nl80211::set_monitor(mon).map_err(|e| {
+                // Failing to enter monitor mode is the signature of an
+                // inadequate adapter. Probe its capabilities so the operator
+                // gets a verdict instead of a bare errno; if the driver
+                // genuinely has no monitor mode, make it fatal (no point
+                // retrying a permanent condition every second).
+                let report = probe_adapter(mon);
+                tracing::error!(
+                    monitor_iface = %mon,
+                    ?e,
+                    "failed to set monitor mode: {}",
+                    report.summary()
+                );
+                if report.is_unusable() {
+                    Error::UnsupportedAdapter(report.summary())
+                } else {
+                    Error::Netdev
+                }
+            })?;
+            tracing::debug!(monitor_iface = %mon, "set monitor mode");
         }
         // Always bring it up before tuning (idempotent if already up); this
         // alone recovers a DOWN-but-still-monitor card even with `-N`.
-        os::netdev::set_up(&config.monitor_iface).map_err(|_| Error::Netdev)?;
-        println!("monitor up {:?}", &config.monitor_iface);
+        os::netdev::set_up(mon).map_err(|_| Error::Netdev)?;
+        tracing::debug!(monitor_iface = %mon, "monitor iface up");
         let frequency_mhz =
             channel::channel_to_frequency_mhz(config.anchor_channel).ok_or(Error::Channel)?;
-        os::nl80211::set_channel(&config.monitor_iface, u32::from(frequency_mhz))
-            .map_err(|_| Error::Channel)?;
+        os::nl80211::set_channel(mon, u32::from(frequency_mhz)).map_err(|e| {
+            tracing::error!(
+                monitor_iface = %mon,
+                channel = config.anchor_channel,
+                freq_mhz = frequency_mhz,
+                ?e,
+                "could not tune '{mon}' to channel {} ({} MHz) — the channel may be \
+                 unsupported, No-IR, or DFS on this adapter; try a different -c (6/44/149)",
+                config.anchor_channel,
+                frequency_mhz
+            );
+            Error::Channel
+        })?;
         let packet = os::packet::PacketSocket::open_bound(&config.monitor_iface)
             .map_err(|_| Error::Packet)?;
         let pcap = config
@@ -7982,6 +8193,108 @@ pub mod os {
             set_channel_ifindex(ifindex as libc::c_int, frequency_mhz)
         }
 
+        const NL80211_CMD_GET_WIPHY: u8 = 1;
+        // Nested attribute listing the iftypes the wiphy's driver supports.
+        const NL80211_ATTR_SUPPORTED_IFTYPES: u16 = 32;
+        // Netlink attribute `type` flag bits (nested / byte-order); the low 14
+        // bits are the actual id. Mask them off before comparing/decoding.
+        const NLA_TYPE_MASK: u16 = 0x3fff;
+
+        /// Human-readable name for an `nl80211_iftype` id — used in the adapter
+        /// capability messages. Unknown ids render as `iftype<N>`.
+        pub fn iftype_name(iftype: u32) -> std::borrow::Cow<'static, str> {
+            use std::borrow::Cow;
+            match iftype {
+                1 => Cow::Borrowed("ibss"),
+                2 => Cow::Borrowed("managed"),
+                3 => Cow::Borrowed("ap"),
+                4 => Cow::Borrowed("ap-vlan"),
+                5 => Cow::Borrowed("wds"),
+                6 => Cow::Borrowed("monitor"),
+                7 => Cow::Borrowed("mesh"),
+                8 => Cow::Borrowed("p2p-client"),
+                9 => Cow::Borrowed("p2p-go"),
+                10 => Cow::Borrowed("p2p-device"),
+                11 => Cow::Borrowed("ocb"),
+                12 => Cow::Borrowed("nan"),
+                other => Cow::Owned(format!("iftype{other}")),
+            }
+        }
+
+        /// Query the wiphy backing `iface` for the interface modes its driver
+        /// supports (`GET_WIPHY` → `NL80211_ATTR_SUPPORTED_IFTYPES`). Read-only
+        /// and works without root or bringing the interface up — used to
+        /// explain *why* an adapter can't serve as filin's monitor radio (e.g.
+        /// it advertises no `monitor` mode at all).
+        pub fn supported_iftypes(iface: &str) -> Result<Vec<u32>, Error> {
+            let cs = CString::new(iface).map_err(|_| Error::InvalidName)?;
+            // SAFETY: cs is a valid NUL-terminated C string.
+            let ifindex = unsafe { libc::if_nametoindex(cs.as_ptr()) };
+            if ifindex == 0 {
+                return Err(last_errno());
+            }
+            let socket = NetlinkSocket::open()?;
+            let family_id = socket.resolve_family("nl80211")?;
+            let mut payload = vec![NL80211_CMD_GET_WIPHY, 1, 0, 0];
+            push_attr_u32(&mut payload, NL80211_ATTR_IFINDEX, ifindex);
+            let response =
+                socket.request_big(family_id, libc::NLM_F_REQUEST as u16, &payload)?;
+            Ok(parse_supported_iftypes(&response))
+        }
+
+        /// True iff `iface`'s driver lists `monitor` among its supported modes.
+        pub fn supports_monitor(iface: &str) -> Result<bool, Error> {
+            Ok(supported_iftypes(iface)?.contains(&NL80211_IFTYPE_MONITOR))
+        }
+
+        /// Parse a `GET_WIPHY` genl payload and return the iftype ids carried in
+        /// the (nested) `NL80211_ATTR_SUPPORTED_IFTYPES` attribute. In that
+        /// nest each sub-attribute's *type* field IS the iftype id and the
+        /// value is empty. Pure (no I/O) so it is unit-testable; returns an
+        /// empty vec if the attribute is absent or the buffer is malformed.
+        fn parse_supported_iftypes(payload: &[u8]) -> Vec<u32> {
+            // Skip the 4-byte genlmsghdr (cmd, version, reserved); attrs follow.
+            if payload.len() < 4 {
+                return Vec::new();
+            }
+            let mut attrs = &payload[4..];
+            while attrs.len() >= 4 {
+                let len = u16::from_ne_bytes([attrs[0], attrs[1]]) as usize;
+                let kind = u16::from_ne_bytes([attrs[2], attrs[3]]) & NLA_TYPE_MASK;
+                if len < 4 || len > attrs.len() {
+                    break;
+                }
+                if kind == NL80211_ATTR_SUPPORTED_IFTYPES {
+                    return parse_iftype_nest(&attrs[4..len]);
+                }
+                let aligned = align4(len);
+                if aligned == 0 || aligned > attrs.len() {
+                    break;
+                }
+                attrs = &attrs[aligned..];
+            }
+            Vec::new()
+        }
+
+        fn parse_iftype_nest(nest: &[u8]) -> Vec<u32> {
+            let mut out = Vec::new();
+            let mut p = nest;
+            while p.len() >= 4 {
+                let len = u16::from_ne_bytes([p[0], p[1]]) as usize;
+                let kind = u16::from_ne_bytes([p[2], p[3]]) & NLA_TYPE_MASK;
+                if len < 4 {
+                    break;
+                }
+                out.push(u32::from(kind));
+                let aligned = align4(len);
+                if aligned == 0 || aligned > p.len() {
+                    break;
+                }
+                p = &p[aligned..];
+            }
+            out
+        }
+
         const NL80211_CMD_SET_INTERFACE: u8 = 6;
         const NL80211_ATTR_IFTYPE: u16 = 5;
         const NL80211_IFTYPE_MONITOR: u32 = 6;
@@ -8102,6 +8415,56 @@ pub mod os {
                 buf.truncate(len as usize);
                 parse_ack_or_payload(&buf)
             }
+
+            /// Like [`request`], but with a large receive buffer. A non-dump
+            /// `GET_WIPHY` reply carries the whole phy description in a single
+            /// netlink message that routinely exceeds 8 KiB, so the default
+            /// buffer would truncate it (and drop the iftype list we want).
+            fn request_big(
+                &self,
+                nlmsg_type: u16,
+                flags: u16,
+                payload: &[u8],
+            ) -> Result<Vec<u8>, Error> {
+                let seq = self.seq.get();
+                self.seq.set(seq.wrapping_add(1));
+                let mut msg = Vec::with_capacity(16 + payload.len());
+                msg.extend_from_slice(&((16 + payload.len()) as u32).to_ne_bytes());
+                msg.extend_from_slice(&nlmsg_type.to_ne_bytes());
+                msg.extend_from_slice(&flags.to_ne_bytes());
+                msg.extend_from_slice(&seq.to_ne_bytes());
+                msg.extend_from_slice(&0u32.to_ne_bytes());
+                msg.extend_from_slice(payload);
+
+                // SAFETY: msg is valid readable memory for msg.len() bytes.
+                let sent = unsafe {
+                    libc::send(
+                        self.fd.as_raw_fd(),
+                        msg.as_ptr().cast::<libc::c_void>(),
+                        msg.len(),
+                        0,
+                    )
+                };
+                if sent < 0 {
+                    return Err(last_errno());
+                }
+
+                let mut buf = vec![0u8; 65536];
+                // SAFETY: buf is valid writable memory for buf.len() bytes.
+                let len = unsafe {
+                    libc::recv(
+                        self.fd.as_raw_fd(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                        0,
+                    )
+                };
+                if len < 0 {
+                    return Err(last_errno());
+                }
+                buf.truncate(len as usize);
+                parse_ack_or_payload(&buf)
+            }
         }
 
         fn parse_ack_or_payload(buf: &[u8]) -> Result<Vec<u8>, Error> {
@@ -8190,6 +8553,73 @@ pub mod os {
 
                 assert_eq!(request.ifindex, 9);
                 assert_eq!(request.frequency_mhz, 5220);
+            }
+
+            /// Append a netlink attribute (header + value, padded to 4 bytes).
+            fn push_attr(buf: &mut Vec<u8>, kind: u16, value: &[u8]) {
+                let len = 4 + value.len();
+                buf.extend_from_slice(&(len as u16).to_ne_bytes());
+                buf.extend_from_slice(&kind.to_ne_bytes());
+                buf.extend_from_slice(value);
+                while !buf.len().is_multiple_of(4) {
+                    buf.push(0);
+                }
+            }
+
+            /// Build the nested SUPPORTED_IFTYPES attribute body: one empty
+            /// sub-attr per iftype, whose `type` field is the iftype id.
+            fn iftype_nest(iftypes: &[u16]) -> Vec<u8> {
+                let mut nest = Vec::new();
+                for &t in iftypes {
+                    push_attr(&mut nest, t, &[]);
+                }
+                nest
+            }
+
+            #[test]
+            fn parses_supported_iftypes_from_wiphy_payload() {
+                // genlmsghdr (4 bytes) + a decoy attr + the nested iftypes attr.
+                let mut payload = vec![NL80211_CMD_GET_WIPHY, 1, 0, 0];
+                push_attr(&mut payload, 2 /* WIPHY_NAME */, b"phy0");
+                let nest = iftype_nest(&[2 /* managed */, 6 /* monitor */, 3 /* ap */]);
+                // Kernel sets the NESTED flag on this attr's type; we must mask it.
+                push_attr(&mut payload, 0x8000 | NL80211_ATTR_SUPPORTED_IFTYPES, &nest);
+
+                let types = parse_supported_iftypes(&payload);
+                assert_eq!(types, vec![2, 6, 3]);
+                assert!(types.contains(&NL80211_IFTYPE_MONITOR));
+            }
+
+            #[test]
+            fn parses_iftypes_without_monitor() {
+                let mut payload = vec![NL80211_CMD_GET_WIPHY, 1, 0, 0];
+                let nest = iftype_nest(&[2 /* managed */, 3 /* ap */]);
+                push_attr(&mut payload, NL80211_ATTR_SUPPORTED_IFTYPES, &nest);
+
+                let types = parse_supported_iftypes(&payload);
+                assert_eq!(types, vec![2, 3]);
+                assert!(!types.contains(&NL80211_IFTYPE_MONITOR));
+            }
+
+            #[test]
+            fn missing_iftypes_attr_yields_empty() {
+                let mut payload = vec![NL80211_CMD_GET_WIPHY, 1, 0, 0];
+                push_attr(&mut payload, 2 /* WIPHY_NAME */, b"phy0");
+                assert!(parse_supported_iftypes(&payload).is_empty());
+            }
+
+            #[test]
+            fn truncated_payload_does_not_panic() {
+                // A bogus attr len longer than the buffer must terminate cleanly.
+                let payload = vec![NL80211_CMD_GET_WIPHY, 1, 0, 0, 0xff, 0xff, 0x20, 0x00];
+                assert!(parse_supported_iftypes(&payload).is_empty());
+            }
+
+            #[test]
+            fn iftype_names_are_human_readable() {
+                assert_eq!(iftype_name(2), "managed");
+                assert_eq!(iftype_name(6), "monitor");
+                assert_eq!(iftype_name(99), "iftype99");
             }
         }
     }

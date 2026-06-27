@@ -24,8 +24,17 @@ fn main() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to install tracing subscriber: {err:?}"))?;
 
     tracing::info!("filin starting");
-    let config = filin_rs::cli::parse_config_from_env()
+    let (config, check) = filin_rs::cli::parse_config_from_env()
         .map_err(|err| anyhow::anyhow!("invalid CLI arguments: {err:?}"))?;
+
+    // `--check`: preflight the adapter and exit. No link is brought up and no
+    // root is required — this just asks the driver what it supports so an
+    // operator can tell whether a given card is usable before committing.
+    if check {
+        let report = filin_rs::runtime::probe_adapter(&config.monitor_iface);
+        println!("{}", report.summary());
+        std::process::exit(if report.is_unusable() { 1 } else { 0 });
+    }
     tracing::info!(
         monitor_iface = %config.monitor_iface,
         host_iface = %config.host_iface,
@@ -70,6 +79,12 @@ fn main() -> anyhow::Result<()> {
                         "filin runtime stopped (monitor iface gone?); reopening links in 1s"
                     ),
                 }
+            }
+            // A permanently-unusable adapter (e.g. no monitor mode) will never
+            // work, so retrying every second is pointless noise — exit with the
+            // operator-facing explanation already logged by open_links.
+            Err(filin_rs::runtime::Error::UnsupportedAdapter(msg)) => {
+                return Err(anyhow::anyhow!("unusable monitor adapter: {msg}"));
             }
             Err(err) => tracing::warn!(
                 ?err,

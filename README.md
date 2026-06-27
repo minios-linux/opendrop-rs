@@ -112,6 +112,7 @@ NetworkManager (it reopens within ~1s). Key flags:
 | `-i <iface>` | Wi-Fi interface to use as the raw 802.11 monitor |
 | `-c 44` | anchor/social channel (44 for modern Apple; also 6, 149) |
 | `-h awdl0` | name of the TAP interface to create |
+| `--check` | preflight only: probe the `-i` adapter (does its driver support monitor mode?), print a verdict, and exit. Needs no root. |
 | `-N` / `--assume-monitor` | skip monitor-mode config (something else owns the radio's mode) |
 | `--force-master` / `--no-force-master` | win the AWDL election so peers follow filin's channel (on by default) |
 | `--tx-retransmits N` | re-inject each unicast data frame N extra times (default 0; see notes) |
@@ -133,7 +134,17 @@ lands in `./incoming`.
 
 ## Hardware
 
-AWDL sync over USB monitor interfaces is the delicate part.
+AWDL sync over USB monitor interfaces is the delicate part. Not sure if an
+adapter will work? Probe it first (no root needed):
+
+```bash
+filin -i <wifi_iface> --check
+```
+
+This reports whether the driver supports monitor mode and exits non-zero if the
+adapter is unusable. Note it can only check *capabilities* — some adapters
+(e.g. Realtek `rtw88`) report monitor mode but still silently drop injected
+**data** frames, which `--check` warns about but cannot detect.
 
 - **Known-good injector:** Atheros `carl9170` USB in plain monitor mode on ch44 —
   it injects both AWDL action *and* data frames and time-syncs well.
