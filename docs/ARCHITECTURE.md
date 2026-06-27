@@ -38,9 +38,8 @@ developed and tested independently.
 ```
 
 ## Crates (Cargo workspace)
-- `crates/filin-rs/`   — AWDL daemon. Binary `filin-rs`. Owner: **gpt-5.5 (pty-2)**. Spec: `crates/filin-rs/PORT.md`.
-- `crates/luftlift-rs/` — AirDrop CLI. Binary `luftlift-rs` (send/receive/find). Owner: **GLM-5.2 (pty-3)**. Spec: `crates/luftlift-rs/PORT.md`.
-- `crates/opendrop-rs/` — top-level CLI tying both together + shared debug UI. Owner: **Claude**.
+- `crates/filin-rs/`   — AWDL daemon. Binary `filin`. Spec: `crates/filin-rs/PORT.md`.
+- `crates/luftlift-rs/` — AirDrop CLI. Binary `luftlift` (send/receive/find). Spec: `crates/luftlift-rs/PORT.md`.
 
 ## Hard-won lessons to bake in (do NOT relearn these)
 1. **Sync uses the hardware TSF, not the host clock.** owl's bug was timestamping

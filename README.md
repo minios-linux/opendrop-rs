@@ -13,7 +13,6 @@ The workspace is split into two independent binaries:
 |----------------------|------------|------|
 | `crates/filin-rs`    | `filin`    | AWDL link layer — creates `awdl0`, drives a Wi-Fi monitor interface, runs election/sync, bridges Ethernet ↔ AWDL frames. |
 | `crates/luftlift-rs` | `luftlift` | AirDrop application — mDNS discovery, TLS/HTTPS, the `/Discover` `/Ask` `/Upload` protocol; **send**, **receive**, **find**. |
-| `crates/opendrop-rs` | —          | Reserved for an optional unified CLI wrapper; currently a stub. |
 
 ## Status
 
@@ -168,7 +167,6 @@ scripts/fetch-owl.sh
 ```
 crates/filin-rs/        AWDL link layer (bin: filin)  + RUN.md, PORT.md
 crates/luftlift-rs/     AirDrop app    (bin: luftlift) + PORT.md
-crates/opendrop-rs/     reserved unified-CLI stub
 docs/ARCHITECTURE.md    high-level design
 docs/awdl-sync.md       the TSFT-timestamp sync lesson
 docs/airdrop-protocol.md reverse-engineered iOS AirDrop wire details
