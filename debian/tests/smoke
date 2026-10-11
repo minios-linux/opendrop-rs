@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+filin --help >/dev/null 2>&1
+luftlift --help >/dev/null
+luftlift help receive >/dev/null
+luftlift help find >/dev/null
+luftlift help send >/dev/null

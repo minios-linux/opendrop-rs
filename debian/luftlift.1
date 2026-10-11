@@ -1,0 +1,48 @@
+.TH LUFTLIFT 1 "October 2026" "opendrop-rs" "User Commands"
+.SH NAME
+luftlift \- AirDrop application protocol client and receiver for Linux
+.SH SYNOPSIS
+.B luftlift
+.RI [ options ]
+.I command
+.RI [ command-options ]
+.SH DESCRIPTION
+.B luftlift
+implements AirDrop discovery, HTTPS/TLS transfer, and dvzip/CPIO payload
+handling. It normally runs over the
+.B awdl0
+interface created by
+.BR filin ,
+but discovery can also be used on another IPv6-capable interface.
+.SH OPTIONS
+.TP
+.BI -i ", --interface " interface
+Network interface to use. The default is awdl0.
+.SH COMMANDS
+.TP
+.B receive
+Advertise an AirDrop receiver and save incoming files.
+.TP
+.B find
+Browse for AirDrop peers.
+.TP
+.B send
+Send a file to a discovered AirDrop receiver.
+.SH EXAMPLES
+.nf
+luftlift -i awdl0 find -d 5
+luftlift -i awdl0 receive -o ./incoming
+luftlift -i awdl0 send RECIPIENT photo.jpg
+.fi
+.SH ENVIRONMENT
+.TP
+.B LUFTLIFT_NAME
+Base receiver name advertised through AirDrop.
+.TP
+.B RUST_LOG
+Tracing filter used for diagnostic logging.
+.SH NOTES
+Sending to an idle Apple device may require a Bluetooth LE wake-up
+advertisement that this version of opendrop-rs does not provide.
+.SH SEE ALSO
+.BR filin (1)

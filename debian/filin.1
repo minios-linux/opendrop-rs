@@ -1,0 +1,63 @@
+.TH FILIN 1 "October 2026" "opendrop-rs" "User Commands"
+.SH NAME
+filin \- Apple Wireless Direct Link (AWDL) link layer for Linux
+.SH SYNOPSIS
+.B filin
+.BI -i " interface"
+.RI [ options ]
+.SH DESCRIPTION
+.B filin
+creates a TAP interface (normally
+.BR awdl0 )
+and bridges Ethernet traffic to Apple Wireless Direct Link frames transmitted
+through a monitor-mode Wi-Fi interface.
+.PP
+Normal operation requires CAP_NET_ADMIN and CAP_NET_RAW, or equivalent root
+privileges. The Wi-Fi adapter and driver must support monitor mode and raw frame
+injection.
+.SH OPTIONS
+.TP
+.BI -i " interface"
+Wi-Fi monitor interface. This option is required.
+.TP
+.BI -c " channel"
+AWDL anchor/social channel. The default is 44.
+.TP
+.BI -h " interface"
+Name of the TAP interface to create. The default is awdl0.
+.TP
+.BR -N ", " --assume-monitor
+Do not change the radio to monitor mode; assume it is already configured.
+.TP
+.B --check
+Probe the selected adapter for monitor-mode capability and exit.
+.TP
+.B --no-http
+Disable the local introspection HTTP server.
+.TP
+.BI --http-addr " address"
+Set the loopback introspection address. The default is 127.0.0.1:9930.
+.TP
+.B --park
+Stay on the selected anchor channel instead of channel hopping.
+.TP
+.BR -f ", " --no-rssi-filter
+Disable RSSI admission filtering.
+.TP
+.BR -M ", " --force-master
+Force filin to win the AWDL master election. This is enabled by default.
+.TP
+.B --no-force-master
+Use the normal AWDL election instead.
+.TP
+.BI --tx-retransmits " count"
+Re-inject each unicast data frame the requested number of extra times.
+.SH EXAMPLE
+.nf
+sudo filin -i wlan1 -c 44 -h awdl0
+luftlift -i awdl0 receive -o ./incoming
+.fi
+.SH SEE ALSO
+.BR luftlift (1),
+.BR ip (8),
+.BR tcpdump (8)

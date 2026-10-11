@@ -1,0 +1,23 @@
+Source: opendrop-rs
+Section: net
+Priority: optional
+Maintainer: crims0n <crims0n@minios.dev>
+Build-Depends: debhelper (>= 11),
+               cargo (>= 1.85),
+               rustc (>= 1.85)
+Standards-Version: 4.7.2
+Homepage: https://github.com/minios-linux/opendrop-rs
+Rules-Requires-Root: no
+
+Package: opendrop-rs
+Architecture: amd64 i386
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Suggests: network-manager, tcpdump
+Description: AirDrop and AWDL implementation for Linux
+ opendrop-rs implements Apple Wireless Direct Link (AWDL) and the AirDrop
+ application protocol on Linux. The filin command creates and bridges an awdl0
+ interface using a monitor-mode Wi-Fi adapter, while luftlift discovers AirDrop
+ peers and sends or receives files over the resulting IPv6 link.
+ .
+ filin requires CAP_NET_ADMIN and CAP_NET_RAW for normal operation, plus a
+ Wi-Fi adapter and driver capable of monitor-mode frame injection.

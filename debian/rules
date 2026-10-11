@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+export CARGO_TERM_COLOR = never
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build --release --workspace --locked
+
+override_dh_auto_test:
+	cargo test --workspace --locked
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/filin \
+		$(CURDIR)/debian/opendrop-rs/usr/bin/filin
+	install -D -m 0755 target/release/luftlift \
+		$(CURDIR)/debian/opendrop-rs/usr/bin/luftlift
+
+override_dh_auto_clean:
+	cargo clean || true
+	rm -rf debian/cargo-home

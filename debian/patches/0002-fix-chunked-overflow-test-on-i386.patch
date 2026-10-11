@@ -1,0 +1,20 @@
+Description: Make the chunked overflow test independent of pointer width
+ Use the native usize maximum so the test exercises checked_add overflow
+ on both 32-bit and 64-bit architectures instead of failing during parsing
+ on i386.
+Author: crims0n <crims0n@minios.dev>
+Forwarded: no
+--- a/crates/luftlift-rs/src/chunked.rs
++++ b/crates/luftlift-rs/src/chunked.rs
+@@ -149,9 +149,9 @@
+     fn decode_chunked_rejects_overflowing_size() {
+         // A chunk size near usize::MAX must not overflow pos + chunk_size
+         // (which panics on the add or the slice). Reject it as truncated.
+-        let body = b"ffffffffffffffff\r\nWiki\r\n0\r\n\r\n";
++        let body = format!("{:x}\r\nWiki\r\n0\r\n\r\n", usize::MAX);
+         assert!(matches!(
+-            decode_chunked(body),
++            decode_chunked(body.as_bytes()),
+             Err(ChunkedError::Truncated { .. })
+         ));
+     }

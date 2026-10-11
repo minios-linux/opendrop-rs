@@ -2,8 +2,27 @@
 /target
 **/target
 
+# Debian and quilt build artifacts
+/.pc/
+/debian/.debhelper/
+/debian/cargo-home/
+/debian/opendrop-rs/
+/debian/opendrop-rs-dbgsym/
+/debian/tmp/
+/debian/files
+/debian/*.debhelper
+/debian/*.substvars
+/debian/debhelper-build-stamp
+*.deb
+*.udeb
+*.build
+*.buildinfo
+*.changes
+*.dsc
+*.debian.tar.*
+*.orig.tar.*
+
 # Vendored GPL reference checked out on demand (see scripts/fetch-owl.sh).
-# Kept out of the tree so this repo stays MIT-licensed.
 /owl/
 /vendor/
 

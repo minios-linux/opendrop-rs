@@ -1,0 +1,5 @@
+extend-diff-ignore = "(^|/)(vendor|target|owl)(/|$)|(^|/)debian/cargo-home(/|$)"
+tar-ignore = "vendor"
+tar-ignore = "target"
+tar-ignore = "owl"
+tar-ignore = "debian/cargo-home"

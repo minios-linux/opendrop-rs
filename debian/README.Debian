@@ -1,0 +1,39 @@
+opendrop-rs for Debian and MiniOS
+=================================
+
+This package installs two commands:
+
+* filin: AWDL link layer. It creates awdl0 and requires CAP_NET_ADMIN and
+  CAP_NET_RAW for normal operation, plus a Wi-Fi adapter capable of monitor
+  mode and frame injection.
+* luftlift: AirDrop discovery, sender, and receiver.
+
+Building from source
+--------------------
+
+The package supports amd64 and i386 and requires Rust/Cargo 1.85 or newer.
+Debian patches adjust the dependency lock and source for Rust 1.85 and make
+the chunked overflow test work on both architectures.
+
+Rust dependencies are not bundled in Git or the Debian source package.
+Cargo downloads the versions pinned by the patched Cargo.lock from crates.io
+into debian/cargo-home. The build needs network access unless that cache has
+already been populated. Builds in environments without network access must
+populate the cache after applying the Debian patches, using cargo fetch --locked
+with CARGO_HOME set to debian/cargo-home. The clean target removes this cache;
+populate it after cleaning and retain it through the build.
+
+Create the upstream orig tarball from the upstream Git commit, excluding
+debian/. Do not reuse an orig tarball containing vendor/: dpkg-source retains
+an existing orig tarball, even when debian/source/options excludes that directory.
+
+Ubuntu 18.04 (Bionic) runtime compatibility
+-------------------------------------------
+
+The amd64 package can be built inside Bionic with a current Rust toolchain.
+Such binaries link against Bionic glibc and require only libc6 >= 2.25, so they
+run on the stock Bionic glibc 2.27.
+
+Bionic's archive Rust/Cargo 1.65 is not sufficient to build the current
+opendrop-rs dependency graph. Source builds therefore require Rust/Cargo 1.85
+or newer. This is a build-toolchain limitation, not a runtime dependency.
