@@ -3,6 +3,7 @@ Section: net
 Priority: optional
 Maintainer: crims0n <crims0n@minios.dev>
 Build-Depends: debhelper (>= 11),
+               ca-certificates,
                cargo (>= 1.85),
                rustc (>= 1.85)
 Standards-Version: 4.7.2

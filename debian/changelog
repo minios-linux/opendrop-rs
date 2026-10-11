@@ -6,5 +6,6 @@ opendrop-rs (0.1.0+git20260628.dccc798-1) unstable; urgency=medium
   * Backport the source and dependency lock to Rust 1.85 compatibility.
   * Document Ubuntu 18.04 runtime support and its older source-build toolchain.
   * Enable i386 packaging and fix the pointer-width-dependent overflow test.
+  * Require CA certificates for locked dependency downloads in clean builders.
 
- -- crims0n <crims0n@minios.dev>  Sun, 11 Oct 2026 03:27:07 +0300
+ -- crims0n <crims0n@minios.dev>  Sun, 11 Oct 2026 03:53:43 +0300
